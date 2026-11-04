@@ -206,7 +206,7 @@ trader-exit/        SKILL.md, exit.py
 trader-timemachine/ SKILL.md, timemachine.py
 trader-risk/        SKILL.md, check.py
 trader-budget/      SKILL.md, size.py, config.example.json, targets.example.json
-trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
+trader-broker/      SKILL.md, ticket.py, t212.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py

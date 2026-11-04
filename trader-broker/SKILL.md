@@ -135,6 +135,31 @@ submits orders directly to the market. So with IBKR the final yes happens in
 IBKR as well. Set `"broker": "ibkr"` in `trader/config.json`. Set its tools
 that draft orders to Needs approval too.
 
+## Setup C: Trading 212 (read only, `t212.py`)
+
+`t212.py` reads a Trading 212 account over its public API. It sends GET
+requests only and cannot place, change or cancel an order, so it is safe to
+run without a yes. Orders on Trading 212 still go through the user's app.
+
+1. In the Trading 212 app, make an API key on the **demo** (practice) account
+   with read permissions (account, portfolio, orders:read, metadata).
+2. The user exports `T212_API_KEY` and `T212_API_SECRET` in their own shell.
+   **Keys never go in the chat**, same rule as Alpaca.
+3. Demo is the default. Live needs `T212_ENV=live` **and** `--live`; any
+   mismatch is refused before a request is sent.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/t212.py" status            # which account, is the key working
+python3 "${CLAUDE_SKILL_DIR}/t212.py" cash               # available, reserved, in pies
+python3 "${CLAUDE_SKILL_DIR}/t212.py" positions --json
+python3 "${CLAUDE_SKILL_DIR}/t212.py" orders
+python3 "${CLAUDE_SKILL_DIR}/t212.py" ticker TSLA        # TSLA -> TSLA_US_EQ
+python3 "${CLAUDE_SKILL_DIR}/t212.py" instruments --refresh
+```
+
+It keeps each endpoint's documented rate limit, retries only a 429, and
+caches the instrument list for 24 hours in `trader/cache/`.
+
 ## Steps: the entry
 
 1. `ticket.py show`. Only READY tickets go to the user. A ticket that is NOT
