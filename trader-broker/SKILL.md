@@ -135,14 +135,14 @@ submits orders directly to the market. So with IBKR the final yes happens in
 IBKR as well. Set `"broker": "ibkr"` in `trader/config.json`. Set its tools
 that draft orders to Needs approval too.
 
-## Setup C: Trading 212 (read only, `t212.py`)
+## Setup C: Trading 212 (`t212.py`, demo orders only)
 
-`t212.py` reads a Trading 212 account over its public API. It sends GET
-requests only and cannot place, change or cancel an order, so it is safe to
-run without a yes. Orders on Trading 212 still go through the user's app.
+`t212.py` reads a Trading 212 account over its public API (GET only), and its
+`place` command sends one order, on the **demo** account only for now.
 
-1. In the Trading 212 app, make an API key on the **demo** (practice) account
-   with read permissions (account, portfolio, orders:read, metadata).
+1. In the Trading 212 app, make an API key on the **demo** (practice) account.
+   Reading needs account, portfolio, orders:read and metadata; `place` also
+   needs orders:execute.
 2. The user exports `T212_API_KEY` and `T212_API_SECRET` in their own shell.
    **Keys never go in the chat**, same rule as Alpaca.
 3. Demo is the default. Live needs `T212_ENV=live` **and** `--live`; any
@@ -157,8 +157,28 @@ python3 "${CLAUDE_SKILL_DIR}/t212.py" ticker TSLA        # TSLA -> TSLA_US_EQ
 python3 "${CLAUDE_SKILL_DIR}/t212.py" instruments --refresh
 ```
 
-It keeps each endpoint's documented rate limit, retries only a 429, and
+It keeps each endpoint's documented rate limit, retries only a GET's 429, and
 caches the instrument list for 24 hours in `trader/cache/`.
+
+**Placing (demo).** `t212.py place N` places ticket N from `trader/orders.json`:
+
+- only if trader-risk marked that exact ticket PASS today, and it is not
+  already placed
+- sized in GBP: the USD price at the current GBP/USD rate plus Trading 212's
+  0.15% FX fee on the buy and on the sell at the stop. The loss at the stop
+  never goes over `max_loss_per_trade_gbp` (or `max_loss_per_trade_usd`
+  converted); it can cut the ticket's shares, never add to them
+- it checks pending orders and positions for a duplicate first, shows the
+  exact order and its GBP cost, and needs the user to **type yes in their own
+  terminal**. It has no `--reply` and refuses without a terminal, so Claude
+  cannot say yes for them. Tell the user to run it themselves; never run it.
+- a market entry, then a separate stop order once the entry fills. Buys send
+  a positive quantity, sells a negative one. Nothing is ever retried; after a
+  failed or unclear send, `place N --resend` checks for a duplicate again
+- live placement is switched off. When it is switched on, live places the
+  entry only and the user must set the stop in the app
+- every order and answer goes to `trader/logs/`, and each placement to
+  `trader/state/broker.json`, so trader-risk counts it
 
 ## Steps: the entry
 

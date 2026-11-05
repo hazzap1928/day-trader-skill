@@ -3,6 +3,7 @@ import email.message
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -183,13 +184,26 @@ class Environment(Base):
         self.assertEqual(req.get_header("Authorization"), "Basic " + TOKEN)
         self.assertIsNone(req.data)
 
-    def test_there_is_no_way_to_send_anything_but_get(self):
+    def test_the_only_write_is_post_order_to_the_two_order_endpoints(self):
         public = [n for n in dir(t212.Client) if not n.startswith("_")]
-        self.assertEqual(public, ["get"])
+        self.assertEqual(public, ["get", "post_order"])
+        self.assertEqual(t212.PLACE_PATHS, ("/equity/orders/market", "/equity/orders/stop"))
         with open(os.path.join(ROOT, "trader-broker", "t212.py"), encoding="utf-8") as fh:
             src = fh.read()
-        for verb in ('"POST"', '"PUT"', '"DELETE"', '"PATCH"', "/orders/market", "/orders/limit"):
+        for verb in ('"PUT"', '"DELETE"', '"PATCH"', "/orders/limit", "/orders/stop_limit"):
             self.assertNotIn(verb, src)
+        self.assertEqual(len(re.findall(r'Request\([^)]*method="POST"', src)), 1)
+        self.assertEqual(src.count("_open(req, TIMEOUT)"), 2)   # one in get, one in post_order
+
+    def test_get_cannot_reach_the_order_endpoints(self):
+        c = t212.Client("demo", KEY, SECRET, state_dir=self.dir)
+        for path in t212.PLACE_PATHS:
+            with self.assertRaises(t212.T212Error):
+                c.get(path)
+        self.assertEqual(self.calls, [])
+
+    def test_live_placement_is_switched_off(self):
+        self.assertIs(t212.LIVE_PLACEMENT_ENABLED, False)
 
     def test_redirects_are_never_followed(self):
         h = t212._NoRedirect()
@@ -308,7 +322,8 @@ class RateLimit(Base):
 
     def test_every_endpoint_has_its_documented_limit(self):
         self.assertEqual(t212.MIN_INTERVAL, {"/equity/account/summary": 5.0, "/equity/positions": 1.0,
-                                             "/equity/orders": 5.0, "/equity/metadata/instruments": 50.0})
+                                             "/equity/orders": 5.0, "/equity/metadata/instruments": 50.0,
+                                             "/equity/orders/market": 60.0 / 50, "/equity/orders/stop": 2.0})
 
 
 class Resolve(Base):
