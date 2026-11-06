@@ -280,6 +280,46 @@ class Flow(unittest.TestCase):
         self.assertIn("after you approve it there", text)
         self.assertNotIn("place_stock_order", text)
 
+    def set_broker(self, name):
+        with open(self.cfg) as fh:
+            c = json.load(fh)
+        c["broker"] = name
+        with open(self.cfg, "w") as fh:
+            json.dump(c, fh)
+
+    def test_trading_212_tickets_say_trading_212_and_the_place_command(self):
+        self.set_broker("trading212")
+        self.run_risk()
+        code, text, _ = run(self.args("show", "--index", "1"))
+        self.assertEqual(code, 0)
+        self.assertIn("ORDER 1 of 1, PAPER account, Trading 212", text)
+        self.assertNotIn("Alpaca", text)
+        self.assertNotIn("place_stock_order", text)
+        self.assertNotIn("Reply \"yes\"", text)
+        self.assertIn("python3 trader-broker/t212.py place 1", text)
+        self.assertIn("stop-loss at 358.32", text)
+        self.assertIn("take-profit at 370.04 is NOT sent", text)
+        code, text, _ = run(self.args("show", "--index", "1", "--json"))
+        doc = json.loads(text)
+        self.assertEqual((doc["broker"], doc["broker_name"], doc["tool"]), ("t212", "Trading 212", None))
+        self.assertEqual(doc["command"], "python3 trader-broker/t212.py place 1")
+        self.assertFalse(doc["take_profit_sent"])
+
+    def test_trading_212_yes_is_not_taken_in_the_chat(self):
+        self.set_broker("t212")
+        self.run_risk()
+        code, text, _ = run(self.args("approve", "--index", "1", "--reply", "yes"))
+        self.assertEqual(code, 1)
+        self.assertIn("python3 trader-broker/t212.py place 1", text)
+        self.assertFalse(os.path.exists(self.state) and self.state_doc().get("orders"))
+
+    def test_an_unknown_broker_is_refused_not_shown_as_alpaca(self):
+        self.set_broker("robinhood")
+        code, text, err = run(self.args("show", "--index", "1"))
+        self.assertEqual(code, 1)
+        self.assertIn("unknown broker 'robinhood'", err)
+        self.assertNotIn("Alpaca", text)
+
     def test_fill_sell_relieves_the_oldest_lot(self):
         pf = {"cash": 0, "positions": [{"ticker": "KO", "shares": 3, "lots": [
             {"id": "KO-1", "date": "2025-01-02", "shares": 2, "cost": 120.0},

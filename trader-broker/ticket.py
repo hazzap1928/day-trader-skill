@@ -484,12 +484,52 @@ def kind_of(order, rv):
 
 # ---------------------------------------------------------------- rendering
 
+BROKERS = {"alpaca": "alpaca", "ibkr": "ibkr", "trading212": "t212", "t212": "t212"}
+BROKER_NAMES = {"alpaca": "Alpaca", "ibkr": "Interactive Brokers", "t212": "Trading 212"}
+
+
+def broker_of(cfg):
+    """'alpaca', 'ibkr' or 't212' from the config's "broker". An unknown name is refused,
+    never shown as Alpaca."""
+    raw = str((cfg or {}).get("broker") or "alpaca").strip().lower()
+    if raw not in BROKERS:
+        raise TicketError("unknown broker %r in trader/config.json: use alpaca, ibkr or trading212"
+                          % (cfg or {}).get("broker"))
+    return BROKERS[raw]
+
+
+def t212_command(idx):
+    return "python3 trader-broker/t212.py place %d" % idx
+
+
+def t212_lines(order, idx, cfg):
+    """How Trading 212 really handles this ticket (t212.py place), in plain words."""
+    stop = order.get("stop_loss_stop_price") or (order.get("plan") or {}).get("stop")
+    target = order.get("take_profit_limit_price") or (order.get("plan") or {}).get("target")
+    out = ["  You place it yourself, in your own terminal (demo account only):",
+           "    " + t212_command(idx),
+           "  It re-sizes in GBP at the live GBP/USD rate, counting Trading 212's 0.15% FX fee",
+           "  each way, so the quantity can come down (never up). Then it asks you to type yes."]
+    if str(order.get("side", "")).lower() == "buy":
+        out.append("  Trading 212 gets a market buy, then a separate stop-loss%s (good for today)"
+                   % (" at %s" % _p(stop) if stop else ""))
+        out.append("  once the buy fills.")
+        if target:
+            out.append("  The take-profit at %s is NOT sent: Trading 212's API has no bracket. Sell it"
+                       % _p(target))
+            out.append("  yourself at the target%s." % (", and by %s New York at the latest" % cfg["flat_by"]
+                                                         if cfg.get("flat_by") else ""))
+    else:
+        out.append("  Trading 212 gets a market sell of the shares you hold.")
+    return out
+
+
 def render(order, idx, total, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
-    broker = str(cfg.get("broker", "alpaca")).lower()
+    broker = broker_of(cfg)
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, BROKER_NAMES[broker])]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -500,6 +540,8 @@ def render(order, idx, total, cfg, risk, state, today):
     if broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
+    elif broker == "t212":
+        lines.extend(t212_lines(order, idx, cfg))
     else:
         lines.append("  Claude will call place_stock_order with exactly:")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
@@ -507,7 +549,10 @@ def render(order, idx, total, cfg, risk, state, today):
         if is_bracket(order):
             lines.append("  Alpaca places the entry, then the stop-loss and the take-profit as two orders")
             lines.append("  that cancel each other: when one fills, the other is canceled.")
-    if ready:
+    if ready and broker == "t212":
+        lines.append("  Claude does not place it and cannot say yes for you: only your typed yes in")
+        lines.append("  t212.py place sends it.")
+    elif ready:
         lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
         if broker != "ibkr":
             lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
@@ -517,11 +562,15 @@ def render(order, idx, total, cfg, risk, state, today):
 def ticket_json(order, idx, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
     loss, stop = max_loss(order)
-    return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
-            "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
-            "tool_input": tool_input(order), "why": order.get("why", ""),
-            "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    broker = broker_of(cfg)
+    out = {"index": idx, "ready": ready, "status": label, "plain": plain(order),
+           "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
+           "broker": broker, "broker_name": BROKER_NAMES[broker], "tool": "place_stock_order",
+           "tool_input": tool_input(order), "why": order.get("why", ""),
+           "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    if broker == "t212":
+        out.update(tool=None, tool_input=None, command=t212_command(idx), take_profit_sent=False)
+    return out
 
 
 # ---------------------------------------------------------------- fills -> portfolio
@@ -651,6 +700,10 @@ def cmd_approve(a):
     ready, label, rv = status_of(order, risk, state, today)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
+    if broker_of(cfg) == "t212":
+        print("Not recorded: a Trading 212 order is approved by your typed yes in your own terminal, not in "
+              "the chat. Run: %s" % t212_command(a.index))
+        return 1
     ok, why = parse_yes(a.reply, order, [o.get("symbol", "") for o in orders])
     if not ok:
         print("Not recorded: %s. Ask the user again with the ticket for order %d." % (why, a.index))
@@ -660,11 +713,11 @@ def cmd_approve(a):
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
            "plain": plain(order), "status": "approved", "reply": a.reply,
-           "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", "alpaca")}
+           "paper": bool(cfg.get("paper", True)), "broker": broker_of(cfg)}
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
+    if broker_of(cfg) == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
     else:
         print("Now call place_stock_order with exactly:")
