@@ -18,6 +18,7 @@ Commands (each takes --json):
     python3 t212.py status                  # which account, is the key working
     python3 t212.py cash                    # free cash, reserved, in pies
     python3 t212.py info                    # account id, currency, totals
+    python3 t212.py fx                      # save GBP/USD to trader/fx.json (no Trading 212 call)
     python3 t212.py positions               # open positions
     python3 t212.py orders                  # pending orders
     python3 t212.py ticker TSLA             # TSLA -> TSLA_US_EQ
@@ -644,7 +645,7 @@ def loss_limit_gbp(cfg, rate):
                     "nothing is placed without a loss limit", 2)
 
 
-def size_entry(entry, stop, ticket_qty, rate, cash_gbp, cfg):
+def size_entry(entry, stop, ticket_qty, rate, cash_gbp, cfg, fractional=None):
     """GBP sizing for a long entry. Never more than the ticket's quantity, and the loss at
     the stop (price move plus the 0.15% FX fee on the buy and on the sell) never over the limit."""
     if not entry or entry <= 0 or not rate or rate <= 0:
@@ -657,7 +658,9 @@ def size_entry(entry, stop, ticket_qty, rate, cash_gbp, cfg):
     cost_ps = entry / rate * (1 + FX_FEE)
     loss_ps = (entry - stop) / rate + (entry / rate) * FX_FEE + (stop / rate) * FX_FEE
     limit, limit_src = loss_limit_gbp(cfg, rate)
-    step = 0.01 if cfg.get("fractional") else 1
+    if fractional is None:
+        fractional = bool(cfg.get("fractional"))
+    step = 0.01 if fractional else 1
     caps = [("the ticket", float(ticket_qty)), ("your max loss per trade", limit / loss_ps),
             ("the cash available to trade", max(cash_gbp, 0.0) / cost_ps)]
     if _num(cfg.get("max_order_gbp")) is not None:
@@ -677,6 +680,31 @@ def size_entry(entry, stop, ticket_qty, rate, cash_gbp, cfg):
             "fee_gbp": round(value * FX_FEE, 2), "cost_gbp": round(value * (1 + FX_FEE), 2),
             "max_loss_gbp": round(qty * loss_ps, 2), "max_loss_usd": round(qty * loss_ps * rate, 2),
             "limit_gbp": round(limit, 2), "limit_src": limit_src, "cash_gbp": cash_gbp}
+
+
+FRACTIONAL_TYPES = ("STOCK", "ETF")
+
+
+def fractional_for(cfg, inst):
+    """Fractions (0.01 of a share) only with "fractional": true AND an instrument type that
+    Trading 212 sells in fractions. Its instrument list has no per-stock flag, so stocks and
+    ETFs get fractions and anything else (warrants) whole shares; Trading 212 refuses the
+    order if a particular stock does not take them, and nothing is ever retried."""
+    return bool(cfg.get("fractional")) and str((inst or {}).get("type", "")).upper() in FRACTIONAL_TYPES
+
+
+def cmd_fx(args):
+    """Fetch GBP/USD and save it to trader/fx.json for trader-budget and trader-risk.
+    Read-only: it asks Yahoo, never Trading 212, and sends no order."""
+    rate, when, src = fetch_gbpusd()
+    fetched = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    doc = {"pair": "GBPUSD", "usd_per_gbp": rate, "quote_time": when, "fetched_at": fetched, "source": src}
+    path = os.path.join(args.state_dir, "fx.json")
+    _write_json(path, doc)
+    if args.json:
+        return dict(doc, path=path)
+    return ("GBP/USD %.4f (1 GBP = %.4f USD, %s, quoted %s)\nsaved to %s; trader-budget and trader-risk "
+            "use it for 12 hours" % (rate, rate, src, when, path))
 
 
 def size_exit(price, qty, rate):
@@ -903,6 +931,10 @@ def cmd_place(client, args):
         risk = tk.read_json(paths["risk"], "risk check", required=False)
     except tk.TicketError as e:
         raise T212Error(str(e), 2)
+    try:
+        tk.config_currency(cfg)               # a GBP config with a dollar name in it stops here
+    except tk.CurrencyError as e:
+        raise T212Error(str(e), 2)
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
     if not isinstance(orders, list) or not orders:
         raise T212Error("no tickets in %s" % paths["orders"], 2)
@@ -974,7 +1006,7 @@ def cmd_place(client, args):
     # 5. size and build the exact bodies
     if side == "buy":
         stop = _num(order.get("stop_loss_stop_price")) or _num((order.get("plan") or {}).get("stop"))
-        sz = size_entry(price, stop, ticket_qty, fx[0], cash, cfg)
+        sz = size_entry(price, stop, ticket_qty, fx[0], cash, cfg, fractional_for(cfg, inst))
         bodies = [(MARKET, market_body(ticker, "buy", sz["qty"]))]
         if client.env == "demo":
             bodies.append((STOP, stop_body(ticker, sz["qty"], stop)))
@@ -1090,6 +1122,7 @@ def build_parser():
     sub.add_parser("info", parents=[common], help="account id, currency and totals")
     sub.add_parser("positions", parents=[common], help="open positions")
     sub.add_parser("orders", parents=[common], help="pending orders")
+    sub.add_parser("fx", parents=[common], help="save the GBP/USD rate to trader/fx.json (Yahoo, no order)")
     t = sub.add_parser("ticker", parents=[common], help="map a plain ticker to a Trading 212 ticker")
     t.add_argument("symbol")
     i = sub.add_parser("instruments", parents=[common], help="the cached instrument list")
@@ -1107,6 +1140,12 @@ def main(argv=None, environ=None):
     args = build_parser().parse_args(argv)
     secrets = []
     try:
+        if args.cmd == "fx":                        # no Trading 212 request, no credentials needed
+            out = cmd_fx(args)
+            if args.json:
+                out = json.dumps(out, indent=1, sort_keys=True)
+            sys.stdout.write(out + "\n")
+            return 0
         env = pick_env(args.live, environ)          # refuse a mismatch before anything else
         key, secret = credentials(environ)
         secrets = _secrets(key, secret)

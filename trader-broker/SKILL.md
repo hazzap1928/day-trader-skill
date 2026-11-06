@@ -155,6 +155,7 @@ python3 "${CLAUDE_SKILL_DIR}/t212.py" positions --json
 python3 "${CLAUDE_SKILL_DIR}/t212.py" orders
 python3 "${CLAUDE_SKILL_DIR}/t212.py" ticker TSLA        # TSLA -> TSLA_US_EQ
 python3 "${CLAUDE_SKILL_DIR}/t212.py" instruments --refresh
+python3 "${CLAUDE_SKILL_DIR}/t212.py" fx                 # GBP/USD -> trader/fx.json (Yahoo; no Trading 212 call)
 ```
 
 It keeps each endpoint's documented rate limit, retries only a GET's 429, and

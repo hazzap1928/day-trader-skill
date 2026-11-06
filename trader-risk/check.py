@@ -124,6 +124,141 @@ CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
 
 
+# ---------------------------------------------------------------- money: USD or GBP config
+# The same block is in trader-budget/size.py, trader-risk/check.py and
+# trader-broker/ticket.py (tests/test_currency.py keeps them identical).
+# Prices are in US dollars. A GBP config ("currency": "GBP") keeps its money
+# limits in pounds under *_gbp names; they are converted to dollars at the
+# GBP/USD rate in trader/fx.json (python3 trader-broker/t212.py fx) or --fx-rate.
+# A GBP config with a dollar name in it (budget, *_usd) is refused, so a pound
+# figure is never read as dollars.
+
+GBP_KEYS = (("budget_gbp", "budget"), ("max_order_gbp", "max_order_usd"),
+            ("min_order_gbp", "min_order_usd"), ("max_loss_per_trade_gbp", "max_loss_per_trade_usd"),
+            ("max_daily_loss_gbp", "max_daily_loss_usd"))
+FX_PATH = "trader/fx.json"
+FX_MAX_HOURS = 12
+
+
+class CurrencyError(Exception):
+    pass
+
+
+def config_currency(raw):
+    """'USD' or 'GBP' for a config as written in the file. Refuses a mixed one."""
+    raw = raw or {}
+    cur = str(raw.get("currency") or "USD").strip().upper()
+    if cur not in ("USD", "GBP"):
+        raise CurrencyError("currency %r in trader/config.json: only USD or GBP" % raw.get("currency"))
+    gbp = sorted(g for g, _ in GBP_KEYS if g in raw)
+    usd = sorted(u for _, u in GBP_KEYS if u in raw)
+    if cur == "USD" and gbp:
+        raise CurrencyError("trader/config.json has %s but no \"currency\": \"GBP\"; add it so the pound "
+                            "limits are read as pounds" % ", ".join(gbp))
+    if cur == "GBP" and usd:
+        raise CurrencyError("trader/config.json says \"currency\": \"GBP\" but has %s, a dollar name; use %s "
+                            "(in pounds) instead" % (", ".join(usd), ", ".join(
+                                g for g, u in GBP_KEYS if u in usd)))
+    return cur
+
+
+def _utc_text(s):
+    import datetime as _dt
+    try:
+        return _dt.datetime.strptime(str(s).strip(), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def read_fx(path, now_utc):
+    """(USD per GBP, where it came from) from trader/fx.json, if it is fresh."""
+    import datetime as _dt
+    import json as _json
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = _json.load(fh)
+    except FileNotFoundError:
+        raise CurrencyError("your limits are in GBP and there is no GBP/USD rate at %s: run "
+                            "python3 trader-broker/t212.py fx (or pass --fx-rate 1.31)" % path)
+    except ValueError as e:
+        raise CurrencyError("%s is not valid JSON: %s" % (path, e))
+    try:
+        rate = float(doc.get("usd_per_gbp"))
+    except (TypeError, ValueError, AttributeError):
+        raise CurrencyError("%s has no usd_per_gbp number" % path)
+    at = _utc_text(doc.get("fetched_at"))
+    if at is None:
+        raise CurrencyError("%s has no fetched_at time" % path)
+    now_utc = now_utc or _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    if now_utc - at > _dt.timedelta(hours=FX_MAX_HOURS) or at - now_utc > _dt.timedelta(minutes=5):
+        raise CurrencyError("the GBP/USD rate in %s is from %s UTC, more than %d hours old: run "
+                            "python3 trader-broker/t212.py fx" % (path, doc.get("fetched_at"), FX_MAX_HOURS))
+    return rate, "%s, fetched %s UTC" % (doc.get("source") or path, doc.get("fetched_at"))
+
+
+def money_config(raw, fx_rate=None, fx_path=FX_PATH, now_utc=None):
+    """The config with every money limit in dollars, plus how it got there.
+
+    USD: returned as it is. GBP: each *_gbp limit becomes its dollar name at the
+    rate (limits rounded down to the cent, the minimum order rounded up), a
+    missing one becomes None so no dollar default fills the gap, and "money"
+    says what was converted."""
+    import math as _m
+    raw = dict(raw or {})
+    cur = config_currency(raw)
+    if cur == "USD":
+        raw["currency"] = "USD"
+        raw.setdefault("money", {"currency": "USD"})
+        return raw
+    if fx_rate is not None:
+        rate, src = float(fx_rate), "--fx-rate"
+    else:
+        rate, src = read_fx(fx_path, now_utc)
+    if not 0.5 < rate < 3.0:
+        raise CurrencyError("a GBP/USD rate of %r looks wrong (USD per GBP, e.g. 1.31)" % rate)
+    out = dict(raw, currency="GBP")
+    conv = {}
+    for g, u in GBP_KEYS:
+        v = raw.get(g)
+        if v is None:
+            out[u] = None
+            continue
+        try:
+            gbp = float(v)
+        except (TypeError, ValueError):
+            raise CurrencyError("%s must be a number of pounds, got %r" % (g, v))
+        usd = gbp * rate
+        out[u] = (_m.ceil(usd * 100 - 1e-6) if u == "min_order_usd" else _m.floor(usd * 100 + 1e-6)) / 100.0
+        conv[u] = {"gbp": gbp, "usd": out[u], "from": g}
+    out["money"] = {"currency": "GBP", "usd_per_gbp": rate, "rate_from": src, "converted": conv}
+    return out
+
+
+def gbp_label(c, usd_key):
+    """'$39.30 (GBP 30)' for a converted limit, '$50' for a dollar one."""
+    v = c.get(usd_key)
+    if v is None:
+        return "none"
+    s = "{:,.2f}".format(float(v))
+    s = "$" + (s[:-3] if s.endswith(".00") else s)
+    conv = ((c.get("money") or {}).get("converted") or {}).get(usd_key)
+    if conv:
+        g = "{:,.2f}".format(conv["gbp"])
+        s += " (GBP %s)" % (g[:-3] if g.endswith(".00") else g)
+    return s
+
+
+def money_line(c):
+    """One line for a report, or '' for a dollar config."""
+    m = c.get("money") or {}
+    if m.get("currency") != "GBP":
+        return ""
+    parts = ["%s %s" % (v["from"].replace("_gbp", "").replace("_", " "), gbp_label(c, k))
+             for k, v in m.get("converted", {}).items()]
+    return ("Your limits are in GBP, at %.4f USD per GBP (%s): %s."
+            % (m["usd_per_gbp"], m["rate_from"], "; ".join(parts)))
+
+
 class RiskError(Exception):
     pass
 
@@ -375,8 +510,17 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
 
     now          naive UTC (default: the real clock); its New York date is "today"
     price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
+    cfg = dict(cfg or {})
+    try:
+        if not cfg.get("money"):
+            if config_currency(cfg) == "GBP":
+                raise CurrencyError("this GBP config was not converted to dollars; pass it through money_config")
+            cfg = money_config(cfg)
+    except CurrencyError as e:
+        raise RiskError(str(e))
     c = dict(DEFAULTS)
-    c.update(cfg or {})
+    c.update(cfg)
+    frac_ok = bool(c.get("fractional")) and str(c.get("broker") or "").lower() in ("trading212", "t212")
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
     now_utc = now or parse_now(None)
     now_et = to_eastern(now_utc)
@@ -461,7 +605,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         if bracket:
             if notional is not None:
                 reasons.append("format: a bracket order needs a whole-share qty, not a notional amount")
-            elif _f(qty) is not None and abs(_f(qty) - round(_f(qty))) > 1e-9:
+            elif _f(qty) is not None and frac_ok and abs(_f(qty) * 100 - round(_f(qty) * 100)) > 1e-6:
+                reasons.append("format: fractional shares go to 0.01 of a share, got qty %r" % qty)
+            elif _f(qty) is not None and not frac_ok and abs(_f(qty) - round(_f(qty))) > 1e-9:
                 reasons.append("format: a bracket order takes whole shares only, got qty %r" % qty)
             if tif not in ("day", "gtc"):
                 reasons.append("format: a bracket order needs time_in_force day or gtc, got %r" % tif)
@@ -533,10 +679,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         if value is not None:
             if value < float(c.get("min_order_usd") or 0) - CENT:
                 later.append("size: %s is under your %s minimum order"
-                             % (money(value), money(c["min_order_usd"])))
+                             % (money(value), gbp_label(c, "min_order_usd")))
             if c.get("max_order_usd") and value > float(c["max_order_usd"]) + CENT:
                 later.append("size: %s is over your %s max order"
-                             % (money(value), money(c["max_order_usd"])))
+                             % (money(value), gbp_label(c, "max_order_usd")))
 
         # account effects, simulated in order
         cash = acct["cash"]
@@ -598,7 +744,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     cap = _f(c.get("max_loss_per_trade_usd"))
                     if cap and max_loss > cap + CENT:
                         later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
-                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
+                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss),
+                                                        gbp_label(c, "max_loss_per_trade_usd")))
                     min_rr = _f(c.get("min_reward_risk"))
                     if target:
                         if (long and target <= ref + CENT) or (not long and target >= ref - CENT):
@@ -618,7 +765,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 if used + max_loss > daily + CENT:
                     later.append("daily loss: %s already at risk today plus %s for this one = %s, over your %s "
                                  "daily loss limit" % (money(used), money(max_loss), money(used + max_loss),
-                                                       money(daily)))
+                                                       gbp_label(c, "max_daily_loss_usd")))
             cap_t = int(c.get("max_trades_per_day") or 0)
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
@@ -633,14 +780,14 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                             % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
                                _p(target) if target else "none", _p(risk_ps)))
                 info.append("max loss %s%s, reward:risk %s%s"
-                            % (money(max_loss), (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
+                            % (money(max_loss), (" (limit %s)" % gbp_label(c, "max_loss_per_trade_usd"))
                                if _f(c.get("max_loss_per_trade_usd")) else "",
                                ("%.2f" % rr) if rr is not None else "n/a",
                                (" (min %s)" % _num(c["min_reward_risk"])) if _f(c.get("min_reward_risk")) else ""))
             if daily or cap_t:
                 info.append("today before this: %d of %s trades, %s of %s daily loss"
                             % (len(entries_today) + batch_entries, cap_t or "unlimited",
-                               money(loss_today + batch_loss), money(daily) if daily else "no limit on"))
+                               money(loss_today + batch_loss), gbp_label(c, "max_daily_loss_usd") if daily else "no limit on"))
 
         # duplicates and the daily order limit
         key = (sym, side)
@@ -695,6 +842,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         "date": today,
         "now_new_york": now_et.strftime("%Y-%m-%d %H:%M"),
         "paper": bool(c.get("paper", True)),
+        "money": c.get("money"), "money_line": money_line(c),
         "results": results,
         "pass": sum(1 for r in results if r["verdict"] == "PASS"),
         "block": sum(1 for r in results if r["verdict"] == "BLOCK"),
@@ -717,6 +865,9 @@ def _num(x):
 
 def report(res):
     lines = []
+    if res.get("money_line"):
+        lines.append(res["money_line"])
+        lines.append("")
     for w in res["warnings"]:
         lines.append("WARNING: " + w)
     if res["warnings"]:
@@ -772,6 +923,8 @@ def main(argv=None):
     ap.add_argument("--portfolio", default="trader/portfolio.json",
                     help="your account; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default="trader/prices.json")
+    ap.add_argument("--fx", default=FX_PATH, help="GBP/USD rate file for a GBP config (default trader/fx.json)")
+    ap.add_argument("--fx-rate", type=float, help="USD per GBP, e.g. 1.31, instead of the rate file")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
     ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
@@ -788,6 +941,10 @@ def main(argv=None):
         if not isinstance(orders, list) or not orders:
             raise RiskError("no orders in %s" % a.orders)
         cfg = read_json(a.config, "config", required=False) or {}
+        try:
+            cfg = money_config(cfg, a.fx_rate, a.fx, now)
+        except CurrencyError as e:
+            raise RiskError(str(e))
         portfolio = read_json(a.portfolio, "portfolio", required=False)
         pdoc = read_json(a.prices, "prices", required=False) or {}
         prices, times = load_prices(pdoc)

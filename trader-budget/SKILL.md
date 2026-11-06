@@ -63,6 +63,15 @@ If `trader/config.json` does not exist, copy `config.example.json` into
 - **blocked**: tickers they never want to trade.
 - Keep **paper** true until they have watched it work on a paper account.
 
+**A pound account (Trading 212 in GBP).** Set `"currency": "GBP"` and write the money limits in
+pounds under `_gbp` names: `budget_gbp`, `max_loss_per_trade_gbp`, `max_daily_loss_gbp`,
+`min_order_gbp`, `max_order_gbp`. Prices stay in dollars, so trader-budget and trader-risk
+convert the pound limits at the GBP/USD rate in `trader/fx.json` (run
+`python3 trader-broker/t212.py fx`; it is good for 12 hours) or `--fx-rate 1.31`. A GBP config
+with a dollar name in it (`budget`, any `_usd` key) is refused, and so is a missing or stale rate:
+a pound figure is never read as dollars. With `"broker": "trading212"` and `"fractional": true`,
+trades size to 0.01 of a share; Trading 212 decides per stock (warrants stay whole shares).
+
 ## Step 2: size the trade
 
 ```bash

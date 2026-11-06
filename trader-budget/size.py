@@ -88,6 +88,141 @@ FRESH_MINUTES = 15
 SETUP_WORDS = {"orb": "opening-range breakout", "flag": "flag", "bounce": "oversold bounce"}
 
 
+# ---------------------------------------------------------------- money: USD or GBP config
+# The same block is in trader-budget/size.py, trader-risk/check.py and
+# trader-broker/ticket.py (tests/test_currency.py keeps them identical).
+# Prices are in US dollars. A GBP config ("currency": "GBP") keeps its money
+# limits in pounds under *_gbp names; they are converted to dollars at the
+# GBP/USD rate in trader/fx.json (python3 trader-broker/t212.py fx) or --fx-rate.
+# A GBP config with a dollar name in it (budget, *_usd) is refused, so a pound
+# figure is never read as dollars.
+
+GBP_KEYS = (("budget_gbp", "budget"), ("max_order_gbp", "max_order_usd"),
+            ("min_order_gbp", "min_order_usd"), ("max_loss_per_trade_gbp", "max_loss_per_trade_usd"),
+            ("max_daily_loss_gbp", "max_daily_loss_usd"))
+FX_PATH = "trader/fx.json"
+FX_MAX_HOURS = 12
+
+
+class CurrencyError(Exception):
+    pass
+
+
+def config_currency(raw):
+    """'USD' or 'GBP' for a config as written in the file. Refuses a mixed one."""
+    raw = raw or {}
+    cur = str(raw.get("currency") or "USD").strip().upper()
+    if cur not in ("USD", "GBP"):
+        raise CurrencyError("currency %r in trader/config.json: only USD or GBP" % raw.get("currency"))
+    gbp = sorted(g for g, _ in GBP_KEYS if g in raw)
+    usd = sorted(u for _, u in GBP_KEYS if u in raw)
+    if cur == "USD" and gbp:
+        raise CurrencyError("trader/config.json has %s but no \"currency\": \"GBP\"; add it so the pound "
+                            "limits are read as pounds" % ", ".join(gbp))
+    if cur == "GBP" and usd:
+        raise CurrencyError("trader/config.json says \"currency\": \"GBP\" but has %s, a dollar name; use %s "
+                            "(in pounds) instead" % (", ".join(usd), ", ".join(
+                                g for g, u in GBP_KEYS if u in usd)))
+    return cur
+
+
+def _utc_text(s):
+    import datetime as _dt
+    try:
+        return _dt.datetime.strptime(str(s).strip(), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def read_fx(path, now_utc):
+    """(USD per GBP, where it came from) from trader/fx.json, if it is fresh."""
+    import datetime as _dt
+    import json as _json
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = _json.load(fh)
+    except FileNotFoundError:
+        raise CurrencyError("your limits are in GBP and there is no GBP/USD rate at %s: run "
+                            "python3 trader-broker/t212.py fx (or pass --fx-rate 1.31)" % path)
+    except ValueError as e:
+        raise CurrencyError("%s is not valid JSON: %s" % (path, e))
+    try:
+        rate = float(doc.get("usd_per_gbp"))
+    except (TypeError, ValueError, AttributeError):
+        raise CurrencyError("%s has no usd_per_gbp number" % path)
+    at = _utc_text(doc.get("fetched_at"))
+    if at is None:
+        raise CurrencyError("%s has no fetched_at time" % path)
+    now_utc = now_utc or _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    if now_utc - at > _dt.timedelta(hours=FX_MAX_HOURS) or at - now_utc > _dt.timedelta(minutes=5):
+        raise CurrencyError("the GBP/USD rate in %s is from %s UTC, more than %d hours old: run "
+                            "python3 trader-broker/t212.py fx" % (path, doc.get("fetched_at"), FX_MAX_HOURS))
+    return rate, "%s, fetched %s UTC" % (doc.get("source") or path, doc.get("fetched_at"))
+
+
+def money_config(raw, fx_rate=None, fx_path=FX_PATH, now_utc=None):
+    """The config with every money limit in dollars, plus how it got there.
+
+    USD: returned as it is. GBP: each *_gbp limit becomes its dollar name at the
+    rate (limits rounded down to the cent, the minimum order rounded up), a
+    missing one becomes None so no dollar default fills the gap, and "money"
+    says what was converted."""
+    import math as _m
+    raw = dict(raw or {})
+    cur = config_currency(raw)
+    if cur == "USD":
+        raw["currency"] = "USD"
+        raw.setdefault("money", {"currency": "USD"})
+        return raw
+    if fx_rate is not None:
+        rate, src = float(fx_rate), "--fx-rate"
+    else:
+        rate, src = read_fx(fx_path, now_utc)
+    if not 0.5 < rate < 3.0:
+        raise CurrencyError("a GBP/USD rate of %r looks wrong (USD per GBP, e.g. 1.31)" % rate)
+    out = dict(raw, currency="GBP")
+    conv = {}
+    for g, u in GBP_KEYS:
+        v = raw.get(g)
+        if v is None:
+            out[u] = None
+            continue
+        try:
+            gbp = float(v)
+        except (TypeError, ValueError):
+            raise CurrencyError("%s must be a number of pounds, got %r" % (g, v))
+        usd = gbp * rate
+        out[u] = (_m.ceil(usd * 100 - 1e-6) if u == "min_order_usd" else _m.floor(usd * 100 + 1e-6)) / 100.0
+        conv[u] = {"gbp": gbp, "usd": out[u], "from": g}
+    out["money"] = {"currency": "GBP", "usd_per_gbp": rate, "rate_from": src, "converted": conv}
+    return out
+
+
+def gbp_label(c, usd_key):
+    """'$39.30 (GBP 30)' for a converted limit, '$50' for a dollar one."""
+    v = c.get(usd_key)
+    if v is None:
+        return "none"
+    s = "{:,.2f}".format(float(v))
+    s = "$" + (s[:-3] if s.endswith(".00") else s)
+    conv = ((c.get("money") or {}).get("converted") or {}).get(usd_key)
+    if conv:
+        g = "{:,.2f}".format(conv["gbp"])
+        s += " (GBP %s)" % (g[:-3] if g.endswith(".00") else g)
+    return s
+
+
+def money_line(c):
+    """One line for a report, or '' for a dollar config."""
+    m = c.get("money") or {}
+    if m.get("currency") != "GBP":
+        return ""
+    parts = ["%s %s" % (v["from"].replace("_gbp", "").replace("_", " "), gbp_label(c, k))
+             for k, v in m.get("converted", {}).items()]
+    return ("Your limits are in GBP, at %.4f USD per GBP (%s): %s."
+            % (m["usd_per_gbp"], m["rate_from"], "; ".join(parts)))
+
+
 class SizeError(Exception):
     pass
 
@@ -167,11 +302,53 @@ def read_json(path, what):
         raise SizeError("%s is not valid JSON: %s" % (path, e))
 
 
-def load_config(path):
+def load_config(path, fx_rate=None, fx_path=FX_PATH, now_utc=None):
+    """DEFAULTS, then your config with every money limit in dollars (a GBP one is converted)."""
+    raw = read_json(path, "config") if path and os.path.exists(path) else {}
+    try:
+        mc = money_config(raw, fx_rate, fx_path, now_utc)
+    except CurrencyError as e:
+        raise SizeError(str(e))
     cfg = dict(DEFAULTS)
-    if path and os.path.exists(path):
-        cfg.update(read_json(path, "config"))
+    cfg.update(mc)
     return cfg
+
+
+def converted(cfg):
+    """DEFAULTS plus a config that load_config (or money_config) has already put in dollars.
+    A GBP config that was not converted is refused, never read as dollars."""
+    cfg = dict(cfg or {})
+    try:
+        if not cfg.get("money"):
+            if config_currency(cfg) == "GBP":
+                raise CurrencyError("this GBP config was not converted to dollars; load it with load_config")
+            cfg = money_config(cfg)
+    except CurrencyError as e:
+        raise SizeError(str(e))
+    c = dict(DEFAULTS)
+    c.update(cfg)
+    return c
+
+
+def fractional_ok(c):
+    """Fractional shares in a day-trade bracket: only for Trading 212 with "fractional": true.
+    (Alpaca takes no fractions in a bracket.) Trading 212 itself has the last word per stock."""
+    return bool(c.get("fractional")) and str(c.get("broker") or "").lower() in ("trading212", "t212")
+
+
+def shares_step(usd, per_share, step):
+    """Shares that fit in usd at per_share, to the step (1 or 0.01), in exact integer cents."""
+    if step >= 1:
+        return shares_for(usd, per_share)
+    u, p = int(round(float(usd) * 100)), int(round(float(per_share) * 100))
+    if p <= 0 or u <= 0:
+        return 0
+    return (u * 100 // p) / 100.0
+
+
+def qty_text(q):
+    q = round(float(q), 2)
+    return str(int(q)) if q == int(q) else ("%.2f" % q).rstrip("0")
 
 
 def _f(x):
@@ -309,8 +486,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     price  a FRESH latest price; a market order is sized at the higher of it and the plan's entry
     cash   the cash in trader/portfolio.json, if there is one
     today  New York date (YYYY-MM-DD); a plan for another day is refused"""
-    c = dict(DEFAULTS)
-    c.update(cfg or {})
+    c = converted(cfg)
     if not isinstance(plan, dict):
         raise SizeError("the plan is not a JSON object")
     sym = str(plan.get("symbol") or "").strip().upper()
@@ -331,12 +507,17 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     if sym in blocked:
         raise SizeError("%s is on your blocked list" % sym)
 
+    gbp = c.get("currency") == "GBP"
+    if gbp and budget is not None:
+        raise SizeError("your config is in GBP: set budget_gbp in trader/config.json instead of --budget")
     budget = float(budget if budget is not None else (c.get("budget") or 0))
     if budget <= 0:
-        raise SizeError("no budget: pass --budget or set \"budget\" in trader/config.json")
+        raise SizeError("no budget: set \"budget_gbp\" in trader/config.json" if gbp else
+                        "no budget: pass --budget or set \"budget\" in trader/config.json")
     buf_pct = float(c.get("cash_buffer_pct") or 0)
     if not 0 <= buf_pct < 100:
         raise SizeError("cash_buffer_pct must be between 0 and 100")
+    step = 0.01 if fractional_ok(c) else 1
 
     if limit is not None:
         ref, ref_from = round_cent(limit), "limit"
@@ -366,18 +547,18 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     limits = []
     max_loss = _f(c.get("max_loss_per_trade_usd"))
     if max_loss:
-        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_for(max_loss, risk),
-                       "how": "%s max loss / %s risk a share" % (money(max_loss), _price(risk))})
+        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_step(max_loss, risk, step),
+                       "how": "%s max loss / %s risk a share" % (gbp_label(c, "max_loss_per_trade_usd"), _price(risk))})
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
         cap = round(budget * cap_pct / 100.0, 2)
-        limits.append({"name": "position cap", "usd": cap, "per": ref, "shares": shares_for(cap, ref),
+        limits.append({"name": "position cap", "usd": cap, "per": ref, "shares": shares_step(cap, ref, step),
                        "how": "%s%% of %s = %s / %s" % (_num(cap_pct), money(budget), money(cap), _price(ref))})
     max_order = _f(c.get("max_order_usd"))
     if max_order:
-        limits.append({"name": "max order", "usd": max_order, "per": ref, "shares": shares_for(max_order, ref),
-                       "how": "%s / %s" % (money(max_order), _price(ref))})
-    limits.append({"name": "cash", "usd": available, "per": ref, "shares": shares_for(available, ref),
+        limits.append({"name": "max order", "usd": max_order, "per": ref, "shares": shares_step(max_order, ref, step),
+                       "how": "%s / %s" % (gbp_label(c, "max_order_usd"), _price(ref))})
+    limits.append({"name": "cash", "usd": available, "per": ref, "shares": shares_step(available, ref, step),
                    "how": "%s = %s / %s" % (cash_note, money(available), _price(ref))})
 
     qty = max(0, min(l["shares"] for l in limits))
@@ -391,17 +572,17 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         if bound[0] == "max loss":
             refusal = ("one share risks %s (entry %s minus stop %s), more than your %s max loss per trade. "
                        "No order. Skip this trade, or plan a closer stop with trader-exit."
-                       % (money(risk), _price(ref), _price(stop), money(max_loss)))
+                       % (money(risk), _price(ref), _price(stop), gbp_label(c, "max_loss_per_trade_usd")))
         else:
-            refusal = ("one share of %s costs %s, more than your %s limit (%s). No order."
-                       % (sym, money(ref), bound[0], limits[[l["name"] for l in limits].index(bound[0])]["how"]))
+            refusal = ("%s share of %s costs %s, more than your %s limit (%s). No order."
+                       % ("0.01 of a" if step < 1 else "one", sym, money(ref), bound[0], limits[[l["name"] for l in limits].index(bound[0])]["how"]))
     elif _f(c.get("min_reward_risk")) and reward_c < _f(c["min_reward_risk"]) * risk_c - EPS:
         refusal = ("reward:risk %.2f (target %s, entry %s, stop %s) is under your minimum %s, so trader-risk "
                    "would block it. No order. Skip it, or make a new plan with trader-exit."
                    % (reward_c / float(risk_c), _price(target), _price(ref), _price(stop), _num(c["min_reward_risk"])))
     elif cost < float(c.get("min_order_usd") or 0) - 0.005:
-        refusal = ("%d share%s of %s is %s, under your %s minimum order. No order."
-                   % (qty, "" if qty == 1 else "s", sym, money(cost), money(c["min_order_usd"])))
+        refusal = ("%s share%s of %s is %s, under your %s minimum order. No order."
+                   % (qty_text(qty), "" if qty == 1 else "s", sym, money(cost), gbp_label(c, "min_order_usd")))
     return {
         "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
         "entry_time": plan.get("entry_time", ""), "entry_plan": round_cent(entry_plan),
@@ -412,6 +593,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
         "cost": cost, "max_loss": loss, "flat_by": plan.get("flat_by") or c.get("flat_by"),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
+        "share_step": step, "money": c.get("money"), "money_line": money_line(c),
+        "max_loss_label": gbp_label(c, "max_loss_per_trade_usd"),
     }
 
 
@@ -419,16 +602,16 @@ def bracket_order(s):
     """The one proposed order, Alpaca place_stock_order fields (strings) plus why and plan."""
     if s["refusal"] or s["qty"] <= 0:
         return None
-    o = {"symbol": s["symbol"], "side": "buy", "qty": str(int(s["qty"])), "type": s["order_type"],
+    o = {"symbol": s["symbol"], "side": "buy", "qty": qty_text(s["qty"]), "type": s["order_type"],
          "time_in_force": "day"}
     if s["order_type"] == "limit":
         o["limit_price"] = _price(s["entry"])
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "day trade")
-    why = ("%s on %s: %d shares, bound by your %s (%d x %s = %s at the stop)"
-           % (setup, s["symbol"], s["qty"], {"max loss": "%s max loss per trade" % money(s["max_loss_per_trade_usd"] or 0),
+    why = ("%s on %s: %s shares, bound by your %s (%s x %s = %s at the stop)"
+           % (setup, s["symbol"], qty_text(s["qty"]), {"max loss": "%s max loss per trade" % s.get("max_loss_label", money(s["max_loss_per_trade_usd"] or 0)),
                                              "position cap": "position cap", "max order": "max order",
                                              "cash": "cash after the buffer"}[s["bound_by"]],
-              s["qty"], _price(s["risk_per_share"]), money(s["max_loss"])))
+              qty_text(s["qty"]), _price(s["risk_per_share"]), money(s["max_loss"])))
     o.update({
         "order_class": "bracket",
         "take_profit_limit_price": _price(s["target"]),
@@ -457,17 +640,20 @@ def plan_report(s, order, notes=()):
                  % (_price(s["entry"]), src, _price(s["risk_per_share"]), _price(s["entry"]), _price(s["stop"]),
                     s["reward_risk"]))
     lines.append("")
-    lines.append("Limits (whole shares; the smallest one wins):")
+    if s.get("money_line"):
+        lines.append(s["money_line"])
+    lines.append("Limits (%s; the smallest one wins):"
+                 % ("to 0.01 of a share" if s.get("share_step", 1) < 1 else "whole shares"))
     for l in s["limits"]:
-        lines.append("  %-13s %-58s %3d shares%s" % (l["name"], l["how"], l["shares"],
+        lines.append("  %-13s %-58s %6s shares%s" % (l["name"], l["how"], qty_text(l["shares"]),
                                                       "  <- binds" if l["binds"] else ""))
     lines.append("")
     if order is None:
         lines.append("No order: " + s["refusal"])
         lines.append("Education and tooling, not financial advice.")
         return "\n".join(lines)
-    lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s = %s."
-                 % (s["qty"], s["symbol"], money(s["cost"]), _price(s["entry"]), s["qty"],
+    lines.append("Size: %s shares of %s = %s at %s. Max loss at the stop: %s x %s = %s."
+                 % (qty_text(s["qty"]), s["symbol"], money(s["cost"]), _price(s["entry"]), qty_text(s["qty"]),
                     _price(s["risk_per_share"]), money(s["max_loss"])))
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
@@ -604,6 +790,15 @@ def whole_shares(dollars, prices, order, cap, cash):
 
 def size(rows, cfg, budget=None, prices=None, whole=None, cents=False, top=None):
     """Weights mode. Pure function: weights + rules -> the full sizing result (a dict)."""
+    try:
+        if config_currency(cfg) == "GBP":
+            if not cfg.get("money"):
+                raise CurrencyError("this GBP config was not converted to dollars; load it with load_config")
+            if budget is not None:
+                raise CurrencyError("your config is in GBP: set budget_gbp in trader/config.json "
+                                    "instead of --budget")
+    except CurrencyError as e:
+        raise SizeError(str(e))
     budget = float(budget if budget is not None else (cfg.get("budget") or 0))
     if budget <= 0:
         raise SizeError("no budget: pass --budget or set \"budget\" in trader/config.json")
@@ -848,7 +1043,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Size a day trade to your budget and max loss (trader-budget).")
     ap.add_argument("--plan", default="trader/plan.json", help="the trade plan (default trader/plan.json)")
     ap.add_argument("--config", default="trader/config.json", help="rules (default trader/config.json)")
-    ap.add_argument("--budget", type=float, help="override the budget in the config")
+    ap.add_argument("--budget", type=float, help="override the budget in the config (USD configs only)")
+    ap.add_argument("--fx", default=FX_PATH, help="GBP/USD rate file for a GBP config (default trader/fx.json)")
+    ap.add_argument("--fx-rate", type=float, help="USD per GBP, e.g. 1.31, instead of the rate file")
     ap.add_argument("--limit", nargs="?", const="plan", metavar="PRICE",
                     help="a limit order instead of market, at the plan's entry or at PRICE")
     ap.add_argument("--prices", help="prices JSON (default trader/prices.json if it exists)")
@@ -866,7 +1063,7 @@ def main(argv=None):
     g.add_argument("--cents", action="store_true", help="size to the cent instead of whole dollars")
     a = ap.parse_args(argv)
     try:
-        cfg = load_config(a.config)
+        cfg = load_config(a.config, a.fx_rate, a.fx, parse_now(a.now) if a.now else None)
         if a.weights or a.targets:
             return run_weights(a, cfg)
         if a.top or a.whole_shares or a.cents:

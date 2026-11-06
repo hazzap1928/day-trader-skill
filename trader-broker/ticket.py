@@ -55,6 +55,141 @@ DOUBT_WORDS = {"no", "not", "dont", "don't", "wait", "cancel", "stop", "but", "m
                "hold", "unless", "if"}
 
 
+# ---------------------------------------------------------------- money: USD or GBP config
+# The same block is in trader-budget/size.py, trader-risk/check.py and
+# trader-broker/ticket.py (tests/test_currency.py keeps them identical).
+# Prices are in US dollars. A GBP config ("currency": "GBP") keeps its money
+# limits in pounds under *_gbp names; they are converted to dollars at the
+# GBP/USD rate in trader/fx.json (python3 trader-broker/t212.py fx) or --fx-rate.
+# A GBP config with a dollar name in it (budget, *_usd) is refused, so a pound
+# figure is never read as dollars.
+
+GBP_KEYS = (("budget_gbp", "budget"), ("max_order_gbp", "max_order_usd"),
+            ("min_order_gbp", "min_order_usd"), ("max_loss_per_trade_gbp", "max_loss_per_trade_usd"),
+            ("max_daily_loss_gbp", "max_daily_loss_usd"))
+FX_PATH = "trader/fx.json"
+FX_MAX_HOURS = 12
+
+
+class CurrencyError(Exception):
+    pass
+
+
+def config_currency(raw):
+    """'USD' or 'GBP' for a config as written in the file. Refuses a mixed one."""
+    raw = raw or {}
+    cur = str(raw.get("currency") or "USD").strip().upper()
+    if cur not in ("USD", "GBP"):
+        raise CurrencyError("currency %r in trader/config.json: only USD or GBP" % raw.get("currency"))
+    gbp = sorted(g for g, _ in GBP_KEYS if g in raw)
+    usd = sorted(u for _, u in GBP_KEYS if u in raw)
+    if cur == "USD" and gbp:
+        raise CurrencyError("trader/config.json has %s but no \"currency\": \"GBP\"; add it so the pound "
+                            "limits are read as pounds" % ", ".join(gbp))
+    if cur == "GBP" and usd:
+        raise CurrencyError("trader/config.json says \"currency\": \"GBP\" but has %s, a dollar name; use %s "
+                            "(in pounds) instead" % (", ".join(usd), ", ".join(
+                                g for g, u in GBP_KEYS if u in usd)))
+    return cur
+
+
+def _utc_text(s):
+    import datetime as _dt
+    try:
+        return _dt.datetime.strptime(str(s).strip(), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def read_fx(path, now_utc):
+    """(USD per GBP, where it came from) from trader/fx.json, if it is fresh."""
+    import datetime as _dt
+    import json as _json
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = _json.load(fh)
+    except FileNotFoundError:
+        raise CurrencyError("your limits are in GBP and there is no GBP/USD rate at %s: run "
+                            "python3 trader-broker/t212.py fx (or pass --fx-rate 1.31)" % path)
+    except ValueError as e:
+        raise CurrencyError("%s is not valid JSON: %s" % (path, e))
+    try:
+        rate = float(doc.get("usd_per_gbp"))
+    except (TypeError, ValueError, AttributeError):
+        raise CurrencyError("%s has no usd_per_gbp number" % path)
+    at = _utc_text(doc.get("fetched_at"))
+    if at is None:
+        raise CurrencyError("%s has no fetched_at time" % path)
+    now_utc = now_utc or _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    if now_utc - at > _dt.timedelta(hours=FX_MAX_HOURS) or at - now_utc > _dt.timedelta(minutes=5):
+        raise CurrencyError("the GBP/USD rate in %s is from %s UTC, more than %d hours old: run "
+                            "python3 trader-broker/t212.py fx" % (path, doc.get("fetched_at"), FX_MAX_HOURS))
+    return rate, "%s, fetched %s UTC" % (doc.get("source") or path, doc.get("fetched_at"))
+
+
+def money_config(raw, fx_rate=None, fx_path=FX_PATH, now_utc=None):
+    """The config with every money limit in dollars, plus how it got there.
+
+    USD: returned as it is. GBP: each *_gbp limit becomes its dollar name at the
+    rate (limits rounded down to the cent, the minimum order rounded up), a
+    missing one becomes None so no dollar default fills the gap, and "money"
+    says what was converted."""
+    import math as _m
+    raw = dict(raw or {})
+    cur = config_currency(raw)
+    if cur == "USD":
+        raw["currency"] = "USD"
+        raw.setdefault("money", {"currency": "USD"})
+        return raw
+    if fx_rate is not None:
+        rate, src = float(fx_rate), "--fx-rate"
+    else:
+        rate, src = read_fx(fx_path, now_utc)
+    if not 0.5 < rate < 3.0:
+        raise CurrencyError("a GBP/USD rate of %r looks wrong (USD per GBP, e.g. 1.31)" % rate)
+    out = dict(raw, currency="GBP")
+    conv = {}
+    for g, u in GBP_KEYS:
+        v = raw.get(g)
+        if v is None:
+            out[u] = None
+            continue
+        try:
+            gbp = float(v)
+        except (TypeError, ValueError):
+            raise CurrencyError("%s must be a number of pounds, got %r" % (g, v))
+        usd = gbp * rate
+        out[u] = (_m.ceil(usd * 100 - 1e-6) if u == "min_order_usd" else _m.floor(usd * 100 + 1e-6)) / 100.0
+        conv[u] = {"gbp": gbp, "usd": out[u], "from": g}
+    out["money"] = {"currency": "GBP", "usd_per_gbp": rate, "rate_from": src, "converted": conv}
+    return out
+
+
+def gbp_label(c, usd_key):
+    """'$39.30 (GBP 30)' for a converted limit, '$50' for a dollar one."""
+    v = c.get(usd_key)
+    if v is None:
+        return "none"
+    s = "{:,.2f}".format(float(v))
+    s = "$" + (s[:-3] if s.endswith(".00") else s)
+    conv = ((c.get("money") or {}).get("converted") or {}).get(usd_key)
+    if conv:
+        g = "{:,.2f}".format(conv["gbp"])
+        s += " (GBP %s)" % (g[:-3] if g.endswith(".00") else g)
+    return s
+
+
+def money_line(c):
+    """One line for a report, or '' for a dollar config."""
+    m = c.get("money") or {}
+    if m.get("currency") != "GBP":
+        return ""
+    parts = ["%s %s" % (v["from"].replace("_gbp", "").replace("_", " "), gbp_label(c, k))
+             for k, v in m.get("converted", {}).items()]
+    return ("Your limits are in GBP, at %.4f USD per GBP (%s): %s."
+            % (m["usd_per_gbp"], m["rate_from"], "; ".join(parts)))
+
+
 class TicketError(Exception):
     pass
 
@@ -391,12 +526,25 @@ def ticket_json(order, idx, cfg, risk, state, today):
 
 # ---------------------------------------------------------------- fills -> portfolio
 
+def read_config(path):
+    """trader/config.json as written (or {}). A mixed USD/GBP config is refused here too."""
+    cfg = read_json(path, "config", required=False) or {}
+    try:
+        config_currency(cfg)
+    except CurrencyError as e:
+        raise TicketError(str(e))
+    return cfg
+
+
 def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
     """Record a filled order in trader/portfolio.json: cash and shares, with a
     cost-basis lot per buy (oldest lots are relieved first on a sell)."""
     pf = read_json(portfolio_path, "portfolio", required=False)
     if pf is None:
-        budget = cfg.get("budget")
+        try:
+            budget = money_config(cfg, fx_path=FX_PATH).get("budget")     # a GBP budget_gbp, in dollars at the fx.json rate
+        except CurrencyError as e:
+            raise TicketError(str(e))
         if not budget:
             raise TicketError("no %s yet and no budget in the config to start it from" % portfolio_path)
         pf = {"cash": float(budget), "positions": []}
@@ -464,7 +612,7 @@ def _load(a):
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
     if not isinstance(orders, list) or not orders:
         raise TicketError("no orders in %s" % a.orders)
-    cfg = read_json(a.config, "config", required=False) or {}
+    cfg = read_config(a.config)
     risk = read_json(a.risk, "risk check", required=False)
     state = load_state(a.state)
     now, today = _clock(a)
@@ -570,7 +718,7 @@ def cmd_result(a):
 
 
 def cmd_fill(a):
-    cfg = read_json(a.config, "config", required=False) or {}
+    cfg = read_config(a.config)
     now = parse_now(a.now)
     date = a.date or to_eastern(now).date().isoformat()
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
@@ -584,7 +732,7 @@ def cmd_fill(a):
 
 
 def cmd_flatten(a):
-    cfg = read_json(a.config, "config", required=False) or {}
+    cfg = read_config(a.config)
     sym = a.symbol.strip().upper()
     now, today = _clock(a)
     source = "the broker, get_open_position"
