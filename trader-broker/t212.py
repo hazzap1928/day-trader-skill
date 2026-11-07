@@ -45,9 +45,12 @@ place <ticket-id> (ticket number from trader/orders.json, or its fingerprint):
     a side and a sign that disagree are refused before sending
   - sends each order once: no retry, ever. After a failed or unclear send,
     `place ID --resend` checks for a duplicate again before sending
-  - demo: a market entry, then a separate good-till-cancelled stop once the entry fills.
-    Live placement is switched off (LIVE_PLACEMENT_ENABLED); when switched on,
-    it places the entry only and you set the stop in the app yourself
+  - the same on demo and live: a market entry, then (stop_mode "broker", the
+    default) a separate good-till-cancelled stop once the entry fills, or
+    (stop_mode "market") no stop order: t212.py guard sells at market when the
+    price is at or under the stop
+  - live needs all of: T212_ENV=live, --live, and "live_enabled": true with
+    "paper": false in trader/config.json (trader-broker/go-live.sh sets them)
   - logs every order and response (never credentials) to trader/logs/
 
 Credentials come from T212_API_KEY and T212_API_SECRET (HTTP Basic: key as
@@ -93,9 +96,10 @@ MIN_INTERVAL = {SUMMARY: 5.0, POSITIONS: 1.0, ORDERS: 5.0, INSTRUMENTS: 50.0, MA
 # the scope each endpoint's 403 names in the reference
 SCOPES = {SUMMARY: "account", POSITIONS: "portfolio", ORDERS: "orders:read", INSTRUMENTS: "metadata",
           MARKET: "orders:execute", STOP: "orders:execute", CANCEL: "orders:execute"}
-# Live placement is off. Switching it on is a deliberate one-line change; even
-# then a live run places the market entry only and never the stop.
+# A code-level master switch, left False: live is switched on in trader/config.json
+# ("live_enabled": true and "paper": false, see go-live.sh), never here.
 LIVE_PLACEMENT_ENABLED = False
+STOP_MODES = ("broker", "market")
 STOP_VALIDITY = "GOOD_TILL_CANCEL"   # the stop outlives the session: a forgotten position stays protected
 FX_FEE = 0.0015          # Trading 212's FX fee, Invest and Stocks ISA, on each conversion
 FX_URL = "https://query2.finance.yahoo.com/v8/finance/chart/GBPUSD=X?range=1d&interval=1d"
@@ -214,6 +218,32 @@ def _now():
     return time.time()
 
 
+def live_switch(cfg):
+    """Live orders only with "live_enabled": true AND "paper": false in the config."""
+    cfg = cfg or {}
+    return cfg.get("live_enabled") is True and cfg.get("paper") is False
+
+
+def stop_mode(cfg):
+    """"broker": a real stop order at Trading 212. "market": the guard sells at market when the
+    price crosses the stop. The same on demo and live."""
+    m = str((cfg or {}).get("stop_mode") or "broker").strip().lower()
+    if m not in STOP_MODES:
+        raise T212Error("stop_mode in trader/config.json must be \"broker\" or \"market\", not %r"
+                        % (cfg or {}).get("stop_mode"), 2)
+    return m
+
+
+def allowed_tickers(cfg):
+    """The allow-list as a set of plain tickers, or None when there is none."""
+    a = (cfg or {}).get("allowed_tickers")
+    if a is None:
+        return None
+    if not isinstance(a, list) or not all(isinstance(x, str) and x.strip() for x in a):
+        raise T212Error("allowed_tickers in trader/config.json must be a list of tickers", 2)
+    return {x.strip().upper() for x in a}
+
+
 def _num(v):
     try:
         return float(v)
@@ -227,6 +257,7 @@ class Client(object):
 
     def __init__(self, env, key, secret, state_dir="trader", log=None):
         self.env = env
+        self.live_ok = False        # set from the config by main(); see live_switch
         self.base = BASE_URLS[env]
         self._secrets = _secrets(key, secret)
         self._auth = "Basic " + self._secrets[1]
@@ -320,10 +351,9 @@ class Client(object):
         even on a 429: the order endpoints are not idempotent. Raises PlaceError."""
         if path not in PLACE_PATHS:
             raise T212Error("unknown order endpoint %s" % path)
-        if self.env != "demo" and not LIVE_PLACEMENT_ENABLED:
-            raise T212Error("placing orders on the live account is switched off; nothing was sent", 2)
-        if self.env != "demo" and path == STOP:
-            raise T212Error("the stop is never placed on live; set it in the app. Nothing was sent", 2)
+        if self.env != "demo" and not (self.live_ok or LIVE_PLACEMENT_ENABLED):
+            raise T212Error("live trading is switched off (trader-broker/go-live.sh switches it on); "
+                            "nothing was sent", 2)
         check_sign(body, side)
         self._wait_turn(path)
         req = urllib.request.Request(self.base + path, method="POST",
@@ -361,8 +391,8 @@ class Client(object):
 
     def cancel_order(self, order_id):
         """Cancel one pending order, once, on the DEMO account only. Raises PlaceError."""
-        if self.env != "demo":
-            raise T212Error("cancelling is demo only; nothing was sent", 2)
+        if self.env != "demo" and not (self.live_ok or LIVE_PLACEMENT_ENABLED):
+            raise T212Error("live trading is switched off; nothing was cancelled", 2)
         if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
             raise T212Error("refusing to cancel: %r is not an order id" % (order_id,), 2)
         self._wait_turn(CANCEL)
@@ -526,7 +556,9 @@ def cmd_status(client, args):
         lines.append("rate limit on account/summary: %s of %s left per %ss"
                      % (rl.get("x-ratelimit-remaining", "?"), rl.get("x-ratelimit-limit", "?"),
                         rl.get("x-ratelimit-period", "?")))
-    lines.append("read only: only the place command sends orders, after your typed yes (demo only)")
+    lines.append("orders: only place (after your typed yes) and guard (exits only) send any%s"
+                 % ("" if client.env == "demo" else
+                    "; live trading is %s" % ("ON" if (client.live_ok or LIVE_PLACEMENT_ENABLED) else "OFF")))
     return "\n".join(lines)
 
 
@@ -902,7 +934,7 @@ def _today_ny(tk):
     return tk.to_eastern(_utc_now()).date().isoformat()
 
 
-def render_place(index, total, client, order, inst, sz, side, price_src, fx, bodies, rv_fp):
+def render_place(index, total, client, order, inst, sz, side, price_src, fx, bodies, rv_fp, mode="broker"):
     ccy = "USD"
     lines = ["PLACE TICKET %d of %d on %s" % (index, total, _env_line(client)),
              "  %s %s %s (%s, %s), market order" % (side.upper(), _qty(sz["qty"]), inst.get("ticker"),
@@ -912,12 +944,13 @@ def render_place(index, total, client, order, inst, sz, side, price_src, fx, bod
     if side == "buy":
         lines.append("  est. cost:   %s + 0.15%% FX fee %s = %s (cash available %s)"
                      % (_gbp(sz["value_gbp"]), _gbp(sz["fee_gbp"]), _gbp(sz["cost_gbp"]), _gbp(sz["cash_gbp"])))
-        if client.env == "demo":
+        if mode == "broker":
             lines.append("  stop:        %.2f %s, sent as a separate STOP order once the entry fills: SELL %s, "
                          "good till cancelled" % (sz["stop_usd"], ccy, _qty(sz["qty"])))
         else:
-            lines.append("  stop:        %.2f %s  NOT PLACED ON LIVE: set this stop yourself in the Trading 212 "
-                         "app straight after the entry fills" % (sz["stop_usd"], ccy))
+            lines.append("  stop:        %.2f %s, enforced by t212.py guard (stop_mode market): it sells at market "
+                         "when the price is at or under it. No stop order is sent; keep the guard running"
+                         % (sz["stop_usd"], ccy))
         target = _num((order.get("plan") or {}).get("target")) or _num(order.get("take_profit_limit_price"))
         if target:
             lines.append("  target:      %.2f %s (shown only, not sent: Trading 212's API has no bracket order)"
@@ -937,7 +970,7 @@ def render_place(index, total, client, order, inst, sz, side, price_src, fx, bod
     lines.append("  A market order can fill worse than this price, and a stop can fill below its price in a "
                  "fast market.")
     if client.env != "demo":
-        lines.append("  !!! LIVE ACCOUNT, REAL MONEY. NO STOP WILL BE PLACED. SET IT IN THE APP. !!!")
+        lines.append("  !!! LIVE ACCOUNT, REAL MONEY. !!!")
     return "\n".join(lines)
 
 
@@ -953,10 +986,9 @@ def wait_for_fill(client, ticker, want, before):
 def cmd_place(client, args):
     secrets = client._secrets
     sd = args.state_dir
-    if client.env != "demo" and not LIVE_PLACEMENT_ENABLED:
-        raise T212Error("placing orders is demo only for now; refusing on the LIVE account. Nothing was sent. "
-                        "(When live placement is switched on it will place the market entry only and you "
-                        "must set the stop yourself in the Trading 212 app.)", 2)
+    if client.env != "demo" and not (client.live_ok or LIVE_PLACEMENT_ENABLED):
+        raise T212Error("live trading is switched off: it needs \"live_enabled\": true and \"paper\": false in "
+                        "trader/config.json (trader-broker/go-live.sh). Nothing was sent.", 2)
     tk = ticket_module()
     paths = {"orders": os.path.join(sd, "orders.json"), "config": os.path.join(sd, "config.json"),
              "risk": os.path.join(sd, "state", "risk.json"), "state": os.path.join(sd, "state", "broker.json"),
@@ -971,6 +1003,8 @@ def cmd_place(client, args):
         tk.config_currency(cfg)               # a GBP config with a dollar name in it stops here
     except tk.CurrencyError as e:
         raise T212Error(str(e), 2)
+    mode = stop_mode(cfg)
+    allow = allowed_tickers(cfg)
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
     if not isinstance(orders, list) or not orders:
         raise T212Error("no tickets in %s" % paths["orders"], 2)
@@ -999,6 +1033,9 @@ def cmd_place(client, args):
     side = str(order.get("side", "")).strip().lower()
     signed_quantity(side, order.get("qty"))     # a bad side or a non-positive qty stops here
     kind = tk.kind_of(order, rv)
+    if side == "buy" and allow is not None and str(order.get("symbol", "")).upper() not in allow:
+        raise T212Error("ticket %d buys %s, which is not on your allowed_tickers list; nothing was sent"
+                        % (index, str(order.get("symbol", "")).upper()), 2)
     if side == "sell" and kind != "exit":
         raise T212Error("ticket %d would sell short; this tool only buys to open and sells what you hold" % index, 2)
     if str(order.get("type", "market")).lower() != "market":
@@ -1044,7 +1081,7 @@ def cmd_place(client, args):
         stop = _num(order.get("stop_loss_stop_price")) or _num((order.get("plan") or {}).get("stop"))
         sz = size_entry(price, stop, ticket_qty, fx[0], cash, cfg, fractional_for(cfg, inst))
         bodies = [(MARKET, market_body(ticker, "buy", sz["qty"]))]
-        if client.env == "demo":
+        if mode == "broker":
             bodies.append((STOP, stop_body(ticker, sz["qty"], stop)))
     else:
         sz = size_exit(price, ticket_qty, fx[0])
@@ -1052,7 +1089,7 @@ def cmd_place(client, args):
     for path, body in bodies:
         check_sign(body, "sell" if path == STOP else side)
 
-    _say(render_place(index, len(orders), client, order, inst, sz, side, price_src, fx, bodies, fp))
+    _say(render_place(index, len(orders), client, order, inst, sz, side, price_src, fx, bodies, fp, mode))
 
     # 6. your typed yes, for this one order
     if not _is_tty():
@@ -1099,13 +1136,13 @@ def cmd_place(client, args):
         _say("!!! Trading 212 reports this order as %s, not %s. Check it in the app now. !!!" % (got_side.upper(), side.upper()))
     result = {"ticket": index, "env": client.env, "entry": resp, "stop": None}
 
-    # 8. the stop (demo only), once the entry has filled
+    # 8. the stop, once the entry has filled: the same on demo and live
     if side != "buy":
         return result
-    if client.env != "demo":
-        _say("!!! LIVE: NO STOP WAS PLACED. Open the Trading 212 app now and set a stop: SELL %s %s at %.2f. !!!"
-             % (_qty(sz["qty"]), ticker, sz["stop_usd"]))
-        result["stop_warning"] = "set the stop in the app"
+    if mode == "market":
+        _say("STOP %.2f is enforced by t212.py guard (stop_mode market): it sells %s %s at market when the price "
+             "is at or under it. No stop order was sent. Keep the guard running." % (sz["stop_usd"], _qty(sz["qty"]), ticker))
+        result["stop_mode"] = "market"
         return result
     if not wait_for_fill(client, ticker, sz["qty"], held):
         msg = ("the entry has not filled yet (the market may be closed), so the stop was NOT placed. "
@@ -1385,21 +1422,105 @@ def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
            "clear it in %s." % (ticker, new, err, ticker, g.path))
 
 
+def guard_market(g, row, rec, held, ticket_qty, price, trail, cfg):
+    """stop_mode "market": no stop order at Trading 212. At or under the stop (the ticket's,
+    or the trail's once it has risen) the guard sells the ticket's shares at market. With the
+    trail it keeps the high and raises its own stop level (never lowers it); with
+    sell_half_at_target it sells half at market at the first check at or above the target."""
+    ticker = row["ticker"]
+    entry, stop0, target = _num(rec.get("entry")), float(rec["stop"]), _num(rec.get("target"))
+    risk = (entry - stop0) if entry else None
+    t = g.trail.get(ticker)
+    if not t or t.get("fingerprint") != rec.get("fingerprint"):
+        t = g.trail[ticker] = {"fingerprint": rec.get("fingerprint"), "high": entry or price or stop0,
+                               "stop": stop0, "half_sold": False}
+    level = max(stop0, _num(t.get("stop")) or 0)
+    row["stop"] = level
+    if price is None:
+        row["status"] = "no price"
+        g.warn("%s: Trading 212 sent no current price, so the stop %.2f could not be checked this time"
+               % (ticker, level))
+        return
+    qty = _floor(min(held, ticket_qty), 0.01 if (min(held, ticket_qty) % 1) > 1e-9 else 1)
+    if price <= level + 0.005:
+        if qty <= 0:
+            row["status"] = "nothing to sell"
+            return
+        g.log("request", method="POST", path=MARKET, body=market_body(ticker, "sell", qty), why="stop %.2f hit" % level)
+        try:
+            _, resp = guard_send_sell(g.client, ticker, qty)
+        except PlaceError as e:
+            g.log("response", path=MARKET, status=e.status, outcome=e.outcome, error=str(e))
+            if e.outcome != "rejected":
+                g.unclear[ticker] = "stop sale SELL %s: %s at %s" % (_qty(qty), e, g.out["at"])
+                g.save()
+            row["status"] = "STOP SALE FAILED" if e.outcome == "rejected" else "unclear"
+            g.warn("%s is at %s, at or under the stop %.2f, and the market sell of %s %s (%s). %s"
+                   % (ticker, _fmt(price), level, _qty(qty), "was refused" if e.outcome == "rejected" else
+                      "is UNCLEAR", e, "The next check tries again." if e.outcome == "rejected"
+                      else "Check the app NOW; the guard will not send it again."))
+            return
+        g.log("response", path=MARKET, body=resp)
+        g.state.setdefault("sold", []).append({"at": g.out["at"], "ticker": ticker, "qty": qty, "why": "stop",
+                                               "stop": level, "price_seen": price, "order_id": resp.get("id")})
+        t["sold_at_stop"] = g.out["at"]
+        g.save()
+        row.update(status="SOLD AT STOP", trail="market SELL %s at the %.2f stop (seen %s), order id %s"
+                   % (_qty(qty), level, _fmt(price), _ident(resp.get("id"))))
+        g.out["placed"] += 1
+        return
+    if trail and trail["half"] and not t.get("half_sold") and target and price >= target:
+        half = _floor(qty / 2.0, 0.01 if (cfg.get("fractional") or qty % 1 > 1e-9) else 1)
+        if half > 0:
+            g.log("request", method="POST", path=MARKET, body=market_body(ticker, "sell", half), why="half at target")
+            try:
+                _, resp = guard_send_sell(g.client, ticker, half)
+            except PlaceError as e:
+                g.log("response", path=MARKET, status=e.status, outcome=e.outcome, error=str(e))
+                if e.outcome != "rejected":
+                    g.unclear[ticker] = "half sale SELL %s: %s at %s" % (_qty(half), e, g.out["at"])
+                g.save()
+                g.warn("%s: the half sale at the target %s (%s)." % (ticker, "was refused" if e.outcome == "rejected"
+                                                                     else "is UNCLEAR, check the app", e))
+                return
+            g.log("response", path=MARKET, body=resp)
+            g.state.setdefault("sold", []).append({"at": g.out["at"], "ticker": ticker, "qty": half,
+                                                   "why": "half at target", "price_seen": price,
+                                                   "order_id": resp.get("id")})
+            row["trail"] = "SOLD HALF (%s) at the target" % _qty(half)
+            g.out["placed"] += 1
+        t["half_sold"] = True
+    if price > t["high"]:
+        t["high"] = price
+    row["high"] = t["high"]
+    if trail:
+        new = trail_level(trail, t["high"], risk)
+        if new is not None and level < new < price - 0.01:
+            row["trail"] = ((row.get("trail") or "") + "; " if row.get("trail") else "") + \
+                "raised the guard's stop %.2f -> %.2f (high %.2f)" % (level, new, t["high"])
+            level = t["stop"] = new
+        elif new is None:
+            row["trail"] = "not trailed: no entry price in the ticket record (use distance_pct)"
+    row.update(status="watching", stop=level)
+    g.save()
+
+
 def guard_pass(client, state_dir):
     """One look at every open position. Returns {"at", "positions": [...], "warnings": [...], "placed": n}."""
-    if client.env != "demo":
-        raise T212Error("the stop guardian runs on the demo account only; nothing was sent", 2)
+    if client.env != "demo" and not (client.live_ok or LIVE_PLACEMENT_ENABLED):
+        raise T212Error("live trading is switched off, so the guard does not run on live; nothing was sent", 2)
     tk = ticket_module()
     try:
         cfg = tk.read_config(os.path.join(state_dir, "config.json"))
     except tk.TicketError as e:
         raise T212Error(str(e), 2)
     trail = trail_settings(cfg)
+    mode = stop_mode(cfg)
     state = tk.load_state(os.path.join(state_dir, "state", "broker.json"))
     positions = client.get(POSITIONS) or []
     pending = client.get(ORDERS) or []
     out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
-           "trailing": trail}
+           "trailing": trail, "stop_mode": mode}
     g = _Guard(client, state_dir, out)
     held_tickers = set()
     for p in positions:
@@ -1414,10 +1535,10 @@ def guard_pass(client, state_dir):
         stops, others = guard_sell_orders(pending, ticker)
         covered = sum(abs(_num(o.get("quantity")) or 0) for o in stops)
         row["covered"] = covered
-        if others:
+        if others or (mode == "market" and stops):
             row["status"] = "exit pending"
-            row["note"] = "a sell is already pending (%s); no stop added" % ", ".join(
-                str(o.get("type", "?")) for o in others)
+            row["note"] = "a sell is already pending at Trading 212 (%s); the guard adds nothing on top" % ", ".join(
+                str(o.get("type", "?")) for o in others + (stops if mode == "market" else []))
             continue
         rec = guard_ticket(state, ticker, client.env)
         if rec is None:
@@ -1439,6 +1560,9 @@ def guard_pass(client, state_dir):
             row["status"] = "unclear"
             g.warn("%s: an earlier guard order came back unclear (%s). Nothing is sent for it; check the app, "
                    "then delete %s from \"unclear\" in %s" % (ticker, g.unclear[ticker], ticker, g.path))
+            continue
+        if mode == "market":
+            guard_market(g, row, rec, held, ticket_qty, price, trail, cfg)
             continue
         want = min(held, ticket_qty) - covered          # never more than the ticket bought
         want = _floor(want, 0.01 if (want % 1) > 1e-9 else 1)
@@ -1471,8 +1595,8 @@ def guard_pass(client, state_dir):
 
 
 def render_guard(res):
-    lines = ["%s  stop guard on %s: %d open position%s, %d order%s sent%s" % (
-        res["at"], res["env"], len(res["positions"]), "" if len(res["positions"]) == 1 else "s",
+    lines = ["%s  stop guard (%s stops) on %s: %d open position%s, %d order%s sent%s" % (
+        res["at"], res.get("stop_mode", "broker"), res["env"], len(res["positions"]), "" if len(res["positions"]) == 1 else "s",
         res["placed"], "" if res["placed"] == 1 else "s",
         "" if not res.get("trailing") else ", trailing %s%s" % (
             ("%sR" % _fmt(res["trailing"]["distance_r"])) if res["trailing"]["distance_r"] is not None
@@ -1480,6 +1604,8 @@ def render_guard(res):
             ", half at target" if res["trailing"]["half"] else ""))]
     for r in res["positions"]:
         extra = ""
+        if r.get("status") == "watching":
+            extra = ": stop %.2f, price %s" % (r["stop"], _fmt(r.get("price")))
         if r.get("status") == "stop placed":
             extra = ": SELL %s at %.2f, good till cancelled, order id %s" % (_qty(r["placed_qty"]), r["stop"],
                                                                            _ident(r.get("order_id")))
@@ -1496,12 +1622,15 @@ def render_guard(res):
 
 def cmd_guard(client, args):
     """Stop guardian. Never buys: its one write is a SELL stop for shares you hold."""
-    if client.env != "demo":
-        raise T212Error("the stop guardian runs on the demo account only; nothing was sent", 2)
+    if client.env != "demo" and not (client.live_ok or LIVE_PLACEMENT_ENABLED):
+        raise T212Error("live trading is switched off, so the guard does not run on live; nothing was sent", 2)
     if not args.watch:
         res = guard_pass(client, args.state_dir)
         return res if args.json else render_guard(res)
     tk = ticket_module()
+    if args.every is None:      # a stop the guard enforces itself wants a closer look
+        cfg = _read_json(os.path.join(args.state_dir, "config.json"), {}) or {}
+        args.every = 1 if stop_mode(cfg) == "market" else 5
     every = max(1.0, float(args.every)) * 60
     m = re.match(r"^(\d{1,2}):(\d{2})$", str(args.until).strip())
     if not m or not (0 <= int(m.group(1)) < 24 and 0 <= int(m.group(2)) < 60):
@@ -1574,9 +1703,10 @@ def build_parser():
                     help="send again after a failed or unclear send (checks for a duplicate first)")
     pl.add_argument("--fx-rate", type=float, help="USD per GBP to use instead of Yahoo's current rate")
     g = sub.add_parser("guard", parents=[common],
-                       help="DEMO: place a ticket's stop on any open position that has none (never buys)")
+                       help="protect open positions with the ticket's stop (exits only, never buys)")
     g.add_argument("--watch", action="store_true", help="wait for the open, then check every --every minutes")
-    g.add_argument("--every", type=float, default=5, help="minutes between checks with --watch (default 5)")
+    g.add_argument("--every", type=float, default=None,
+                   help="minutes between checks with --watch (default 5, or 1 with stop_mode market)")
     g.add_argument("--until", default="16:00", help="New York time --watch stops (default 16:00)")
     return p
 
@@ -1595,6 +1725,8 @@ def main(argv=None, environ=None):
         key, secret = credentials(environ)
         secrets = _secrets(key, secret)
         client = Client(env, key, secret, state_dir=args.state_dir)
+        if env == "live":
+            client.live_ok = live_switch(_read_json(os.path.join(args.state_dir, "config.json"), {}) or {})
         out = COMMANDS[args.cmd](client, args)
         if args.cmd == "guard" and out is None:
             return 0                                # --watch has already printed every pass

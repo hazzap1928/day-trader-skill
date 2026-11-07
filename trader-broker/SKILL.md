@@ -145,8 +145,11 @@ that draft orders to Needs approval too.
    needs orders:execute.
 2. The user exports `T212_API_KEY` and `T212_API_SECRET` in their own shell.
    **Keys never go in the chat**, same rule as Alpaca.
-3. Demo is the default. Live needs `T212_ENV=live` **and** `--live`; any
-   mismatch is refused before a request is sent.
+3. Demo is the default, and demo runs exactly what live runs. Live needs
+   `T212_ENV=live`, `--live`, **and** `"live_enabled": true` with `"paper": false`
+   in `trader/config.json`; anything less is refused before a request is sent.
+   Only the user switches it, with `trader-broker/go_live.py` and the checklist
+   in `trader-broker/GO_LIVE.md`. Never run `go_live.py`, never edit those keys.
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/t212.py" status            # which account, is the key working
@@ -161,7 +164,7 @@ python3 "${CLAUDE_SKILL_DIR}/t212.py" fx                 # GBP/USD -> trader/fx.
 It keeps each endpoint's documented rate limit, retries only a GET's 429, and
 caches the instrument list for 24 hours in `trader/cache/`.
 
-**Placing (demo).** `t212.py place N` places ticket N from `trader/orders.json`:
+**Placing (demo and live alike).** `t212.py place N` places ticket N from `trader/orders.json`:
 
 - only if trader-risk marked that exact ticket PASS today, and it is not
   already placed
@@ -173,23 +176,31 @@ caches the instrument list for 24 hours in `trader/cache/`.
   exact order and its GBP cost, and needs the user to **type yes in their own
   terminal**. It has no `--reply` and refuses without a terminal, so Claude
   cannot say yes for them. Tell the user to run it themselves; never run it.
-- a market entry, then a separate **good-till-cancelled** stop order once the
-  entry fills (it stays after the close, so a position you forget is still
-  covered; cancel it in the app if you sell another way). Buys send
+- only a ticker on `allowed_tickers` (when the config has the list; the
+  scanner only scans those and trader-risk blocks any other entry)
+- a market entry, then, with `"stop_mode": "broker"` (the default), a separate
+  **good-till-cancelled** stop order once the entry fills. With
+  `"stop_mode": "market"` no stop order is sent: the guard sells at market when
+  the price is at or under the stop (Trading 212's sources disagree on whether
+  live takes stop orders; market mode works either way). A broker stop stays
+  after the close, so a position you forget is still covered; cancel it in the
+  app if you sell another way. In market mode the guard checks every minute
+  and must be running for the stop to exist at all. Buys send
   a positive quantity, sells a negative one. Nothing is ever retried; after a
   failed or unclear send, `place N --resend` checks for a duplicate again
-- live placement is switched off. When it is switched on, live places the
-  entry only and the user must set the stop in the app
 - every order and answer goes to `trader/logs/`, and each placement to
   `trader/state/broker.json`, so trader-risk counts it
 
-**Stop guardian (demo).** `t212.py guard` looks at every open demo position
-and, when one has no pending stop, places the stop of the `t212.py place`
+**Stop guardian (demo and live alike).** `t212.py guard` looks at every open
+position. In broker mode, when one has no pending stop, it places the stop of the `t212.py place`
 ticket that bought it. `guard --watch` waits for the 9:30 open and checks
 every 5 minutes (`--every N`) until 16:00 New York (`--until HH:MM`); it does
 nothing on a weekend. It never buys: its one write is a SELL stop, good till
 cancelled, built and sign-checked inside the guard, for no more shares than
-the ticket bought and not already covered. It sends nothing and says why when:
+the ticket bought and not already covered. In market mode it places no stop orders: at or under the stop (the ticket's,
+or the trail's once it has risen) it sells the ticket's shares at market, once;
+a refused sale is tried again on the next check, an unclear one never. It sends
+nothing and says why when:
 
 - the position has no ticket with a stop (it never invents a stop)
 - the price is already at or under the stop (a stop then would sell at once)

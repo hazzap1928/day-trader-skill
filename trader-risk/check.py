@@ -527,6 +527,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     today = today or now_et.date().isoformat()
     acct, top_warn = account(c, portfolio, prices)
     blocked = {str(b).upper() for b in c.get("blocked") or []}
+    allow = c.get("allowed_tickers")
+    if allow is not None:
+        if not isinstance(allow, list):
+            raise RiskError("allowed_tickers in trader/config.json must be a list of tickers")
+        allow = {str(x).strip().upper() for x in allow}
     done_today = placed_today(state, today)
     count_today = len(done_today)
     entries_today = [r for r in done_today if rec_is_entry(r)]
@@ -676,6 +681,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         # blocked list and size
         if sym in blocked:
             later.append("blocked: %s is on your blocked list" % sym)
+        if allow is not None and sym not in allow:
+            later.append("allowed_tickers: %s is not on your allow-list" % sym)
         if value is not None:
             if value < float(c.get("min_order_usd") or 0) - CENT:
                 later.append("size: %s is under your %s minimum order"

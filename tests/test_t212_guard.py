@@ -155,7 +155,7 @@ class Guard(Base):
     def test_live_is_refused_before_any_request(self):
         code, _, err = self.guard("--live", environ=dict(CREDS, T212_ENV="live"))
         self.assertEqual(code, 2)
-        self.assertIn("demo account only", err)
+        self.assertIn("live trading is switched off", err)
         self.assertEqual(self.router.calls, [])
 
     def test_watch_waits_for_the_open_and_stops_at_until(self):
@@ -164,7 +164,7 @@ class Guard(Base):
         code, text, err = self.guard("--watch", "--every", "60", "--until", "11:00")
         self.assertEqual(code, 0, err)
         self.assertIn("waiting for the open", text)
-        self.assertEqual(text.count("stop guard on demo"), 2)                # 9:30 and 10:30
+        self.assertEqual(text.count("stop guard (broker stops) on demo"), 2)                # 9:30 and 10:30
         self.assertIn("past 11:00 New York", text)
         self.assertEqual(self.router.posts(), [])
 

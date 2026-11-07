@@ -256,11 +256,13 @@ class PostOrderGuards(Base):
 
     def test_live_post_is_refused_by_the_client_itself(self):
         c = t212.Client("live", KEY, SECRET, state_dir=self.dir)
+        self.assertFalse(c.live_ok)
         with self.assertRaises(t212.T212Error):
             c.post_order(t212.MARKET, {"ticker": "TSLA_US_EQ", "quantity": 1}, "buy")
-        t212.LIVE_PLACEMENT_ENABLED = True
         with self.assertRaises(t212.T212Error):
             c.post_order(t212.STOP, {"ticker": "TSLA_US_EQ", "quantity": -1, "stopPrice": 1}, "sell")
+        with self.assertRaises(t212.T212Error):
+            c.cancel_order(5)
         self.assertEqual(self.router.calls, [])
 
     def test_only_the_order_endpoints(self):
@@ -527,8 +529,8 @@ class Live(Base):
     def test_live_is_refused_before_any_request(self):
         code, _, err = self.place("1", "--live", environ=self.LIVE)
         self.assertEqual(code, 2)
-        self.assertIn("demo only", err)
-        self.assertIn("set the stop yourself", err)
+        self.assertIn("live trading is switched off", err)
+        self.assertIn('"live_enabled": true', err)
         self.assertEqual(self.router.calls, [])
         self.assertEqual(self.fx_calls, [])
 
@@ -538,17 +540,25 @@ class Live(Base):
             self.assertEqual(code, 2)
         self.assertEqual(self.router.calls, [])
 
-    def test_when_switched_on_live_places_the_entry_only_and_warns(self):
-        t212.LIVE_PLACEMENT_ENABLED = True
+    def switch_on(self, **extra):
+        self.write("config.json", dict(self.cfg, live_enabled=True, paper=False, **extra))
+
+    def test_switched_on_in_config_live_does_exactly_what_demo_does(self):
+        self.switch_on()
         self.account()
         code, out, err = self.place("1", "--live", environ=self.LIVE)
         self.assertEqual(code, 0, err)
         posts = self.router.posts()
-        self.assertEqual([p[1] for p in posts], ["/equity/orders/market"])
-        self.assertTrue(posts[0][4].startswith("https://live.trading212.com/"))
-        self.assertIn("NO STOP WILL BE PLACED", out)
-        self.assertIn("NO STOP WAS PLACED", out)
-        self.assertIn("SELL 7 TSLA_US_EQ at 358.32", out)
+        self.assertEqual([p[1] for p in posts], ["/equity/orders/market", "/equity/orders/stop"])
+        self.assertTrue(all(p[4].startswith("https://live.trading212.com/") for p in posts))
+        self.assertEqual(posts[1][2]["timeValidity"], "GOOD_TILL_CANCEL")
+        self.assertIn("LIVE ACCOUNT, REAL MONEY", out)
+
+    def test_live_enabled_alone_is_not_enough_paper_must_be_false(self):
+        self.write("config.json", dict(self.cfg, live_enabled=True, paper=True))
+        code, _, err = self.place("1", "--live", environ=self.LIVE)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.router.calls, [])
 
 
 # ------------------------------------------------------------------ never retried

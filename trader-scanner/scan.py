@@ -784,11 +784,28 @@ def read_symbols(a, offline_syms=None):
     for s in syms:
         if s not in out:
             out.append(s)
+    allow = allowed_tickers(read_config(getattr(a, "config", None)))
+    if allow is not None:
+        n = len(out)
+        out = [s for s in out if s in allow]
+        progress(a, "allowed_tickers: scanning %d of %d symbols (only the %d on your list)" % (len(out), n, len(allow)))
+        if not out:
+            raise ScanError("none of the %d symbols are on your allowed_tickers list in trader/config.json" % n)
     if a.limit:
         out = out[:a.limit]
     if not out:
         raise ScanError("no symbols to scan")
     return out
+
+
+def allowed_tickers(cfg):
+    """The config's allow-list as a set, or None when there is none. The scanner only picks from it."""
+    a = (cfg or {}).get("allowed_tickers")
+    if a is None:
+        return None
+    if not isinstance(a, list) or not all(isinstance(x, str) and x.strip() for x in a):
+        raise ScanError("allowed_tickers in trader/config.json must be a list of tickers")
+    return {x.strip().upper() for x in a}
 
 
 def symbols_from_file(path):
@@ -1054,6 +1071,8 @@ def main(argv=None):
         p.add_argument("--show", type=int, default=50, help="hits to print (all are written)")
         p.add_argument("--quiet", action="store_true")
         p.add_argument("--json", action="store_true")
+        p.add_argument("--config", default="trader/config.json",
+                       help="your rules: allowed_tickers, no_entries_after (default trader/config.json)")
 
     p = sub.add_parser("daily", help="pre-market setups from daily closes")
     common(p, 5.0, 1000000)
@@ -1064,7 +1083,6 @@ def main(argv=None):
                    help="v8 charts to fetch in stage 2, most traded first (%d; 0 = all)" % MAX_CONFIRM)
     p.add_argument("--at", help="cut the clock at this New York time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 15:30)")
-    p.add_argument("--config", default="trader/config.json")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
