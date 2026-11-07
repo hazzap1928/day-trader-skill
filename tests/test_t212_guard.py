@@ -124,7 +124,7 @@ class Guard(Base):
         self.router.add("POST", "/equity/orders/stop", FakeResp({"id": 9002}))
         code, text, _ = self.guard()
         self.assertEqual(len(self.router.posts()), 1)
-        self.assertIn("Not sent again", text)
+        self.assertIn("Nothing is sent for it", text)
 
     def test_a_refused_stop_is_reported(self):
         self.set_account([position()], stop_reply=http_error(400, "bad stop"))

@@ -37,6 +37,7 @@ python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --json
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol TSLA --date 2026-10-19 \
     --entry 364.18 --stop 358.32 --target 370.04 --entry-time "10:15 AM"
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan chart of the saved run
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" trail --until 15:55 --half --write   # trailing stop study -> trader/trail.json
 ```
 
 Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
@@ -95,6 +96,25 @@ plain line, when there are fewer than 20 full sessions, when the entry bar is
 not in the data (wrong date, not closed yet, a future day), or when the plan
 does not make sense (a stop above a buy's entry, an entry off the 5-minute
 grid). A live in-progress bar is never used.
+
+## The trailing stop study (`trail`)
+
+`trail` takes the same plan and compares its fixed target with a trailing stop at
+0.5, 0.75, 1, 1.5, 2 and 3R (`--distances`), and with `--half` also "sell half at
+the target, trail the rest". The trail follows the highest 5-minute CLOSE and is
+never lowered, the way `t212.py guard` raises it on its checks. Every row uses the
+same 10,000 replays (same seed as `run`, so the plan row matches `run` exactly)
+and the same real past sessions.
+
+It suggests the distance with the best average R, averaged with its neighbours so
+one lucky number does not win, on the real past sessions when the rule fired at
+least 15 times, else on the replays. Say all of it to the user: the table, the
+suggestion and every line under it. It says when the best does not beat the fixed
+target, when the margin is inside the noise, and when the best is the widest
+distance tried, or a flat stretch where the trail never catches up within the day
+(the same as no trail). The replays break up trends, so they understate trailing;
+the history keeps them but is about 30 trades. It never writes the config; the
+user turns it on with the `trailing_stop` block it prints.
 
 ## Steps
 

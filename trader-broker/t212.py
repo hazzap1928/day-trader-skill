@@ -84,13 +84,15 @@ ORDERS = "/equity/orders"
 INSTRUMENTS = "/equity/metadata/instruments"
 MARKET = "/equity/orders/market"
 STOP = "/equity/orders/stop"
+CANCEL = "/equity/orders/{id}"      # DELETE: the guardian cancels a stop only to raise it (demo)
 READ_PATHS = (SUMMARY, POSITIONS, ORDERS, INSTRUMENTS)
 PLACE_PATHS = (MARKET, STOP)
 # seconds between calls, from each endpoint's documented "N req / Ts"
-MIN_INTERVAL = {SUMMARY: 5.0, POSITIONS: 1.0, ORDERS: 5.0, INSTRUMENTS: 50.0, MARKET: 1.2, STOP: 2.0}
+MIN_INTERVAL = {SUMMARY: 5.0, POSITIONS: 1.0, ORDERS: 5.0, INSTRUMENTS: 50.0, MARKET: 1.2, STOP: 2.0,
+                CANCEL: 1.2}
 # the scope each endpoint's 403 names in the reference
 SCOPES = {SUMMARY: "account", POSITIONS: "portfolio", ORDERS: "orders:read", INSTRUMENTS: "metadata",
-          MARKET: "orders:execute", STOP: "orders:execute"}
+          MARKET: "orders:execute", STOP: "orders:execute", CANCEL: "orders:execute"}
 # Live placement is off. Switching it on is a deliberate one-line change; even
 # then a live run places the market entry only and never the stop.
 LIVE_PLACEMENT_ENABLED = False
@@ -356,6 +358,36 @@ class Client(object):
             raise PlaceError("Trading 212 answered %s to POST %s (expected 200)" % (status, path),
                              "unknown", status)
         return status, data
+
+    def cancel_order(self, order_id):
+        """Cancel one pending order, once, on the DEMO account only. Raises PlaceError."""
+        if self.env != "demo":
+            raise T212Error("cancelling is demo only; nothing was sent", 2)
+        if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
+            raise T212Error("refusing to cancel: %r is not an order id" % (order_id,), 2)
+        self._wait_turn(CANCEL)
+        req = urllib.request.Request(self.base + CANCEL.replace("{id}", str(order_id)), method="DELETE", headers={
+            "Authorization": self._auth, "Accept": "application/json", "User-Agent": USER_AGENT})
+        try:
+            resp = _open(req, TIMEOUT)
+        except urllib.error.HTTPError as e:
+            self._remember(CANCEL, dict(e.headers.items()) if e.headers is not None else {})
+            outcome = "rejected" if 400 <= e.code < 500 and e.code != 408 else "unknown"
+            raise PlaceError(self._http_message(CANCEL, e, "DELETE"), outcome, e.code)
+        except (urllib.error.URLError, OSError) as e:
+            raise PlaceError(self._clean("no answer from %s for DELETE %s: %s"
+                                         % (self.base, CANCEL, getattr(e, "reason", e))), "unknown")
+        try:
+            headers = dict(resp.headers.items()) if resp.headers is not None else {}
+            status = getattr(resp, "status", None) or resp.getcode()
+            resp.read()
+        finally:
+            resp.close()
+        self._remember(CANCEL, headers)
+        if status != 200:
+            raise PlaceError("Trading 212 answered %s to DELETE %s (expected 200)" % (status, CANCEL),
+                             "unknown", status)
+        return status
 
     def _http_message(self, path, e, method="GET"):
         try:
@@ -1042,7 +1074,8 @@ def cmd_place(client, args):
             "plain": "%s %s %s, market" % (side.upper(), _qty(sz["qty"]), ticker)}
     if side == "buy":
         base.update(max_loss=sz["max_loss_usd"], max_loss_gbp=sz["max_loss_gbp"], stop=sz["stop_usd"],
-                    cost_gbp=sz["cost_gbp"], fx_rate=fx[0])
+                    entry=sz["entry_usd"], cost_gbp=sz["cost_gbp"], fx_rate=fx[0],
+                    target=_num(order.get("take_profit_limit_price")) or _num((order.get("plan") or {}).get("target")))
     path, body = bodies[0]
     _record(paths["state"], state, dict(base, at=tk.ny_iso(_utc_now()), status="sending"))
     log_event(sd, secrets, "request", env=client.env, ticket=index, fingerprint=fp, method="POST", path=path, body=body)
@@ -1105,6 +1138,7 @@ def cmd_place(client, args):
 GUARD_STOP_TYPES = ("STOP", "STOP_LIMIT")
 GUARD_OPEN = (9, 30)
 GUARD_STATUSES = ("placed", "stop_placed", "stop_not_placed")
+GUARD_GONE_POLLS = 3          # looks at the pending list after a cancel, before the new stop goes in
 
 
 def guard_sell_orders(pending, ticker):
@@ -1132,7 +1166,7 @@ def guard_ticket(state, ticker, env):
 
 
 def guard_send_stop(client, ticker, qty, stop):
-    """The guardian's only write. It builds the body itself: a STOP that SELLS (negative
+    """A guardian write. It builds the body itself: a STOP that SELLS (negative
     quantity). Anything else is refused before a request is made, so it can never buy."""
     body = stop_body(ticker, qty, stop)
     if not (isinstance(body.get("quantity"), (int, float)) and body["quantity"] < 0):
@@ -1142,19 +1176,231 @@ def guard_send_stop(client, ticker, qty, stop):
     return body, resp
 
 
+def guard_send_sell(client, ticker, qty):
+    """The other guardian write: a MARKET SELL of shares you hold (half at the target).
+    Built and sign-checked here; a buy is refused before any request."""
+    body = market_body(ticker, "sell", qty)
+    if not (isinstance(body.get("quantity"), (int, float)) and body["quantity"] < 0):
+        raise T212Error("guard refused to send: it only ever sells (negative quantity)", 2)
+    check_sign(body, "sell")
+    status, resp = client.post_order(MARKET, body, "sell")
+    return body, resp
+
+
+# ---------------------------------------------------------------- trailing stop
+
+def trail_settings(cfg):
+    """None (off) or {"distance_r" | "distance_pct", "half"} from "trailing_stop" in the config."""
+    t = (cfg or {}).get("trailing_stop")
+    if not t or not t.get("enabled"):
+        return None
+    if not isinstance(t, dict):
+        raise T212Error("trailing_stop in trader/config.json must be an object", 2)
+    r, p = _num(t.get("distance_r")), _num(t.get("distance_pct"))
+    if (r is None) == (p is None):
+        raise T212Error("trailing_stop needs exactly one of distance_r (in R) or distance_pct", 2)
+    if r is not None and not 0.1 <= r <= 10:
+        raise T212Error("trailing_stop.distance_r must be between 0.1 and 10 (R)", 2)
+    if p is not None and not 0.1 <= p <= 50:
+        raise T212Error("trailing_stop.distance_pct must be between 0.1 and 50", 2)
+    return {"distance_r": r, "distance_pct": p, "half": bool(t.get("sell_half_at_target"))}
+
+
+def _cent_down(x):
+    return math.floor(round(x * 100, 6)) / 100.0
+
+
+def trail_level(trail, high, risk):
+    """The trailing stop for a high-water mark: high minus the distance, rounded down to the cent."""
+    if trail["distance_r"] is not None:
+        if not risk or risk <= 0:
+            return None
+        return _cent_down(high - trail["distance_r"] * risk)
+    return _cent_down(high * (1 - trail["distance_pct"] / 100.0))
+
+
+def _gone(client, order_id):
+    """Has a cancelled order left the pending list? A few looks, 5 seconds apart."""
+    for _ in range(GUARD_GONE_POLLS):
+        if not any(o.get("id") == order_id for o in client.get(ORDERS) or []):
+            return True
+    return False
+
+
+class _Guard(object):
+    """One pass's bookkeeping: state file, log, warnings."""
+
+    def __init__(self, client, state_dir, out):
+        self.client, self.sd, self.out = client, state_dir, out
+        self.path = os.path.join(state_dir, "state", "t212-guard.json")
+        self.state = _read_json(self.path, {}) or {}
+        self.unclear = self.state.setdefault("unclear", {})
+        self.trail = self.state.setdefault("trail", {})
+
+    def save(self):
+        _write_json(self.path, self.state)
+
+    def log(self, event, **kw):
+        log_event(self.sd, self.client._secrets, event, env=self.client.env, by="guard", **kw)
+
+    def warn(self, text):
+        self.out["warnings"].append(text)
+
+    def stop(self, ticker, qty, price, why):
+        """Place a stop; returns ('ok', resp) / ('rejected', err) / ('unknown', err)."""
+        self.log("request", method="POST", path=STOP, body=stop_body(ticker, qty, price), why=why)
+        try:
+            _, resp = guard_send_stop(self.client, ticker, qty, price)
+        except PlaceError as e:
+            self.log("response", path=STOP, status=e.status, outcome=e.outcome, error=str(e))
+            if e.outcome != "rejected":
+                self.unclear[ticker] = "stop SELL %s at %.2f: %s at %s" % (_qty(qty), price, e, self.out["at"])
+                self.save()
+            return e.outcome, e
+        self.log("response", path=STOP, body=resp)
+        self.state.setdefault("placed", []).append({"at": self.out["at"], "ticker": ticker, "qty": qty,
+                                                    "stop": price, "why": why, "order_id": resp.get("id")})
+        self.save()
+        return "ok", resp
+
+    def cancel(self, ticker, order_id):
+        self.log("request", method="DELETE", path=CANCEL, order_id=order_id)
+        try:
+            self.client.cancel_order(order_id)
+        except PlaceError as e:
+            self.log("response", path=CANCEL, status=e.status, outcome=e.outcome, error=str(e))
+            if e.outcome != "rejected":
+                self.unclear[ticker] = "cancel of stop %s: %s at %s" % (order_id, e, self.out["at"])
+                self.save()
+            return e.outcome, e
+        self.log("response", path=CANCEL, order_id=order_id, status=200)
+        return "ok", None
+
+
+def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
+    """Raise the one pending stop to the trail (never lower it); with sell_half_at_target,
+    sell half at the target first. Cancel, then place, because Trading 212 has no modify
+    and no trailing order; a refused new stop puts the old one back."""
+    ticker = row["ticker"]
+    cur = _num(stop_order.get("stopPrice"))
+    oid = stop_order.get("id")
+    sq = abs(_num(stop_order.get("quantity")) or 0)
+    entry, stop0, target = _num(rec.get("entry")), float(rec["stop"]), _num(rec.get("target"))
+    risk = (entry - stop0) if entry else None
+    t = g.trail.get(ticker)
+    if not t or t.get("fingerprint") != rec.get("fingerprint"):
+        t = g.trail[ticker] = {"fingerprint": rec.get("fingerprint"), "high": entry or price,
+                               "stop": cur, "half_sold": False}
+    if price > t["high"]:
+        t["high"] = price
+    row["high"] = t["high"]
+    g.save()
+    if cur is None or not isinstance(oid, int):
+        row["trail"] = "not trailed: the stop order has no price or id"
+        return
+    new = trail_level(trail, t["high"], risk)
+    if new is None:
+        row["trail"] = "not trailed: no entry price in the ticket record to measure R from (use distance_pct)"
+        return
+    new = max(new, cur, _num(t.get("stop")) or 0)            # never lower
+    if new >= price - 0.01:
+        new = cur                                             # a stop at the price would sell at once
+    step = max(0.05, 0.1 * (risk or new * 0.01))
+
+    if trail["half"] and not t.get("half_sold") and target and price >= target and sq > 0:
+        unit = 0.01 if (cfg.get("fractional") and str(cfg.get("broker", "")).lower() in ("trading212", "t212")) \
+            or abs(sq - round(sq)) > 1e-9 else 1
+        half = _floor(sq / 2.0, unit)
+        rest = round(sq - half, 2)
+        if half <= 0:
+            row["trail"] = "half at target: %s shares cannot be halved" % _qty(sq)
+            t["half_sold"] = True
+            g.save()
+        else:
+            o, err = g.cancel(ticker, oid)
+            if o != "ok":
+                g.warn("%s reached the target %.2f but the stop could not be cancelled (%s), so nothing was sold. "
+                       "Not retried%s." % (ticker, target, err, "" if o == "rejected" else "; it is UNCLEAR, check the app"))
+                return
+            _gone(g.client, oid)
+            g.log("request", method="POST", path=MARKET, body=market_body(ticker, "sell", half), why="half at target")
+            try:
+                _, resp = guard_send_sell(g.client, ticker, half)
+            except PlaceError as e:
+                g.log("response", path=MARKET, status=e.status, outcome=e.outcome, error=str(e))
+                if e.outcome == "rejected":
+                    o2, _ = g.stop(ticker, sq, cur, "put back after a refused half sale")
+                    g.warn("%s: the half sale at the target was refused (%s); the stop %s"
+                           % (ticker, e, "was put back at %.2f" % cur if o2 == "ok" else
+                              "COULD NOT BE PUT BACK: the position has NO STOP. Set one in the app now"))
+                    return
+                g.unclear[ticker] = "half sale SELL %s: %s at %s" % (_qty(half), e, g.out["at"])
+                g.save()
+                o2, _ = g.stop(ticker, rest, new, "after an unclear half sale")
+                g.warn("%s: the half sale is UNCLEAR (%s). A stop for the other %s was %s. The guard stops "
+                       "touching %s until you check the app and clear it in %s."
+                       % (ticker, e, _qty(rest), "placed at %.2f" % new if o2 == "ok" else "NOT placed", ticker, g.path))
+                return
+            g.log("response", path=MARKET, body=resp)
+            t["half_sold"] = True
+            g.state.setdefault("sold", []).append({"at": g.out["at"], "ticker": ticker, "qty": half,
+                                                   "price_seen": price, "target": target, "order_id": resp.get("id")})
+            g.save()
+            o2, err2 = g.stop(ticker, rest, new, "the rest after half at target")
+            if o2 == "ok":
+                t["stop"] = new
+                g.save()
+                row["trail"] = "SOLD HALF (%s) at the target, stop on the other %s at %.2f" % (_qty(half), _qty(rest), new)
+            else:
+                g.warn("%s: sold half at the target, but the stop for the other %s %s (%s). %s"
+                       % (ticker, _qty(rest), "was refused" if o2 == "rejected" else "is UNCLEAR", err2,
+                          "The next pass puts it back." if o2 == "rejected" else "Check the app now."))
+            g.out["placed"] += 1
+            return
+
+    if new < cur + step - 1e-9:
+        row["trail"] = "stop %.2f, high %.2f: no raise yet (trail at %.2f)" % (cur, t["high"], max(new, cur))
+        return
+    o, err = g.cancel(ticker, oid)
+    if o != "ok":
+        g.warn("%s: could not cancel the stop at %.2f to raise it to %.2f (%s). %s"
+               % (ticker, cur, new, err, "It stays where it is." if o == "rejected"
+                  else "UNCLEAR: check the app; the guard leaves %s alone until you clear it." % ticker))
+        return
+    _gone(g.client, oid)
+    o, err = g.stop(ticker, sq, new, "trail raise from %.2f" % cur)
+    if o == "ok":
+        t["stop"] = new
+        g.save()
+        row["trail"] = "RAISED the stop %.2f -> %.2f (high %.2f)" % (cur, new, t["high"])
+        g.out["placed"] += 1
+        return
+    if o == "rejected":
+        o2, _ = g.stop(ticker, sq, cur, "put back after a refused raise")
+        g.warn("%s: the raised stop %.2f was refused (%s); the old stop %s"
+               % (ticker, new, err, "was put back at %.2f" % cur if o2 == "ok" else
+                  "COULD NOT BE PUT BACK: the position has NO STOP. Set one in the app now"))
+        return
+    g.warn("%s: the raised stop %.2f is UNCLEAR (%s). Check the app; the guard leaves %s alone until you "
+           "clear it in %s." % (ticker, new, err, ticker, g.path))
+
+
 def guard_pass(client, state_dir):
     """One look at every open position. Returns {"at", "positions": [...], "warnings": [...], "placed": n}."""
     if client.env != "demo":
         raise T212Error("the stop guardian runs on the demo account only; nothing was sent", 2)
     tk = ticket_module()
-    secrets = client._secrets
-    gpath = os.path.join(state_dir, "state", "t212-guard.json")
-    gstate = _read_json(gpath, {}) or {}
-    unclear = gstate.setdefault("unclear", {})
+    try:
+        cfg = tk.read_config(os.path.join(state_dir, "config.json"))
+    except tk.TicketError as e:
+        raise T212Error(str(e), 2)
+    trail = trail_settings(cfg)
     state = tk.load_state(os.path.join(state_dir, "state", "broker.json"))
     positions = client.get(POSITIONS) or []
     pending = client.get(ORDERS) or []
-    out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0}
+    out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
+           "trailing": trail}
+    g = _Guard(client, state_dir, out)
     held_tickers = set()
     for p in positions:
         ticker = _o_ticker(p)
@@ -1179,61 +1425,59 @@ def guard_pass(client, state_dir):
                 row["status"] = "covered"
             else:
                 row["status"] = "no ticket stop"
-                out["warnings"].append("%s: %s held, %s covered by a stop, and no t212.py place ticket with a "
-                                       "stop for it. Set a stop yourself in the app." % (ticker, _qty(held), _qty(covered)))
+                g.warn("%s: %s held, %s covered by a stop, and no t212.py place ticket with a stop for it. "
+                       "Set a stop yourself in the app." % (ticker, _qty(held), _qty(covered)))
             continue
-        stop, ticket_qty = float(rec["stop"]), float(_num(rec["qty"]))
+        tr = g.trail.get(ticker) or {}
+        trailed = _num(tr.get("stop")) if tr.get("fingerprint") == rec.get("fingerprint") else None
+        stop = max(float(rec["stop"]), trailed or 0)              # a trailed stop is never put back lower
+        ticket_qty = float(_num(rec["qty"]))
+        if tr.get("half_sold") and tr.get("fingerprint") == rec.get("fingerprint"):
+            ticket_qty = min(ticket_qty, held)
         row["stop"] = stop
+        if g.unclear.get(ticker):
+            row["status"] = "unclear"
+            g.warn("%s: an earlier guard order came back unclear (%s). Nothing is sent for it; check the app, "
+                   "then delete %s from \"unclear\" in %s" % (ticker, g.unclear[ticker], ticker, g.path))
+            continue
         want = min(held, ticket_qty) - covered          # never more than the ticket bought
         want = _floor(want, 0.01 if (want % 1) > 1e-9 else 1)
         if want <= 0:
             row["status"] = "covered"
-            continue
-        if unclear.get(ticker):
-            row["status"] = "unclear"
-            out["warnings"].append("%s: an earlier guard stop came back unclear (%s). Not sent again; check the "
-                                   "app, then delete %s from %s" % (ticker, unclear[ticker], ticker, gpath))
+            if trail and price is not None:
+                guard_trail(g, row, rec, stops[0], held, price, trail, cfg) if len(stops) == 1 else \
+                    row.update(trail="not trailed: %d stop orders cover it, the guard trails exactly one" % len(stops))
             continue
         if price is None or price <= stop + 0.005:
             row["status"] = "below stop"
-            out["warnings"].append("%s is at %s, at or under the ticket's stop %.2f: a stop now would sell at once, "
-                                   "so the guard did not place it. Decide yourself in the app."
-                                   % (ticker, _fmt(price) if price is not None else "an unknown price", stop))
+            g.warn("%s is at %s, at or under the stop %.2f: a stop now would sell at once, so the guard did not "
+                   "place it. Decide yourself in the app."
+                   % (ticker, _fmt(price) if price is not None else "an unknown price", stop))
             continue
-        log_event(state_dir, secrets, "request", env=client.env, by="guard", method="POST", path=STOP,
-                  body=stop_body(ticker, want, stop))
-        try:
-            body, resp = guard_send_stop(client, ticker, want, stop)
-        except PlaceError as e:
-            log_event(state_dir, secrets, "response", env=client.env, by="guard", path=STOP, status=e.status,
-                      outcome=e.outcome, error=str(e))
-            if e.outcome != "rejected":
-                unclear[ticker] = "%s at %s" % (e, out["at"])
-                _write_json(gpath, gstate)
-            row["status"] = "stop failed" if e.outcome == "rejected" else "unclear"
-            out["warnings"].append("%s: the guard's stop (SELL %s at %.2f) %s: %s. Not retried."
-                                   % (ticker, _qty(want), stop, "was refused" if e.outcome == "rejected"
-                                      else "is UNCLEAR", e))
+        o, err = g.stop(ticker, want, stop, "missing stop")
+        if o != "ok":
+            row["status"] = "stop failed" if o == "rejected" else "unclear"
+            g.warn("%s: the guard's stop (SELL %s at %.2f) %s: %s. Not retried."
+                   % (ticker, _qty(want), stop, "was refused" if o == "rejected" else "is UNCLEAR", err))
             continue
-        log_event(state_dir, secrets, "response", env=client.env, by="guard", path=STOP, body=resp)
-        gstate.setdefault("placed", []).append({"at": out["at"], "ticker": ticker, "qty": want, "stop": stop,
-                                                "order_id": resp.get("id"), "fingerprint": rec.get("fingerprint")})
-        _write_json(gpath, gstate)
-        row.update(status="stop placed", placed_qty=want, order_id=resp.get("id"))
+        row.update(status="stop placed", placed_qty=want, order_id=err.get("id") if isinstance(err, dict) else None)
         out["placed"] += 1
     for o in pending:
         t = _o_ticker(o)
         if t and t not in held_tickers and o in guard_sell_orders(pending, t)[0]:
-            out["warnings"].append("%s: a sell stop (%s at %s) is pending but you hold none; it is good till "
-                                   "cancelled, so cancel it in the app" % (t, _qty(o.get("quantity")),
-                                                                         _fmt(o.get("stopPrice"))))
+            g.warn("%s: a sell stop (%s at %s) is pending but you hold none; it is good till cancelled, so "
+                   "cancel it in the app" % (t, _qty(o.get("quantity")), _fmt(o.get("stopPrice"))))
     return out
 
 
 def render_guard(res):
-    lines = ["%s  stop guard on %s: %d open position%s, %d stop%s placed" % (
+    lines = ["%s  stop guard on %s: %d open position%s, %d order%s sent%s" % (
         res["at"], res["env"], len(res["positions"]), "" if len(res["positions"]) == 1 else "s",
-        res["placed"], "" if res["placed"] == 1 else "s")]
+        res["placed"], "" if res["placed"] == 1 else "s",
+        "" if not res.get("trailing") else ", trailing %s%s" % (
+            ("%sR" % _fmt(res["trailing"]["distance_r"])) if res["trailing"]["distance_r"] is not None
+            else "%s%%" % _fmt(res["trailing"]["distance_pct"]),
+            ", half at target" if res["trailing"]["half"] else ""))]
     for r in res["positions"]:
         extra = ""
         if r.get("status") == "stop placed":
@@ -1241,6 +1485,8 @@ def render_guard(res):
                                                                            _ident(r.get("order_id")))
         elif r.get("note"):
             extra = ": " + r["note"]
+        if r.get("trail"):
+            extra += "; " + r["trail"]
         lines.append("  %-12s %s held, %s covered  %s%s" % (r["ticker"], _qty(r["held"]), _qty(r.get("covered", 0)),
                                                          r.get("status", "?"), extra))
     for w in res["warnings"]:

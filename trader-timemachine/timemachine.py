@@ -676,12 +676,8 @@ def verdict_notes(mc):
     return notes
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
-    """Chart JSON text + a normalized plan -> the timemachine.json document."""
-    if not 1 <= replays <= 1000000:
-        raise TMError("--replays must be between 1 and 1,000,000")
-    if not 0 <= window <= 10:
-        raise TMError("--window must be between 0 and 10 bars")
+def prepare(text, plan, now_utc, until=None):
+    """The data a replay needs: bars, the entry bar k, the last bar, past full sessions, the pool."""
     sym = plan["symbol"]
     result = chart_result(text, sym)
     meta, bars, dropped = parse_bars(result, now_utc)
@@ -721,6 +717,21 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         raise TMError("only %d full session(s) of %s before %s in the data; the time machine needs at least %d"
                       % (len(sessions), sym, plan["date"], MIN_SESSIONS))
     pool = build_pool(sessions)
+    return {"sym": sym, "msym": msym, "bars": bars, "dropped": dropped, "k": k, "last": last,
+            "until_min": until_min, "entry_day": entry_day, "warn": warn, "sessions": sessions,
+            "short": short, "pool": pool}
+
+
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
+    """Chart JSON text + a normalized plan -> the timemachine.json document."""
+    if not 1 <= replays <= 1000000:
+        raise TMError("--replays must be between 1 and 1,000,000")
+    if not 0 <= window <= 10:
+        raise TMError("--window must be between 0 and 10 bars")
+    P = prepare(text, plan, now_utc, until)
+    sym, msym, bars, dropped, k, last = P["sym"], P["msym"], P["bars"], P["dropped"], P["k"], P["last"]
+    until_min, entry_day, warn, sessions, short, pool = (P["until_min"], P["entry_day"], P["warn"],
+                                                         P["sessions"], P["short"], P["pool"])
     mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"])
     mc = dict(mc, until=clock24(until_min), pool_sessions=len(sessions), pool_from=sessions[0][0],
               pool_to=sessions[-1][0],
@@ -751,6 +762,209 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "note": ("A simulation built from %s's own last %d full sessions. It is not a prediction: earnings, "
                  "news and halts can do things those sessions never did. Same seed, same numbers." % (sym, len(sessions))),
     }
+
+
+# ---------------------------------------------------------------- trailing stop study
+
+TRAIL_DISTANCES = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
+TRAIL_MIN_HISTORY = 15      # fewer real trades than this and the suggestion leans on the replays
+
+
+def _cent_down(x):
+    return math.floor(round(x * 100, 6)) / 100.0
+
+
+def trail_outcome(path, entry, stop, target, dist_r, half):
+    """R for one long trade over bars [(high, low, close), ...] after the entry.
+
+    dist_r None = the plan as it is: the stop and a fixed target (touched by a bar's high).
+    Otherwise the stop trails dist_r x risk under the highest CLOSE so far and is never
+    lowered, the way t212.py guard raises it on its 5-minute checks. With half, half is
+    sold at the first close at or above the target and the rest keeps trailing. The stop
+    is checked first in each bar (conservative); a stop fills at the stop, a gap can be worse."""
+    risk = entry - stop
+    cur, hw, pos, got, half_done, last = stop, entry, 1.0, 0.0, False, entry
+    for hi, lo, cl in path:
+        if lo <= cur:
+            got += pos * (cur - entry)
+            return got / risk, ("stop" if cur <= stop + 1e-9 and not half_done else "trailed out")
+        if dist_r is None:
+            if hi >= target:
+                return (target - entry) / risk, "target"
+        else:
+            if half and not half_done and cl >= target:
+                got += 0.5 * (cl - entry)
+                pos, half_done = 0.5, True
+            if cl > hw:
+                hw = cl
+                cur = max(cur, _cent_down(hw - dist_r * risk))
+        last = cl
+    got += pos * (last - entry)
+    return got / risk, "close"
+
+
+def mc_paths(pool, entry, k, last, replays, seed, window):
+    """The same draws as simulate(): same seed, same order, so the plan row matches `run`."""
+    def slot(rng, i):
+        return i if window == 0 else min(SESSION_BARS - 1, max(1, i + rng.randint(-window, window)))
+    rng = random.Random(seed)
+    choice = rng.choice
+    paths = []
+    for _ in range(replays):
+        p, path = entry, []
+        for i in range(k + 1, last + 1):
+            o, h, l, c = choice(pool[slot(rng, i)])
+            path.append((p * h, p * l, p * c))
+            p = p * c
+        paths.append(path)
+    return paths
+
+
+def history_paths(sessions, rule, last):
+    """The plan's rule on each past session (as history_replay): entry, stop, target and the real bars after."""
+    n = rule["or_minutes"] // 5
+    out = []
+    for d, D in sessions:
+        oh, ol = opening_range(D, n)
+        kk = next((i for i in range(n, last + 1) if D[i]["c"] > oh), None)
+        if kk is None:
+            continue
+        e = round(D[kk]["c"], 2)
+        s = rule_stop(rule, oh, ol, e, True)
+        if e - s <= 0:
+            continue
+        t = round(e + rule["target_r"] * (e - s), 2)
+        out.append((d, e, s, t, [(b["h"], b["l"], b["c"]) for b in D[kk + 1:last + 1]]))
+    return out
+
+
+def _summary(Rs, kinds):
+    n = len(Rs)
+    if not n:
+        return {"n": 0}
+    srt = sorted(Rs)
+    return {"n": n, "avg_R": round(statistics.mean(Rs), 3), "median_R": round(pct(srt, 0.5), 3),
+            "p_green": round(sum(1 for r in Rs if r > 0) / n, 4),
+            "p_full_loss": round(sum(1 for r in Rs if r <= -0.999) / n, 4),
+            "p_trailed_out": round(kinds.count("trailed out") / n, 4)}
+
+
+def trail_study(text, plan, now_utc, distances=TRAIL_DISTANCES, half=False, replays=10000, seed=19, window=2,
+                until=None, source="yahoo"):
+    """Compare the plan's fixed target with trailing stops at several distances, on the
+    same Monte Carlo replays and the same real past sessions, and suggest a distance."""
+    if plan["side"] != "buy":
+        raise TMError("the trailing stop study is for buys (long trades) only")
+    if not 1 <= replays <= 200000:
+        raise TMError("--replays must be between 1 and 200,000 for the trail study")
+    dists = sorted({float(d) for d in distances})
+    if not dists or any(not 0.1 <= d <= 10 for d in dists):
+        raise TMError("--distances are in R, each between 0.1 and 10, e.g. 0.5,1,1.5")
+    P = prepare(text, plan, now_utc, until)
+    entry, stop, target = plan["entry"], plan["stop"], plan["target"]
+    paths = mc_paths(P["pool"], entry, P["k"], P["last"], replays, seed, window)
+    rule = resolve_rule(plan, P["entry_day"])
+    hist = history_paths(P["sessions"], rule, P["last"]) if rule else []
+    modes = [("trail", False)] + ([("half then trail", True)] if half else [])
+    rows = []
+    for label, dist, hf in [("plan: fixed target", None, False)] + [
+            (m, d, hf) for m, hf in modes for d in dists]:
+        mc = [trail_outcome(pth, entry, stop, target, dist, hf) for pth in paths]
+        hs = [trail_outcome(b, e, s, t, dist, hf) for _, e, s, t, b in hist]
+        rows.append({"mode": label, "distance_r": dist, "half": hf,
+                     "mc": _summary([r for r, _ in mc], [x for _, x in mc]),
+                     "history": _summary([r for r, _ in hs], [x for _, x in hs])})
+    use_hist = len(hist) >= TRAIL_MIN_HISTORY
+    basis = "history" if use_hist else "mc"
+    for m, hf in modes:
+        group = [r for r in rows if r["distance_r"] is not None and r["half"] == hf]
+        for j, r in enumerate(group):          # each distance with its neighbours: less luck from one number
+            nb = group[max(0, j - 1):j + 2]
+            r["score"] = round(statistics.mean(x[basis]["avg_R"] for x in nb), 3)
+    cands = [r for r in rows if "score" in r]
+    best = max(cands, key=lambda r: (r["score"], r["distance_r"]))   # a tie goes to the wider trail
+    plan_row = rows[0]
+    beats = best[basis]["avg_R"] > plan_row[basis]["avg_R"]
+    return {
+        "created_by": "trader-timemachine", "kind": "trail",
+        "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "source": source,
+        "plan": {kk: v for kk, v in plan.items() if v is not None},
+        "replays": replays, "seed": seed, "window": window, "until": clock24(P["until_min"]),
+        "pool_sessions": len(P["sessions"]), "pool_from": P["sessions"][0][0], "pool_to": P["sessions"][-1][0],
+        "history_trades": len(hist), "history_rule": rule, "basis": basis,
+        "rows": rows,
+        "suggestion": {"distance_r": best["distance_r"], "sell_half_at_target": best["half"],
+                       "score": best["score"], "beats_plan": beats,
+                       "margin_R": round(best[basis]["avg_R"] - plan_row[basis]["avg_R"], 3),
+                       "plateau_from": _plateau(rows, best, basis),
+                       "at_edge": "widest" if best["distance_r"] == dists[-1] else
+                                  "tightest" if best["distance_r"] == dists[0] else None,
+                       "config": {"trailing_stop": {"enabled": True, "distance_r": best["distance_r"],
+                                                    "sell_half_at_target": best["half"]}}},
+        "warnings": P["warn"],
+    }
+
+
+def _plateau(rows, best, basis):
+    """The smallest distance from which the best mode's result stops changing, when the
+    best is on that flat stretch (a trail that never catches up within the day)."""
+    group = [r for r in rows if r["distance_r"] is not None and r["half"] == best["half"]]
+    flat = None
+    for r in reversed(group):
+        if r[basis]["avg_R"] != group[-1][basis]["avg_R"]:
+            break
+        flat = r["distance_r"]
+    if flat is None or flat == group[-1]["distance_r"] or best["distance_r"] < flat:
+        return None
+    return flat
+
+
+def trail_report(doc):
+    p = doc["plan"]
+    risk = p["entry"] - p["stop"]
+    L = ["%s buy %s: entry %.2f at %s, stop %.2f (risk %.2f a share), target %.2f."
+         % (p["symbol"], p["date"], p["entry"], p.get("entry_time", "?"), p["stop"], risk, p["target"]),
+         "Trailing stop study: the stop trails N x risk under the highest 5-minute close, never lowered, "
+         "like t212.py guard. To %s, seed %d." % (doc["until"], doc["seed"]),
+         "Replays: %d, drawn from %d full sessions (%s to %s). History: the same rule fired on %d of them."
+         % (doc["replays"], doc["pool_sessions"], doc["pool_from"], doc["pool_to"], doc["history_trades"]), "",
+         "  %-18s %6s | %8s %7s %8s | %8s %7s %4s" % ("", "trail", "avg R", "green", "full -1R",
+                                                     "avg R", "green", "n"),
+         "  %-18s %6s | %25s | %21s" % ("", "", "replays", "history")]
+    for r in doc["rows"]:
+        h = r["history"]
+        L.append("  %-18s %6s | %+8.3f %6.1f%% %7.1f%% | %8s %7s %4s%s" % (
+            r["mode"], "-" if r["distance_r"] is None else "%gR" % r["distance_r"],
+            r["mc"]["avg_R"], 100 * r["mc"]["p_green"], 100 * r["mc"]["p_full_loss"],
+            ("%+.3f" % h["avg_R"]) if h.get("n") else "-", ("%.1f%%" % (100 * h["p_green"])) if h.get("n") else "-",
+            h.get("n", 0), "  <- suggested" if r["distance_r"] == doc["suggestion"]["distance_r"]
+            and r["half"] == doc["suggestion"]["sell_half_at_target"] and r["distance_r"] is not None else ""))
+    sg = doc["suggestion"]
+    L += ["",
+          "Suggested: distance_r %g%s (best average R on the %s, averaged with its neighbours: %+.3f)."
+          % (sg["distance_r"], ", sell half at the target" if sg["sell_half_at_target"] else "",
+             "real past sessions" if doc["basis"] == "history" else "replays (too few real trades to lean on)",
+             sg["score"])]
+    if not sg["beats_plan"]:
+        L.append("It did NOT beat the plan's fixed target on that basis: trailing is not an edge here.")
+    elif abs(sg["margin_R"]) < 0.1:
+        L.append("It beats the plan's fixed target by only %+.3fR a trade, inside the noise of %d trades."
+                 % (sg["margin_R"], doc["history_trades"] if doc["basis"] == "history" else doc["replays"]))
+    if sg.get("plateau_from") is not None:
+        L.append("From %gR up the results stop changing: a trail that wide never catches up within the day, so "
+                 "this is the same as no trail at all (keep the first stop, hold to %s). Trailing did not help "
+                 "here." % (sg["plateau_from"], doc["until"]))
+    elif sg["at_edge"] == "widest":
+        L.append("That is the widest distance tried: a trail this wide hardly moves in a day, so it is close to "
+                 "keeping the first stop and holding to %s. Try wider with --distances to see if it keeps rising."
+                 % doc["until"])
+    elif sg["at_edge"] == "tightest":
+        L.append("That is the tightest distance tried. Try tighter with --distances before trusting it.")
+    L += ["For trader/config.json:", "  " + json.dumps(sg["config"]),
+          "The replays draw each bar on its own, which breaks up trends, so they understate trailing; the "
+          "history keeps real trends but is only %d trades, so one good day moves it a lot. A stop fills at "
+          "the stop here; a gap fills worse. Built from the last 60 days; not a prediction." % doc["history_trades"]]
+    return L
 
 
 # ---------------------------------------------------------------- output
@@ -892,6 +1106,29 @@ def cmd_run(a):
     return 0
 
 
+def cmd_trail(a):
+    now = parse_now(a.now)
+    plan = load_plan(a, now)
+    if a.offline:
+        text, source = read_offline(a.offline, plan["symbol"]), "offline"
+    else:
+        text, source = fetch_chart(plan["symbol"]), "yahoo"
+    try:
+        dists = [float(x) for x in str(a.distances).split(",") if x.strip()]
+    except ValueError:
+        raise TMError("--distances wants numbers in R, e.g. 0.5,1,1.5")
+    doc = trail_study(text, plan, now, dists, a.half, a.replays, a.seed, a.window, a.until, source)
+    if a.write:
+        _write(a.write, doc)
+    if a.json:
+        print(json.dumps(doc, indent=2))
+    else:
+        print("\n".join(trail_report(doc)))
+        if a.write:
+            print("Wrote %s." % a.write)
+    return 0
+
+
 def cmd_chart(a):
     if a.from_file:
         if not os.path.exists(a.from_file):
@@ -937,6 +1174,14 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.add_argument("--write", nargs="?", const="trader/timemachine.json", metavar="PATH",
                    help="save the result (default trader/timemachine.json)")
+    p = sub.add_parser("trail", help="compare trailing stop distances with the plan's fixed target")
+    common(p)
+    p.add_argument("--distances", default=",".join("%g" % d for d in TRAIL_DISTANCES),
+                   help="trail distances in R (default 0.5,0.75,1,1.5,2,3)")
+    p.add_argument("--half", action="store_true", help="also try selling half at the target, then trailing")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--write", nargs="?", const="trader/trail.json", metavar="PATH",
+                   help="save the result (default trader/trail.json)")
     p = sub.add_parser("chart", help="ASCII fan chart of the replays")
     common(p)
     p.add_argument("--from", dest="from_file", nargs="?", const="trader/timemachine.json", metavar="PATH",
@@ -946,7 +1191,7 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
-        return {"run": cmd_run, "chart": cmd_chart}[a.cmd](a)
+        return {"run": cmd_run, "chart": cmd_chart, "trail": cmd_trail}[a.cmd](a)
     except TMError as e:
         print("timemachine.py: %s" % e, file=sys.stderr)
         return 1
