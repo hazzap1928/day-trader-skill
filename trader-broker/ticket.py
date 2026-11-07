@@ -511,7 +511,7 @@ def t212_lines(order, idx, cfg):
            "  It re-sizes in GBP at the live GBP/USD rate, counting Trading 212's 0.15% FX fee",
            "  each way, so the quantity can come down (never up). Then it asks you to type yes."]
     if str(order.get("side", "")).lower() == "buy":
-        out.append("  Trading 212 gets a market buy, then a separate stop-loss%s (good for today)"
+        out.append("  Trading 212 gets a market buy, then a separate stop-loss%s (good till cancelled)"
                    % (" at %s" % _p(stop) if stop else ""))
         out.append("  once the buy fills.")
         if target:

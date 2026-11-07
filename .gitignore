@@ -1,3 +1,4 @@
 # local trading state, caches and logs (may hold account data)
 trader/
 __pycache__/
+.DS_Store

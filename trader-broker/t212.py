@@ -19,6 +19,8 @@ Commands (each takes --json):
     python3 t212.py cash                    # free cash, reserved, in pies
     python3 t212.py info                    # account id, currency, totals
     python3 t212.py fx                      # save GBP/USD to trader/fx.json (no Trading 212 call)
+    python3 t212.py guard                   # DEMO: one pass, add any missing ticket stop
+    python3 t212.py guard --watch           # DEMO: from the open to the close, every 5 minutes
     python3 t212.py positions               # open positions
     python3 t212.py orders                  # pending orders
     python3 t212.py ticker TSLA             # TSLA -> TSLA_US_EQ
@@ -43,7 +45,7 @@ place <ticket-id> (ticket number from trader/orders.json, or its fingerprint):
     a side and a sign that disagree are refused before sending
   - sends each order once: no retry, ever. After a failed or unclear send,
     `place ID --resend` checks for a duplicate again before sending
-  - demo: a market entry, then a separate DAY stop order once the entry fills.
+  - demo: a market entry, then a separate good-till-cancelled stop once the entry fills.
     Live placement is switched off (LIVE_PLACEMENT_ENABLED); when switched on,
     it places the entry only and you set the stop in the app yourself
   - logs every order and response (never credentials) to trader/logs/
@@ -67,6 +69,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -91,6 +94,7 @@ SCOPES = {SUMMARY: "account", POSITIONS: "portfolio", ORDERS: "orders:read", INS
 # Live placement is off. Switching it on is a deliberate one-line change; even
 # then a live run places the market entry only and never the stop.
 LIVE_PLACEMENT_ENABLED = False
+STOP_VALIDITY = "GOOD_TILL_CANCEL"   # the stop outlives the session: a forgotten position stays protected
 FX_FEE = 0.0015          # Trading 212's FX fee, Invest and Stocks ISA, on each conversion
 FX_URL = "https://query2.finance.yahoo.com/v8/finance/chart/GBPUSD=X?range=1d&interval=1d"
 FX_MAX_AGE = 4 * 24 * 3600   # a weekend's gap is fine, an older rate is not
@@ -620,7 +624,7 @@ def market_body(ticker, side, qty):
 def stop_body(ticker, qty, stop):
     """The stop-loss for a long position: always a SELL, so always a negative quantity."""
     return {"ticker": ticker, "quantity": signed_quantity("sell", qty), "stopPrice": round(float(stop), 2),
-            "timeValidity": "DAY"}
+            "timeValidity": STOP_VALIDITY}
 
 
 # ---------------------------------------------------------------- placing: money
@@ -878,7 +882,7 @@ def render_place(index, total, client, order, inst, sz, side, price_src, fx, bod
                      % (_gbp(sz["value_gbp"]), _gbp(sz["fee_gbp"]), _gbp(sz["cost_gbp"]), _gbp(sz["cash_gbp"])))
         if client.env == "demo":
             lines.append("  stop:        %.2f %s, sent as a separate STOP order once the entry fills: SELL %s, "
-                         "good for the day" % (sz["stop_usd"], ccy, _qty(sz["qty"])))
+                         "good till cancelled" % (sz["stop_usd"], ccy, _qty(sz["qty"])))
         else:
             lines.append("  stop:        %.2f %s  NOT PLACED ON LIVE: set this stop yourself in the Trading 212 "
                          "app straight after the entry fills" % (sz["stop_usd"], ccy))
@@ -1090,14 +1094,204 @@ def cmd_place(client, args):
     log_event(sd, secrets, "response", env=client.env, ticket=index, path=path, status=status, body=sresp)
     _record(paths["state"], state, dict(base, at=tk.ny_iso(_utc_now()), status="stop_placed",
                                         broker_order_id=sresp.get("id")))
-    _say("STOP PLACED: SELL %s %s at %.2f, good for the day, order id %s"
+    _say("STOP PLACED: SELL %s %s at %.2f, good till cancelled, order id %s"
          % (_qty(sz["qty"]), ticker, sz["stop_usd"], _ident(sresp.get("id"))))
     result["stop"] = sresp
     return result
 
 
+# ---------------------------------------------------------------- the stop guardian (demo only)
+
+GUARD_STOP_TYPES = ("STOP", "STOP_LIMIT")
+GUARD_OPEN = (9, 30)
+GUARD_STATUSES = ("placed", "stop_placed", "stop_not_placed")
+
+
+def guard_sell_orders(pending, ticker):
+    """(pending sell stops, other pending sells) for one ticker."""
+    stops, others = [], []
+    for o in pending or []:
+        if _o_ticker(o) != ticker:
+            continue
+        q = _num(o.get("quantity")) or 0
+        if not (q < 0 or str(o.get("side", "")).upper() == "SELL"):
+            continue
+        (stops if str(o.get("type", "")).upper() in GUARD_STOP_TYPES else others).append(o)
+    return stops, others
+
+
+def guard_ticket(state, ticker, env):
+    """The latest entry t212.py place sent for this ticker on this account that had a stop, or None."""
+    found = None
+    for r in (state or {}).get("orders", []):
+        if (r.get("broker") == "trading212" and r.get("env") == env and r.get("t212_ticker") == ticker
+                and str(r.get("side", "")).lower() == "buy" and r.get("kind") == "entry"
+                and r.get("status") in GUARD_STATUSES and _num(r.get("stop")) and _num(r.get("qty"))):
+            found = r
+    return found
+
+
+def guard_send_stop(client, ticker, qty, stop):
+    """The guardian's only write. It builds the body itself: a STOP that SELLS (negative
+    quantity). Anything else is refused before a request is made, so it can never buy."""
+    body = stop_body(ticker, qty, stop)
+    if not (isinstance(body.get("quantity"), (int, float)) and body["quantity"] < 0):
+        raise T212Error("guard refused to send: a stop must sell (negative quantity)", 2)
+    check_sign(body, "sell")
+    status, resp = client.post_order(STOP, body, "sell")
+    return body, resp
+
+
+def guard_pass(client, state_dir):
+    """One look at every open position. Returns {"at", "positions": [...], "warnings": [...], "placed": n}."""
+    if client.env != "demo":
+        raise T212Error("the stop guardian runs on the demo account only; nothing was sent", 2)
+    tk = ticket_module()
+    secrets = client._secrets
+    gpath = os.path.join(state_dir, "state", "t212-guard.json")
+    gstate = _read_json(gpath, {}) or {}
+    unclear = gstate.setdefault("unclear", {})
+    state = tk.load_state(os.path.join(state_dir, "state", "broker.json"))
+    positions = client.get(POSITIONS) or []
+    pending = client.get(ORDERS) or []
+    out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0}
+    held_tickers = set()
+    for p in positions:
+        ticker = _o_ticker(p)
+        held = _num(p.get("quantity")) or 0
+        if not ticker or held <= 0:
+            continue
+        held_tickers.add(ticker)
+        price = _num(p.get("currentPrice"))
+        row = {"ticker": ticker, "held": held, "price": price}
+        out["positions"].append(row)
+        stops, others = guard_sell_orders(pending, ticker)
+        covered = sum(abs(_num(o.get("quantity")) or 0) for o in stops)
+        row["covered"] = covered
+        if others:
+            row["status"] = "exit pending"
+            row["note"] = "a sell is already pending (%s); no stop added" % ", ".join(
+                str(o.get("type", "?")) for o in others)
+            continue
+        rec = guard_ticket(state, ticker, client.env)
+        if rec is None:
+            if covered + 1e-9 >= held:
+                row["status"] = "covered"
+            else:
+                row["status"] = "no ticket stop"
+                out["warnings"].append("%s: %s held, %s covered by a stop, and no t212.py place ticket with a "
+                                       "stop for it. Set a stop yourself in the app." % (ticker, _qty(held), _qty(covered)))
+            continue
+        stop, ticket_qty = float(rec["stop"]), float(_num(rec["qty"]))
+        row["stop"] = stop
+        want = min(held, ticket_qty) - covered          # never more than the ticket bought
+        want = _floor(want, 0.01 if (want % 1) > 1e-9 else 1)
+        if want <= 0:
+            row["status"] = "covered"
+            continue
+        if unclear.get(ticker):
+            row["status"] = "unclear"
+            out["warnings"].append("%s: an earlier guard stop came back unclear (%s). Not sent again; check the "
+                                   "app, then delete %s from %s" % (ticker, unclear[ticker], ticker, gpath))
+            continue
+        if price is None or price <= stop + 0.005:
+            row["status"] = "below stop"
+            out["warnings"].append("%s is at %s, at or under the ticket's stop %.2f: a stop now would sell at once, "
+                                   "so the guard did not place it. Decide yourself in the app."
+                                   % (ticker, _fmt(price) if price is not None else "an unknown price", stop))
+            continue
+        log_event(state_dir, secrets, "request", env=client.env, by="guard", method="POST", path=STOP,
+                  body=stop_body(ticker, want, stop))
+        try:
+            body, resp = guard_send_stop(client, ticker, want, stop)
+        except PlaceError as e:
+            log_event(state_dir, secrets, "response", env=client.env, by="guard", path=STOP, status=e.status,
+                      outcome=e.outcome, error=str(e))
+            if e.outcome != "rejected":
+                unclear[ticker] = "%s at %s" % (e, out["at"])
+                _write_json(gpath, gstate)
+            row["status"] = "stop failed" if e.outcome == "rejected" else "unclear"
+            out["warnings"].append("%s: the guard's stop (SELL %s at %.2f) %s: %s. Not retried."
+                                   % (ticker, _qty(want), stop, "was refused" if e.outcome == "rejected"
+                                      else "is UNCLEAR", e))
+            continue
+        log_event(state_dir, secrets, "response", env=client.env, by="guard", path=STOP, body=resp)
+        gstate.setdefault("placed", []).append({"at": out["at"], "ticker": ticker, "qty": want, "stop": stop,
+                                                "order_id": resp.get("id"), "fingerprint": rec.get("fingerprint")})
+        _write_json(gpath, gstate)
+        row.update(status="stop placed", placed_qty=want, order_id=resp.get("id"))
+        out["placed"] += 1
+    for o in pending:
+        t = _o_ticker(o)
+        if t and t not in held_tickers and o in guard_sell_orders(pending, t)[0]:
+            out["warnings"].append("%s: a sell stop (%s at %s) is pending but you hold none; it is good till "
+                                   "cancelled, so cancel it in the app" % (t, _qty(o.get("quantity")),
+                                                                         _fmt(o.get("stopPrice"))))
+    return out
+
+
+def render_guard(res):
+    lines = ["%s  stop guard on %s: %d open position%s, %d stop%s placed" % (
+        res["at"], res["env"], len(res["positions"]), "" if len(res["positions"]) == 1 else "s",
+        res["placed"], "" if res["placed"] == 1 else "s")]
+    for r in res["positions"]:
+        extra = ""
+        if r.get("status") == "stop placed":
+            extra = ": SELL %s at %.2f, good till cancelled, order id %s" % (_qty(r["placed_qty"]), r["stop"],
+                                                                           _ident(r.get("order_id")))
+        elif r.get("note"):
+            extra = ": " + r["note"]
+        lines.append("  %-12s %s held, %s covered  %s%s" % (r["ticker"], _qty(r["held"]), _qty(r.get("covered", 0)),
+                                                         r.get("status", "?"), extra))
+    for w in res["warnings"]:
+        lines.append("  !!! " + w)
+    return "\n".join(lines)
+
+
+def cmd_guard(client, args):
+    """Stop guardian. Never buys: its one write is a SELL stop for shares you hold."""
+    if client.env != "demo":
+        raise T212Error("the stop guardian runs on the demo account only; nothing was sent", 2)
+    if not args.watch:
+        res = guard_pass(client, args.state_dir)
+        return res if args.json else render_guard(res)
+    tk = ticket_module()
+    every = max(1.0, float(args.every)) * 60
+    m = re.match(r"^(\d{1,2}):(\d{2})$", str(args.until).strip())
+    if not m or not (0 <= int(m.group(1)) < 24 and 0 <= int(m.group(2)) < 60):
+        raise T212Error("--until wants a New York time like 16:00", 2)
+    uh, um = int(m.group(1)), int(m.group(2))
+    passes = 0
+    while True:
+        now_et = tk.to_eastern(_utc_now())
+        if now_et.weekday() >= 5:
+            _say("%s  weekend in New York: the guard has nothing to watch" % now_et.strftime("%a %H:%M"))
+            return None
+        open_et = now_et.replace(hour=GUARD_OPEN[0], minute=GUARD_OPEN[1], second=0)
+        end_et = now_et.replace(hour=uh, minute=um, second=0)
+        if now_et >= end_et:
+            _say("%s  past %s New York: the guard stops (%d pass%s)" % (now_et.strftime("%H:%M"), args.until,
+                                                                        passes, "" if passes == 1 else "es"))
+            return None
+        if now_et < open_et:
+            wait = (open_et - now_et).total_seconds() + 30
+            _say("%s  waiting for the open (9:30 New York)" % now_et.strftime("%H:%M"))
+            _sleep(wait)
+            continue
+        try:
+            res = guard_pass(client, args.state_dir)
+            _say(json.dumps(res, sort_keys=True) if args.json else render_guard(res))
+        except T212Error as e:
+            if e.code == 2:
+                raise
+            _say("%s  guard pass failed, will try again: %s" % (now_et.strftime("%H:%M"), scrub(e, client._secrets)))
+        passes += 1
+        _sleep(every)
+
+
 COMMANDS = {"status": cmd_status, "cash": cmd_cash, "info": cmd_info, "positions": cmd_positions,
-            "orders": cmd_orders, "ticker": cmd_ticker, "instruments": cmd_instruments, "place": cmd_place}
+            "orders": cmd_orders, "ticker": cmd_ticker, "instruments": cmd_instruments, "place": cmd_place,
+            "guard": cmd_guard}
 
 
 def _add_common(parser, defaults):
@@ -1133,6 +1327,11 @@ def build_parser():
     pl.add_argument("--resend", action="store_true",
                     help="send again after a failed or unclear send (checks for a duplicate first)")
     pl.add_argument("--fx-rate", type=float, help="USD per GBP to use instead of Yahoo's current rate")
+    g = sub.add_parser("guard", parents=[common],
+                       help="DEMO: place a ticket's stop on any open position that has none (never buys)")
+    g.add_argument("--watch", action="store_true", help="wait for the open, then check every --every minutes")
+    g.add_argument("--every", type=float, default=5, help="minutes between checks with --watch (default 5)")
+    g.add_argument("--until", default="16:00", help="New York time --watch stops (default 16:00)")
     return p
 
 
@@ -1151,6 +1350,8 @@ def main(argv=None, environ=None):
         secrets = _secrets(key, secret)
         client = Client(env, key, secret, state_dir=args.state_dir)
         out = COMMANDS[args.cmd](client, args)
+        if args.cmd == "guard" and out is None:
+            return 0                                # --watch has already printed every pass
         if args.cmd == "place":
             if out is None:
                 return 1                            # you did not say yes; nothing was sent

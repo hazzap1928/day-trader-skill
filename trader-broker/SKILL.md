@@ -173,13 +173,33 @@ caches the instrument list for 24 hours in `trader/cache/`.
   exact order and its GBP cost, and needs the user to **type yes in their own
   terminal**. It has no `--reply` and refuses without a terminal, so Claude
   cannot say yes for them. Tell the user to run it themselves; never run it.
-- a market entry, then a separate stop order once the entry fills. Buys send
+- a market entry, then a separate **good-till-cancelled** stop order once the
+  entry fills (it stays after the close, so a position you forget is still
+  covered; cancel it in the app if you sell another way). Buys send
   a positive quantity, sells a negative one. Nothing is ever retried; after a
   failed or unclear send, `place N --resend` checks for a duplicate again
 - live placement is switched off. When it is switched on, live places the
   entry only and the user must set the stop in the app
 - every order and answer goes to `trader/logs/`, and each placement to
   `trader/state/broker.json`, so trader-risk counts it
+
+**Stop guardian (demo).** `t212.py guard` looks at every open demo position
+and, when one has no pending stop, places the stop of the `t212.py place`
+ticket that bought it. `guard --watch` waits for the 9:30 open and checks
+every 5 minutes (`--every N`) until 16:00 New York (`--until HH:MM`); it does
+nothing on a weekend. It never buys: its one write is a SELL stop, good till
+cancelled, built and sign-checked inside the guard, for no more shares than
+the ticket bought and not already covered. It sends nothing and says why when:
+
+- the position has no ticket with a stop (it never invents a stop)
+- the price is already at or under the stop (a stop then would sell at once)
+- a sell is already pending, or an earlier guard stop came back unclear (it is
+  never sent twice; check the app, then clear it in `trader/state/t212-guard.json`)
+
+It also reports a pending sell stop with no position under it, but never
+cancels anything. It runs unattended, so it needs no typed yes: that is the
+one exception, and it only ever protects shares you already hold. Its log is
+`trader/state/t212-guard.json` plus `trader/logs/`.
 
 ## Steps: the entry
 

@@ -227,7 +227,7 @@ class Signs(unittest.TestCase):
                          {"ticker": "TSLA_US_EQ", "quantity": 7, "extendedHours": False})
         self.assertEqual(t212.market_body("TSLA_US_EQ", "sell", 7)["quantity"], -7)
         self.assertEqual(t212.stop_body("TSLA_US_EQ", 7, 358.324),
-                         {"ticker": "TSLA_US_EQ", "quantity": -7, "stopPrice": 358.32, "timeValidity": "DAY"})
+                         {"ticker": "TSLA_US_EQ", "quantity": -7, "stopPrice": 358.32, "timeValidity": "GOOD_TILL_CANCEL"})
 
     def test_the_stop_is_always_a_sell(self):
         for q in (1, 7, 0.5):
