@@ -334,6 +334,14 @@ class Watching(PilotBase):
         self.assertIn("Tickets: 1 sent, 1 rejected", text)
         self.assertIn("TSLA_US_EQ 7", text)
 
+    def test_the_summary_records_the_day_for_the_briefing(self):
+        p = self.pilot()
+        p.state["start_value"] = 4990.0
+        self.router.add("GET", "/equity/account/summary", FakeResp(test_t212_place.SUMMARY))
+        self.router.add("GET", "/equity/positions", FakeResp([]))
+        p.send_summary()
+        self.assertEqual(self.read("state/account-days.json")["days"][TODAY], {"start": 4990.0, "close": 5000.0})
+
     def test_status_from_the_phone(self):
         p = self.pilot()
         p.command("/status")

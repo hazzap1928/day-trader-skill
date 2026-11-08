@@ -257,6 +257,19 @@ skips it, trader-risk blocks an entry on it, and `t212.py place` and the
 autopilot refuse to buy it, even when it is on `allowed_tickers`. Exits are
 never blocked.
 
+**Morning briefing (`briefing.py`, read-only).** launchd runs `run-briefing.sh` at
+07:30 UK time on weekdays, and the script skips US market holidays. It sends a
+short message (the account and the top 3 points) to the paired phone, and saves
+the full briefing to `trader/briefings/DATE.md`. The briefing covers:
+- the account, with yesterday's result taken from the autopilot's open and close
+  record
+- positions and their stops, guard alerts since the close, and unclear orders
+- the futures direction, GBP/USD, headlines and US economic releases (in UK time)
+- Nasdaq-calendar earnings for holdings and recent flags
+- a to-do list, most urgent first
+
+Anything that does not load says "no data". It only ever GETs.
+
 **Autopilot and phone approvals (`autopilot.py`, `phone.py`, demo only).** For
 time away from the Mac. On weekdays launchd runs `run-autopilot.sh`. Every 15
 minutes inside the entry window it runs scanner (orb, `allowed_tickers` only),

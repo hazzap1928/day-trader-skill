@@ -1799,6 +1799,14 @@ def _phone_push(client, text, once_key=None):
 def guard_alarm(client, text):
     """Say it in the log in capitals, as a notification, and on your phone."""
     _say("!!! GUARD ALERT (%s): %s !!!" % (client.env.upper(), text))
+    try:                          # for the morning briefing: what went wrong since the last close
+        path = os.path.join(client.state_dir, "logs", "guard-alerts.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"at": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"), "env": client.env,
+                                 "text": scrub(text, client._secrets)}) + "\n")
+    except OSError:
+        pass
     _notify("Trading 212 stop guard (%s)" % client.env, text)
     _phone_push(client, "GUARD ALERT (%s): %s" % (client.env.upper(), text))
 

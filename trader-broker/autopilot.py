@@ -582,7 +582,19 @@ class Pilot(object):
             st["day"], len(st["tickets"]), len(self.pending()), ", PAUSED" if st.get("paused") else "",
             ", ".join(t212.allowed_tickers(self.cfg) or [])))
 
+    def record_day(self):
+        """Start and close value of the account for today, for the morning briefing's result."""
+        try:
+            close = t212._num((self.client.get(t212.SUMMARY) or {}).get("totalValue"))
+        except t212.T212Error:
+            return
+        path = self.p("state", "account-days.json")
+        doc = t212._read_json(path, {}) or {}
+        doc.setdefault("days", {})[self.state["day"]] = {"start": self.state.get("start_value"), "close": close}
+        t212._write_json(path, doc)
+
     def send_summary(self):
+        self.record_day()
         try:
             text = self.summary_text()
         except t212.T212Error as e:
