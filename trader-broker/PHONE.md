@@ -60,14 +60,16 @@ Why Telegram:
 | Message | When |
 |---|---|
 | Autopilot started | each trading day at the open |
-| DEMO TICKET + Approve / Reject | a ticket passed scanner, entry, exit plan, Time Machine, trader-budget and trader-risk |
-| PLACED / NOT PLACED | after your Approve |
+| DEMO TICKET + Approve / Reject | a ticket passed every check (only when `auto_buy` is off) |
+| BOUGHT (demo, automatic) | with `"autopilot": {"auto_buy": true}`: what was bought, the cost and max loss in GBP, the stop, the target and the Time Machine's odds |
+| PLACED / NOT PLACED | after your Approve, or when an automatic buy failed a placing-time check (and why) |
 | FILLED / EXIT | the positions changed (checked each minute) |
 | GUARD / GUARD ALERT | the guard placed a stop, trailed it or sold; or it cannot protect you |
 | END-OF-DAY CLOSE | 15:50 New York: the guard sold every open position (`eod_close`) and lists them; a failed sale is a loud GUARD ALERT |
-| DEMO DAILY SUMMARY | 5 minutes after the close |
+| MORNING BRIEFING | 07:30 UK on weekdays (`briefing.py`) |
+| CLOSING REPORT | about 15:55 New York: each trade with entry, exit, reason and P&L after fees; day and week totals; win rate; account; anything open; results against the Time Machine |
 
-From the chat, send `/pause` to stop new tickets (the guard keeps
+From the chat, send `/pause` to stop new tickets and automatic buys (the guard keeps
 protecting positions), `/resume` to start them again, and `/status` to see
 the state.
 

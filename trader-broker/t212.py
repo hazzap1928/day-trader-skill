@@ -89,14 +89,15 @@ INSTRUMENTS = "/equity/metadata/instruments"
 MARKET = "/equity/orders/market"
 STOP = "/equity/orders/stop"
 CANCEL = "/equity/orders/{id}"      # DELETE: the guardian cancels a stop only to raise it (demo)
-READ_PATHS = (SUMMARY, POSITIONS, ORDERS, INSTRUMENTS)
+HISTORY = "/equity/history/orders"  # filled and finished orders, with fills and fees (read-only)
+READ_PATHS = (SUMMARY, POSITIONS, ORDERS, INSTRUMENTS, HISTORY)
 PLACE_PATHS = (MARKET, STOP)
 # seconds between calls, from each endpoint's documented "N req / Ts"
 MIN_INTERVAL = {SUMMARY: 5.0, POSITIONS: 1.0, ORDERS: 5.0, INSTRUMENTS: 50.0, MARKET: 1.2, STOP: 2.0,
-                CANCEL: 1.2}
+                CANCEL: 1.2, HISTORY: 10.0}
 # the scope each endpoint's 403 names in the reference
 SCOPES = {SUMMARY: "account", POSITIONS: "portfolio", ORDERS: "orders:read", INSTRUMENTS: "metadata",
-          MARKET: "orders:execute", STOP: "orders:execute", CANCEL: "orders:execute"}
+          MARKET: "orders:execute", STOP: "orders:execute", CANCEL: "orders:execute", HISTORY: "history:orders"}
 # A code-level master switch, left False: live is switched on in trader/config.json
 # ("live_enabled": true and "paper": false, see go-live.sh), never here.
 LIVE_PLACEMENT_ENABLED = False
@@ -1798,6 +1799,7 @@ def _phone_push(client, text, once_key=None):
 
 def guard_alarm(client, text):
     """Say it in the log in capitals, as a notification, and on your phone."""
+    text = scrub(text, client._secrets)
     _say("!!! GUARD ALERT (%s): %s !!!" % (client.env.upper(), text))
     try:                          # for the morning briefing: what went wrong since the last close
         path = os.path.join(client.state_dir, "logs", "guard-alerts.jsonl")

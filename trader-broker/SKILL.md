@@ -285,8 +285,25 @@ chat, and each needs the ticket's one-time nonce, so a second tap does
 nothing. It refuses to start on live (T212_ENV=live, `"paper": false` or
 `live_enabled`), without `allowed_tickers`, or without a paired phone.
 
-It also sends fills and exits (positions are checked each minute) and a daily
-summary after the close. From the chat, `/pause`, `/resume` and `/status`
+With `"auto_buy": true` (demo only) there is no Approve step. A ticket that passes
+every check is placed at once, after the same placing-time checks an Approve runs.
+Those checks are a fresh quote, no chase past `max_chase_r`, and trader-risk again,
+which covers the daily loss limit, trades per day and the allow and block lists.
+The phone gets a BOUGHT message: ticker, shares, entry, cost in GBP, stop, target,
+max loss in GBP and the Time Machine's odds. A passing ticket that is not placed
+gets a NOT PLACED message saying why. Live refuses automatic buying: it needs
+its own setting, built and checked separately, and it does not exist yet.
+
+It also sends fills and exits (positions are checked each minute). About 5 minutes
+after the 15:50 end-of-day close it sends the closing report (`report.py`, read-only),
+built from Trading 212's own fills:
+- each trade today, with entry, exit, exit reason and P&L in GBP after FX fees
+- the day's and the week's totals and win rate
+- the account value
+- anything still open, and guard alerts
+- the results against the Time Machine's odds
+
+The full report is saved to `trader/reports/`. From the chat, `/pause`, `/resume` and `/status`
 control it. Setup and the phone app are in `PHONE.md`. Claude never pairs the
 phone, never handles the bot token, and never taps Approve.
 
@@ -349,8 +366,10 @@ buttons: Allow once, Deny. Allow once sends it to the paper account. The
 ## What it never does
 
 - Never places an order without all three gates, and never two orders on one yes.
-- Never places orders from a scheduled or background task, with one exception: the demo autopilot,
-  where the user's own Approve tap on their paired phone is the yes for that one ticket.
+- Never places orders from a scheduled or background task, with one exception: the demo autopilot.
+  There the yes is either the user's Approve tap on their paired phone, or, with the user's own
+  `"autopilot": {"auto_buy": true}` setting, the autopilot itself after every check passes. Demo only:
+  there is no live automatic buying, and Claude never turns auto_buy on by itself.
 - Never asks for, reads, stores or repeats API keys or passwords.
 - Never switches `ALPACA_PAPER_TRADE` or `"paper"` to live. The user does that themselves.
 - Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.

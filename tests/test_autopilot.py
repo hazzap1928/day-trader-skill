@@ -306,6 +306,88 @@ class Approve(PilotBase):
         self.assertEqual(self.router.posts(), [])
 
 
+class AutoBuy(PilotBase):
+    def setUp(self):
+        super().setUp()
+        self.cfg = dict(self.cfg, autopilot={"auto_buy": True})
+        self.write("config.json", self.cfg)
+
+    def cycle(self):
+        self.router.add("GET", "/equity/positions", FakeResp([]))
+        p = self.pilot()
+        self.account()
+        return p, p.cycle()
+
+    def test_a_passing_ticket_is_bought_with_no_tap_and_the_phone_is_told(self):
+        p, line = self.cycle()
+        self.assertIn("TSLA: placed", line)
+        self.assertEqual([x[1] for x in self.router.posts()], ["/equity/orders/market", "/equity/orders/stop"])
+        self.assertTrue(all(c[4].startswith("https://demo.trading212.com/") for c in self.router.calls))
+        text = self.phone.sent[-1][0]
+        self.assertRegex(text, r"^BOUGHT \(demo, automatic\): \d+ TSLA\n")
+        for want in ("Entry: $", "Cost: about £", "Stop: $358.32",
+                     "Target: $370.04", "Max loss at the stop: about £", "Time Machine: target first 60.0 %, stop first 40.0 %"):
+            self.assertIn(want, text)
+        self.assertIsNone(self.phone.sent[-1][1])                  # no buttons
+        rec = [r for r in self.broker_log() if r.get("status") == "placed"][0]
+        self.assertTrue(rec["reply"].startswith("auto-buy"))
+
+    def test_the_placing_checks_still_run_and_say_why_not(self):
+        for setup, why in ((lambda: setattr(self.pipe, "quote", 368.0), "too late to chase"),
+                           (lambda: None, "trader-risk no longer passes")):
+            with self.subTest(why):
+                self.router.routes.clear()
+                self.router.calls.clear()
+                self.write("state/autopilot.json", {})
+                self.pipe.quote = 364.5
+                setup()
+                if "risk" in why:
+                    calls = {"n": 0}
+                    real = self.pipe.verdict
+
+                    def flip(args, timeout=None, _p=self.pipe):
+                        if args[0].endswith("check.py"):
+                            calls["n"] += 1
+                            _p.verdict = "PASS" if calls["n"] == 1 else "BLOCK"
+                        return Pipeline.__call__(_p, args, timeout)
+                    ap._run = flip
+                p, line = self.cycle()
+                ap._run = self.pipe
+                self.pipe.verdict = "PASS"
+                self.assertEqual(self.router.posts(), [])
+                self.assertIn("NOT PLACED (demo): TSLA passed the checks when built", self.phone.sent[-1][0])
+                self.assertIn(why, self.phone.sent[-1][0])
+
+    def test_the_daily_limits_live_in_the_risk_check_it_reruns(self):
+        p, _ = self.cycle()
+        steps = [c[0].rsplit("/", 1)[1] for c in self.pipe.calls]
+        self.assertEqual(steps.count("check.py"), 2)               # when built, and again just before placing
+
+    def test_paused_buys_nothing(self):
+        p = self.pilot()
+        p.command("/pause")
+        self.assertIn("paused", p.cycle())
+        self.assertEqual(self.router.posts(), [])
+
+    def test_auto_buy_must_be_true_or_false(self):
+        with self.assertRaises(ap.PilotError):
+            ap.settings({"autopilot": {"auto_buy": "yes"}})
+        self.assertFalse(ap.settings({})["auto_buy"])
+
+    def test_there_is_no_live_automatic_buying(self):
+        self.assertTrue(any("no live automatic buying" in x for x in ap.check_ready(self.cfg, "live", self.phone)))
+        p = self.pilot()
+        p.client = t212.Client("live", "k", "s", state_dir=self.dir, log=lambda m: None)
+        with self.assertRaises(ap.PilotError):
+            p.auto_buy({"symbol": "TSLA", "fingerprint": "x", "order": tsla_ticket(), "risk": {}, "verdict": ""})
+        self.assertEqual(self.router.posts(), [])
+
+    def test_status_says_it_buys_automatically(self):
+        p = self.pilot()
+        p.command("/status")
+        self.assertIn("buys automatically", self.phone.sent[-1][0])
+
+
 class Watching(PilotBase):
     def test_fills_and_exits_go_to_the_phone(self):
         p = self.pilot()
@@ -321,31 +403,19 @@ class Watching(PilotBase):
         p.watch_positions()
         self.assertIn("EXIT (demo): sold 7 TSLA_US_EQ", self.phone.sent[-1][0])
 
-    def test_the_daily_summary(self):
-        p, t = self.ticket()
-        t["status"] = "rejected"
-        p.state["start_value"] = 4990.0
-        self.router.add("GET", "/equity/account/summary", FakeResp(test_t212_place.SUMMARY))
-        self.router.add("GET", "/equity/positions", FakeResp(HELD7))
-        p.send_summary()
-        text = self.phone.sent[-1][0]
-        self.assertIn("DEMO DAILY SUMMARY", text)
-        self.assertIn("£5,000.00 (start of day £4,990.00, +£10.00)", text)
-        self.assertIn("Tickets: 1 sent, 1 rejected", text)
-        self.assertIn("TSLA_US_EQ 7", text)
-
     def test_the_summary_records_the_day_for_the_briefing(self):
         p = self.pilot()
         p.state["start_value"] = 4990.0
         self.router.add("GET", "/equity/account/summary", FakeResp(test_t212_place.SUMMARY))
         self.router.add("GET", "/equity/positions", FakeResp([]))
+        self.router.add("GET", "/equity/history/orders", FakeResp({"items": []}))
         p.send_summary()
         self.assertEqual(self.read("state/account-days.json")["days"][TODAY], {"start": 4990.0, "close": 5000.0})
 
     def test_status_from_the_phone(self):
         p = self.pilot()
         p.command("/status")
-        self.assertIn("Autopilot (demo)", self.phone.sent[-1][0])
+        self.assertIn("Autopilot (demo, asks for Approve)", self.phone.sent[-1][0])
 
 
 class Day(PilotBase):
@@ -360,13 +430,15 @@ class Day(PilotBase):
         self.pipe.triggered = ()
         self.router.add("GET", "/equity/positions", FakeResp([]))
         self.router.add("GET", "/equity/account/summary", FakeResp(test_t212_place.SUMMARY))
+        self.router.add("GET", "/equity/history/orders", FakeResp({"items": [], "nextPagePath": None}))
         p = self.pilot()
         with redirect_stdout(io.StringIO()):
             self.assertEqual(p.day(), "done")
         scans = [c for c in self.pipe.calls if c[0].endswith("scan.py")]
         self.assertEqual(len(scans), 24)              # 9:45, 10:00 ... 15:30
         self.assertIn("Autopilot started (demo)", self.phone.sent[0][0])
-        self.assertIn("DEMO DAILY SUMMARY", self.phone.sent[-1][0])
+        self.assertIn("CLOSING REPORT (demo) Thu 05 Nov", self.phone.sent[-1][0])
+        self.assertLessEqual(self.clock[0], NOW + (5 * 60 + 26) * 60)   # by about 15:56 New York
         self.assertEqual(self.router.posts(), [])
         self.assertTrue(p.state["summary_sent"])
 

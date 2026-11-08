@@ -336,7 +336,8 @@ class RateLimit(Base):
         self.assertEqual(t212.MIN_INTERVAL, {"/equity/account/summary": 5.0, "/equity/positions": 1.0,
                                              "/equity/orders": 5.0, "/equity/metadata/instruments": 50.0,
                                              "/equity/orders/market": 60.0 / 50, "/equity/orders/stop": 2.0,
-                                             "/equity/orders/{id}": 60.0 / 50})
+                                             "/equity/orders/{id}": 60.0 / 50,
+                                             "/equity/history/orders": 60.0 / 6})
 
 
 class Resolve(Base):

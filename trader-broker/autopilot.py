@@ -20,10 +20,15 @@ There is no live path here: T212_ENV=live makes it refuse to start.
 It also sends fills and exits (from the positions it watches each minute) and a
 daily summary after the close. Guard alerts come from t212.py guard itself.
 
+With "auto_buy": true (demo only) there is no Approve step: a ticket that passes every
+check is placed at once, after the same checks an Approve runs, and the phone is told
+what was bought (or why a passing ticket was not placed). Live has no automatic buying.
+After the 15:50 end-of-day close it sends the closing report (trader-broker/report.py).
+
 Config (trader/config.json), all optional except allowed_tickers:
     "allowed_tickers": ["AAPL", ...]      required: the autopilot never scans anything else
     "autopilot": {"every_minutes": 15, "expire_minutes": 10, "max_chase_r": 0.5,
-                  "min_edge": 0.0, "max_tickets_per_day": 10}
+                  "min_edge": 0.0, "max_tickets_per_day": 10, "auto_buy": false}
 
 From your phone: /pause stops new tickets, /resume starts them again, /status.
 Education and tooling, not financial advice.
@@ -48,9 +53,11 @@ ROOT = os.path.dirname(HERE)
 AUTOPILOT_ENV = "demo"           # the one account this ever places on
 DEFAULTS = {"every_minutes": 15, "expire_minutes": 10, "max_chase_r": 0.5, "min_edge": 0.0,
             "max_tickets_per_day": 10}
+FLAGS = {"auto_buy": False}      # true: a ticket that passes every check is placed without a tap (demo only)
 POSITIONS_EVERY = 60             # seconds between fill and exit checks
 POLL_WAIT = 20                   # seconds a phone poll waits for a tap
-SUMMARY_AFTER = 5                # minutes after the close the daily summary goes
+REPORT_AFTER = 5                 # minutes after the end-of-day close (15:50 New York) the closing report goes
+EOD_DEFAULT = "15:50"
 STEP_TIMEOUT = 900
 
 
@@ -127,7 +134,14 @@ def _gbp(x):
 def settings(cfg):
     s = dict(DEFAULTS)
     s.update({k: v for k, v in (cfg.get("autopilot") or {}).items() if k in DEFAULTS})
+    for k, default in FLAGS.items():
+        v = (cfg.get("autopilot") or {}).get(k, default)
+        if not isinstance(v, bool):
+            raise PilotError("autopilot.%s must be true or false" % k)
+        s[k] = v
     for k in DEFAULTS:
+        if k in FLAGS:
+            continue
         try:
             s[k] = float(s[k])
         except (TypeError, ValueError):
@@ -157,6 +171,8 @@ def check_ready(cfg, client_env, phone):
         problems.append("trader/config.json has no allowed_tickers list: add the tickers it may scan")
     if cfg.get("require_stop", True) is not True:
         problems.append("\"require_stop\" must stay true")
+    if (cfg.get("autopilot") or {}).get("auto_buy") is True and client_env != AUTOPILOT_ENV:
+        problems.append("autopilot.auto_buy works on the demo account only; there is no live automatic buying")
     if phone is None:
         problems.append("no phone paired: set TELEGRAM_BOT_TOKEN, then run python3 trader-broker/phone.py setup")
     try:
@@ -267,11 +283,14 @@ class Pilot(object):
                 self.state["tried"][sym] = "already held"
                 continue
             got = self.build(sym, cfgp, fx)
-            self.state["tried"][sym] = got if isinstance(got, str) else "ticket sent"
+            self.state["tried"][sym] = got if isinstance(got, str) else "passed every check"
             self.save()
             if isinstance(got, str):
                 notes.append("%s: %s" % (sym, got))
                 continue
+            if self.s["auto_buy"]:
+                t = self.auto_buy(got)
+                return "%s: %s" % (sym, t["status"])
             self.send_ticket(got)
             return "%s: ticket sent to your phone" % sym
         return "no ticket: " + ("; ".join(notes) if notes else "nothing triggered that was not tried today")
@@ -319,8 +338,10 @@ class Pilot(object):
         if verdict.get("verdict") != "PASS":
             return "trader-risk BLOCKED: %s" % "; ".join(verdict.get("reasons") or ["?"])
         order = self.order()
+        mc = doc.get("mc") or {}
         return {"symbol": sym, "fingerprint": verdict["fingerprint"], "order": order, "risk": verdict,
-                "verdict": doc.get("verdict") or ""}
+                "verdict": doc.get("verdict") or "",
+                "tm": {"p_target": mc.get("p_target"), "p_stop": mc.get("p_stop"), "verdict": doc.get("verdict") or ""}}
 
     def risk(self):
         self.run(["trader-risk/check.py", "--orders", self.p("orders.json"), "--config", self.p("config.json"),
@@ -363,12 +384,77 @@ class Pilot(object):
                      _uk(t["expires"]), round(self.s["expire_minutes"]))]
         return "\n".join(lines)
 
-    def send_ticket(self, built):
+    def new_ticket(self, built, status):
         now = _now()
-        t = {"id": _rand.token_hex(4), "nonce": _rand.token_hex(8), "symbol": built["symbol"],
-             "fingerprint": built["fingerprint"], "order": built["order"], "risk": built["risk"],
-             "verdict": built["verdict"], "created": now, "expires": now + self.s["expire_minutes"] * 60,
-             "status": "pending", "message_id": None}
+        return {"id": _rand.token_hex(4), "nonce": _rand.token_hex(8), "symbol": built["symbol"],
+                "fingerprint": built["fingerprint"], "order": built["order"], "risk": built["risk"],
+                "verdict": built["verdict"], "tm": built.get("tm"), "created": now,
+                "expires": now + self.s["expire_minutes"] * 60, "status": status, "message_id": None,
+                "auto": status == "approving"}
+
+    def auto_buy(self, built):
+        """DEMO ONLY: place a ticket that passed every check, with the same checks at placing time as
+        an Approve tap (fresh quote, no chase past max_chase_r, trader-risk again: daily loss, trades
+        per day, allow and block lists), then tell the phone what was bought or why not."""
+        if self.client.env != AUTOPILOT_ENV or not self.s["auto_buy"]:
+            raise PilotError("automatic buying runs on the demo account only, with autopilot.auto_buy true")
+        t = self.new_ticket(built, "approving")
+        t["approved_at"] = _now()
+        self.state["tickets"].append(t)
+        self.save()
+        try:
+            self._approve(t, by="auto-buy")
+            text = self.bought_text(t)
+        except (PilotError, t212.T212Error) as e:
+            text = self.not_placed(t, e)
+        self.save()
+        self.event(text)
+        return t
+
+    def not_placed(self, t, e):
+        msg = t212.scrub(e, self.client._secrets)
+        t["note"] = msg
+        if isinstance(e, t212.T212Error) and e.code == 3:
+            t["status"] = "entry placed, stop not placed"
+            return "!!! %s BOUGHT BUT STOP NOT PLACED (demo) !!! %s" % (t["symbol"], msg)
+        if isinstance(e, t212.T212Error) and "UNCLEAR" in msg:
+            t["status"] = "unclear"
+            return "!!! %s: UNCLEAR whether it was bought (demo). Check the app. !!! %s" % (t["symbol"], msg)
+        t["status"] = "refused"
+        return "NOT PLACED (demo): %s passed the checks when built, but at placing time: %s" % (t["symbol"], msg)
+
+    def bought_text(self, t):
+        """What was bought, from the placement record and the position Trading 212 now shows."""
+        rec = None
+        for r in (t212._read_json(self.p("state", "broker.json"), {}) or {}).get("orders") or []:
+            if r.get("fingerprint") == t["fingerprint"] and r.get("status") in ("placed", "stop_placed"):
+                rec = r
+        rec = rec or {}
+        fill = None
+        try:
+            for p in self.client.get(t212.POSITIONS) or []:
+                if t212._o_ticker(p) == rec.get("t212_ticker"):
+                    fill = t212._num(p.get("averagePricePaid"))
+        except t212.T212Error:
+            pass
+        tm = t.get("tm") or {}
+        odds = ("target first %.1f %%, stop first %.1f %%" % (100 * tm["p_target"], 100 * tm["p_stop"])
+                if tm.get("p_target") is not None and tm.get("p_stop") is not None else "no data")
+        stop_how = ("a stop order at Trading 212, good till cancelled" if rec.get("status") == "stop_placed"
+                    else "enforced by the guard (stop_mode market)")
+        lines = ["BOUGHT (demo, automatic): %s %s" % (rec.get("qty") or t["order"].get("qty"), t["symbol"]),
+                 "Entry: $%s%s" % (t212._fmt(fill) if fill else t212._fmt(rec.get("entry")),
+                                   " (filled)" if fill else " (estimate; not filled yet)"),
+                 "Cost: about %s with the FX fee" % _gbp(rec.get("cost_gbp")),
+                 "Stop: $%s (%s)" % (t212._fmt(rec.get("stop")), stop_how),
+                 "Target: $%s" % t212._fmt(rec.get("target")),
+                 "Max loss at the stop: about %s" % _gbp(rec.get("max_loss_gbp")),
+                 "Time Machine: %s" % odds,
+                 "Reply /pause to stop further buys today."]
+        return "\n".join(lines)
+
+    def send_ticket(self, built):
+        t = self.new_ticket(built, "pending")
         self.state["tickets"].append(t)
         self.save()
         t["message_id"] = self.phone.send(self.ticket_text(t), [("Approve", "ap:%s:%s" % (t["id"], t["nonce"])),
@@ -469,8 +555,9 @@ class Pilot(object):
         self._edit(t, self.ticket_text(t) + "\n\n" + text)
         self.event("%s %s" % (t["symbol"], text))
 
-    def _approve(self, t):
-        """Fresh quote, chase limit, trader-risk again, then t212.py place with your Approve as the yes."""
+    def _approve(self, t, by="phone approve"):
+        """Fresh quote, chase limit, trader-risk again, then t212.py place with your Approve (or, on demo
+        with auto_buy, the autopilot) as the yes."""
         if self.client.env != AUTOPILOT_ENV:
             raise PilotError("demo only")
         o = self.order()
@@ -495,7 +582,7 @@ class Pilot(object):
         def confirm(index, order, sz):
             if tk.fingerprint(order) != t["fingerprint"]:
                 return False, "", "not the ticket you approved"
-            return True, "phone approve %s at %s" % (t["id"], t212._utc_now().strftime("%H:%M:%SZ")), ""
+            return True, "%s %s at %s" % (by, t["id"], t212._utc_now().strftime("%H:%M:%SZ")), ""
 
         args = argparse.Namespace(ticket_id=t["fingerprint"], resend=False, fx_rate=None, state_dir=self.sd,
                                   json=False, live=False)
@@ -541,46 +628,13 @@ class Pilot(object):
                 self.event("EXIT (demo): sold %s %s near $%s; you hold %s"
                            % (t212._qty(b - n), t, t212._fmt(px), t212._qty(n) if n else "none"))
 
-    def summary_text(self):
-        s = self.client.get(t212.SUMMARY) or {}
-        pos = self.client.get(t212.POSITIONS) or []
-        total = t212._num(s.get("totalValue"))
-        start = self.state.get("start_value")
-        lines = ["DEMO DAILY SUMMARY %s" % _ny().strftime("%a %d %b")]
-        if total is not None:
-            chg = "" if start is None else " (start of day %s, %s%s)" % (
-                _gbp(start), "+" if total >= start else "-", _gbp(abs(total - start)))
-            lines.append("Account: %s%s" % (_gbp(total), chg))
-        if pos:
-            lines.append("Open positions:")
-            for p in pos:
-                w = p.get("walletImpact") or {}
-                lines.append("  %s %s, paid $%s, now $%s, P/L %s" % (
-                    t212._o_ticker(p), t212._qty(p.get("quantity")), t212._fmt(p.get("averagePricePaid")),
-                    t212._fmt(p.get("currentPrice")), _gbp(t212._num(w.get("unrealizedProfitLoss")))))
-        else:
-            lines.append("No open positions.")
-        tickets = self.state["tickets"]
-        counts = {}
-        for t in tickets:
-            counts[t["status"]] = counts.get(t["status"], 0) + 1
-        lines.append("Tickets: %d sent%s" % (len(tickets), "".join(", %d %s" % (n, k) for k, n in sorted(counts.items()))))
-        for t in tickets:
-            lines.append("  %s %s: %s" % (t["symbol"], t["order"].get("qty"), t["status"]))
-        ev = [e for e in self.state["events"] if e["text"].startswith(("FILLED", "EXIT"))]
-        if ev:
-            lines.append("Fills and exits:")
-            lines += ["  %s %s" % (e["at"], e["text"]) for e in ev]
-        if self.state.get("paused"):
-            lines.append("Autopilot is PAUSED (send /resume).")
-        lines.append("Demo money. Education and tooling, not financial advice.")
-        return "\n".join(lines)
-
     def status_text(self):
         st = self.state
-        return ("Autopilot (demo) %s: %d tickets today, %s pending%s. Allowed: %s" % (
-            st["day"], len(st["tickets"]), len(self.pending()), ", PAUSED" if st.get("paused") else "",
-            ", ".join(t212.allowed_tickers(self.cfg) or [])))
+        placed = sum(1 for t in st["tickets"] if t["status"] == "placed")
+        return ("Autopilot (demo, %s) %s: %d passing tickets today, %d placed, %s pending%s. %d tickers allowed." % (
+            "buys automatically" if self.s["auto_buy"] else "asks for Approve", st["day"], len(st["tickets"]),
+            placed, len(self.pending()), ", PAUSED" if st.get("paused") else "",
+            len(t212.allowed_tickers(self.cfg) or [])))
 
     def record_day(self):
         """Start and close value of the account for today, for the morning briefing's result."""
@@ -594,15 +648,19 @@ class Pilot(object):
         t212._write_json(path, doc)
 
     def send_summary(self):
+        """The closing report (trader-broker/report.py), and today's value for the morning briefing."""
         self.record_day()
+        report = mod("trader-broker", "report")
+        report.t212, report.tk, report.phone_mod = t212, tk, phone_mod
+        report._now = lambda: _now()              # the autopilot's clock
         try:
-            text = self.summary_text()
-        except t212.T212Error as e:
-            text = "DEMO DAILY SUMMARY: could not read the account (%s)" % t212.scrub(e, self.client._secrets)
-        self.phone.send(text)
+            ok, path, _ = report.send(self.client, self.sd, phone=self.phone)
+            self.say("closing report %s (%s)" % ("sent" if ok else "NOT sent", path))
+        except Exception as e:
+            phone_mod.push(self.sd, "CLOSING REPORT (demo): could not be built (%s)"
+                           % t212.scrub(e, self.client._secrets), phone=self.phone)
         self.state["summary_sent"] = True
         self.save()
-        self.say("daily summary sent")
 
     # ------------------------------------------------------------ the day
 
@@ -622,7 +680,8 @@ class Pilot(object):
         close_at = ny.replace(hour=c_h, minute=c_m, second=0)
         first = ny.replace(hour=b_h, minute=b_m, second=0)
         last = min(ny.replace(hour=a_h, minute=a_m, second=0), close_at)
-        summary_at = close_at + datetime.timedelta(minutes=SUMMARY_AFTER)
+        e_h, e_m = _hm((self.cfg.get("eod_close") or {}).get("at"), EOD_DEFAULT)
+        summary_at = min(ny.replace(hour=e_h, minute=e_m, second=0), close_at) + datetime.timedelta(minutes=REPORT_AFTER)
         if ny >= summary_at:
             if not self.state.get("summary_sent"):
                 self.send_summary()
@@ -637,10 +696,12 @@ class Pilot(object):
             except t212.T212Error:
                 pass
             self.save()
-        phone_mod.push(self.sd, "Autopilot started (demo). Tickets every %d min from %s to %s New York, "
-                                "only from: %s. Reply /pause to stop new tickets."
-                       % (self.s["every_minutes"], first.strftime("%H:%M"), last.strftime("%H:%M"),
-                          ", ".join(t212.allowed_tickers(self.cfg) or [])), phone=self.phone)
+        phone_mod.push(self.sd, "Autopilot started (demo). It %s, checking every %d min from %s to %s New York, "
+                                "from your %d allowed tickers. Reply /pause to stop new %s."
+                       % ("BUYS AUTOMATICALLY what passes every check" if self.s["auto_buy"]
+                          else "sends tickets for your Approve", self.s["every_minutes"], first.strftime("%H:%M"),
+                          last.strftime("%H:%M"), len(t212.allowed_tickers(self.cfg) or []),
+                          "buys" if self.s["auto_buy"] else "tickets"), phone=self.phone)
         step = datetime.timedelta(minutes=self.s["every_minutes"])
         next_cycle = first
         last_pos = 0
@@ -685,7 +746,8 @@ def main(argv=None, environ=None):
     sub.required = True
     sub.add_parser("run", help="the trading day: wait for the open, cycles, taps, fills, summary")
     sub.add_parser("cycle", help="one cycle now, then wait for your tap until the ticket expires")
-    sub.add_parser("summary", help="send today's summary to your phone now")
+    sub.add_parser("report", help="send today's closing report to your phone now")
+    sub.add_parser("summary", help="the same as report")
     sub.add_parser("status", help="what it has done today")
     a = ap.parse_args(argv)
     environ = os.environ if environ is None else environ
@@ -703,7 +765,7 @@ def main(argv=None, environ=None):
             for t in pilot.state["tickets"]:
                 print("  %s %s %s: %s" % (t["id"], t["symbol"], t["order"].get("qty"), t["status"]))
             return 0
-        if a.cmd == "summary":
+        if a.cmd in ("report", "summary"):
             pilot.send_summary()
             return 0
         if a.cmd == "cycle":
