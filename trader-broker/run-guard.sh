@@ -13,6 +13,9 @@ if [[ -z "${T212_API_KEY:-}" || -z "${T212_API_SECRET:-}" ]]; then
   envfile="${T212_ENV_FILE:-$HOME/.zshrc}"
   eval "$(grep -E '^[[:space:]]*export[[:space:]]+T212_(API_KEY|API_SECRET|ENV)=' "$envfile")"
 fi
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then     # optional: guard alerts to your phone (PHONE.md)
+  eval "$(grep -E '^[[:space:]]*export[[:space:]]+TELEGRAM_BOT_TOKEN=' "${T212_ENV_FILE:-$HOME/.zshrc}" || true)"
+fi
 live=()
 if [[ "${T212_ENV:-}" == "live" ]]; then
   live=(--live)

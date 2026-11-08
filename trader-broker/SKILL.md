@@ -239,7 +239,43 @@ the trail. It happens once per ticket. Every order it sends is a sell; a buy is
 refused before any request. Suggest a distance with `/trader-timemachine`
 (`timemachine.py trail`), and say plainly when the study finds no edge. It runs unattended, so it needs no typed yes: that is the
 one exception, and it only ever protects shares you already hold. Its log is
-`trader/state/t212-guard.json` plus `trader/logs/`.
+`trader/state/t212-guard.json` plus `trader/logs/`. With a phone paired (below),
+every guard alert, every stop it places, trails or sells at, and each new
+warning (once a day) also goes to the phone.
+
+**End-of-day close (demo, exits only, off unless set).** With
+`"eod_close": {"enabled": true, "at": "15:50"}`, the watching guard wakes at that
+New York time once a day. For each open position it cancels the pending sells
+(the stop holds the shares), waits for them to leave the list, and sells the
+whole position at market. Then it sends the list of what it closed to the phone.
+A refused sale puts the stop back. An unclear one is never repeated, and a stop
+that will not cancel means no sale. Each of these raises a loud `GUARD ALERT`
+in the log, on the Mac and on the phone. Every write is a cancel or a SELL.
+
+**blocked_tickers** (a list in `trader/config.json`) always wins: the scanner
+skips it, trader-risk blocks an entry on it, and `t212.py place` and the
+autopilot refuse to buy it, even when it is on `allowed_tickers`. Exits are
+never blocked.
+
+**Autopilot and phone approvals (`autopilot.py`, `phone.py`, demo only).** For
+time away from the Mac. On weekdays launchd runs `run-autopilot.sh`. Every 15
+minutes inside the entry window it runs scanner (orb, `allowed_tickers` only),
+entry, exit plan, Time Machine (it needs a lean toward the target), trader-budget
+and trader-risk. It sends at most one passing ticket to the user's phone through
+their own Telegram bot, with Approve and Reject buttons. Nothing is placed
+without the Approve tap, and a ticket expires after 10 minutes.
+
+An Approve fetches a fresh quote and refuses a price more than `max_chase_r`
+(0.5R) past the entry. It runs trader-risk again, then calls `cmd_place` with
+the tap as the yes. Taps are accepted only from the paired Telegram user and
+chat, and each needs the ticket's one-time nonce, so a second tap does
+nothing. It refuses to start on live (T212_ENV=live, `"paper": false` or
+`live_enabled`), without `allowed_tickers`, or without a paired phone.
+
+It also sends fills and exits (positions are checked each minute) and a daily
+summary after the close. From the chat, `/pause`, `/resume` and `/status`
+control it. Setup and the phone app are in `PHONE.md`. Claude never pairs the
+phone, never handles the bot token, and never taps Approve.
 
 ## Steps: the entry
 
@@ -300,7 +336,8 @@ buttons: Allow once, Deny. Allow once sends it to the paper account. The
 ## What it never does
 
 - Never places an order without all three gates, and never two orders on one yes.
-- Never places orders from a scheduled or background task: nobody is there to say yes.
+- Never places orders from a scheduled or background task, with one exception: the demo autopilot,
+  where the user's own Approve tap on their paired phone is the yes for that one ticket.
 - Never asks for, reads, stores or repeats API keys or passwords.
 - Never switches `ALPACA_PAPER_TRADE` or `"paper"` to live. The user does that themselves.
 - Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.

@@ -784,8 +784,13 @@ def read_symbols(a, offline_syms=None):
     for s in syms:
         if s not in out:
             out.append(s)
-    allow = allowed_tickers(read_config(getattr(a, "config", None)))
+    cfg = read_config(getattr(a, "config", None))
+    blocked = {str(x).strip().upper() for x in (cfg or {}).get("blocked_tickers") or []}
+    if blocked:
+        out = [s for s in out if s not in blocked]          # blocked always wins, list or no list
+    allow = allowed_tickers(cfg)
     if allow is not None:
+        allow = allow - blocked
         n = len(out)
         out = [s for s in out if s in allow]
         progress(a, "allowed_tickers: scanning %d of %d symbols (only the %d on your list)" % (len(out), n, len(allow)))

@@ -526,7 +526,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     now_et = to_eastern(now_utc)
     today = today or now_et.date().isoformat()
     acct, top_warn = account(c, portfolio, prices)
-    blocked = {str(b).upper() for b in c.get("blocked") or []}
+    blocked = {str(b).strip().upper() for b in (c.get("blocked") or []) + (c.get("blocked_tickers") or [])}
     allow = c.get("allowed_tickers")
     if allow is not None:
         if not isinstance(allow, list):
@@ -681,7 +681,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         # blocked list and size
         if sym in blocked:
             later.append("blocked: %s is on your blocked list" % sym)
-        if allow is not None and sym not in allow:
+        elif allow is not None and sym not in allow:
             later.append("allowed_tickers: %s is not on your allow-list" % sym)
         if value is not None:
             if value < float(c.get("min_order_usd") or 0) - CENT:

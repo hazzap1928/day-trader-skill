@@ -105,9 +105,11 @@ class Base(unittest.TestCase):
         self.reply = "yes"
         self.tty = True
         self._saved = (t212._open, t212._sleep, t212._now, t212._fx_open, t212._is_tty, t212._ask,
-                       t212.LIVE_PLACEMENT_ENABLED, t212._notify)
+                       t212.LIVE_PLACEMENT_ENABLED, t212._notify, t212._phone_push)
         self.notes = []
+        self.pushed = []
         t212._notify = lambda title, text: self.notes.append((title, text))   # no real pop-ups in tests
+        t212._phone_push = lambda client, text, once_key=None: self.pushed.append(text)   # nor real phones
 
         def fake_sleep(s):
             self.sleeps.append(s)
@@ -135,7 +137,7 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         (t212._open, t212._sleep, t212._now, t212._fx_open, t212._is_tty, t212._ask,
-         t212.LIVE_PLACEMENT_ENABLED, t212._notify) = self._saved
+         t212.LIVE_PLACEMENT_ENABLED, t212._notify, t212._phone_push) = self._saved
         shutil.rmtree(self.dir)
 
     def write(self, rel, data):

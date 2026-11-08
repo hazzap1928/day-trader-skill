@@ -236,14 +236,24 @@ def stop_mode(cfg):
     return m
 
 
+def blocked_tickers(cfg):
+    """blocked_tickers as a set: never bought, whatever the allow-list says."""
+    b = (cfg or {}).get("blocked_tickers")
+    if b is None:
+        return set()
+    if not isinstance(b, list) or not all(isinstance(x, str) and x.strip() for x in b):
+        raise T212Error("blocked_tickers in trader/config.json must be a list of tickers", 2)
+    return {x.strip().upper() for x in b}
+
+
 def allowed_tickers(cfg):
-    """The allow-list as a set of plain tickers, or None when there is none."""
+    """The allow-list minus blocked_tickers, as a set of plain tickers, or None when there is none."""
     a = (cfg or {}).get("allowed_tickers")
     if a is None:
         return None
     if not isinstance(a, list) or not all(isinstance(x, str) and x.strip() for x in a):
         raise T212Error("allowed_tickers in trader/config.json must be a list of tickers", 2)
-    return {x.strip().upper() for x in a}
+    return {x.strip().upper() for x in a} - blocked_tickers(cfg)
 
 
 def _num(v):
@@ -264,6 +274,8 @@ class Client(object):
         self._secrets = _secrets(key, secret)
         self._auth = "Basic " + self._secrets[1]
         self.rate_path = os.path.join(state_dir, "state", "t212-ratelimit.json")
+        self.state_dir = state_dir
+        self.environ = None         # main() sets it; the phone token is read from it
         self.log = log or (lambda msg: sys.stderr.write(msg + "\n"))
         self.last_headers = {}
 
@@ -985,7 +997,10 @@ def wait_for_fill(client, ticker, want, before):
     return False
 
 
-def cmd_place(client, args):
+def cmd_place(client, args, confirm=None):
+    """confirm: None asks for your typed yes in this terminal. trader-broker/autopilot.py passes
+    one that answers for the Approve you tapped on your phone (demo only); it gets
+    (index, order, sizing) and returns (ok, reply, why)."""
     secrets = client._secrets
     sd = args.state_dir
     if client.env != "demo" and not (client.live_ok or LIVE_PLACEMENT_ENABLED):
@@ -1035,6 +1050,9 @@ def cmd_place(client, args):
     side = str(order.get("side", "")).strip().lower()
     signed_quantity(side, order.get("qty"))     # a bad side or a non-positive qty stops here
     kind = tk.kind_of(order, rv)
+    if side == "buy" and str(order.get("symbol", "")).upper() in blocked_tickers(cfg):
+        raise T212Error("ticket %d buys %s, which is on your blocked_tickers list; nothing was sent"
+                        % (index, str(order.get("symbol", "")).upper()), 2)
     if side == "buy" and allow is not None and str(order.get("symbol", "")).upper() not in allow:
         raise T212Error("ticket %d buys %s, which is not on your allowed_tickers list; nothing was sent"
                         % (index, str(order.get("symbol", "")).upper()), 2)
@@ -1093,14 +1111,19 @@ def cmd_place(client, args):
 
     _say(render_place(index, len(orders), client, order, inst, sz, side, price_src, fx, bodies, fp, mode))
 
-    # 6. your typed yes, for this one order
-    if not _is_tty():
-        raise T212Error("place needs you to type yes in your own terminal; nothing was sent. Run it there: "
-                        "python3 trader-broker/t212.py place %d" % index, 2)
-    reply = (_ask('Type "yes" to place exactly this order (anything else cancels): ') or "").strip()
-    shown = dict(order, qty=str(sz["qty"]))
-    shown["plan"] = dict(order.get("plan") or {}, max_loss=sz.get("max_loss_usd"))
-    ok, why = tk.parse_yes(reply, shown, [o.get("symbol", "") for o in orders])
+    # 6. your yes, for this one order: typed here, or your Approve tap (autopilot, demo only)
+    if confirm is not None:
+        if client.env != "demo":
+            raise T212Error("a phone approval places on demo only; nothing was sent", 2)
+        ok, reply, why = confirm(index, order, sz)
+    else:
+        if not _is_tty():
+            raise T212Error("place needs you to type yes in your own terminal; nothing was sent. Run it there: "
+                            "python3 trader-broker/t212.py place %d" % index, 2)
+        reply = (_ask('Type "yes" to place exactly this order (anything else cancels): ') or "").strip()
+        shown = dict(order, qty=str(sz["qty"]))
+        shown["plan"] = dict(order.get("plan") or {}, max_loss=sz.get("max_loss_usd"))
+        ok, why = tk.parse_yes(reply, shown, [o.get("symbol", "") for o in orders])
     if not ok:
         log_event(sd, secrets, "declined", env=client.env, ticket=index, fingerprint=fp, reply=reply, why=why)
         _say("Not placed: %s." % why)
@@ -1622,6 +1645,117 @@ def render_guard(res):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- end-of-day close (demo, exits only)
+
+EOD_AT = "15:50"
+
+
+def eod_settings(cfg):
+    """None (off) or {"at": (h, m)} from "eod_close" in the config. Off when it is absent."""
+    e = (cfg or {}).get("eod_close")
+    if not e:
+        return None
+    if not isinstance(e, dict):
+        raise T212Error("eod_close in trader/config.json must be an object, e.g. {\"enabled\": true, \"at\": \"15:50\"}", 2)
+    if not e.get("enabled"):
+        return None
+    m = re.match(r"^(\d{1,2}):(\d{2})$", str(e.get("at") or EOD_AT).strip())
+    if not m or not (9 <= int(m.group(1)) < 16 and 0 <= int(m.group(2)) < 60):
+        raise T212Error("eod_close.at must be a New York time in the session, like 15:50", 2)
+    return {"at": (int(m.group(1)), int(m.group(2)))}
+
+
+def eod_close(client, state_dir):
+    """Sell every open position at market, after cancelling its pending sells (the stop holds
+    the shares). Exits only: every write is a cancel or a SELL. Demo only.
+    Returns {"at", "closed": [...], "failed": [...], "nothing": bool}."""
+    if client.env != "demo":
+        raise T212Error("the end-of-day close runs on the demo account only; nothing was sent", 2)
+    tk = ticket_module()
+    out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
+           "closed": [], "failed": []}
+    g = _Guard(client, state_dir, out)
+    positions = client.get(POSITIONS) or []
+    pending = client.get(ORDERS) or []
+    for p in positions:
+        ticker = _o_ticker(p)
+        held = _num(p.get("quantity")) or 0
+        if not ticker or held <= 0:
+            continue
+        stops, others = guard_sell_orders(pending, ticker)
+        if g.unclear.get(ticker):
+            out["failed"].append("%s: NOT CLOSED, an earlier guard order is unclear (%s); sell it in the app"
+                                 % (ticker, g.unclear[ticker]))
+            continue
+        cancelled, ok = [], True
+        for o in stops + others:
+            res, err = g.cancel(ticker, o.get("id"))
+            if res != "ok" or not _gone(client, o.get("id")):
+                ok = False
+                out["failed"].append("%s: NOT CLOSED, could not cancel its pending %s %s (%s); its stop may "
+                                     "still be there. Sell it in the app" % (ticker, o.get("type", "?"), _ident(o.get("id")),
+                                                                            err if res != "ok" else "still pending"))
+                break
+            cancelled.append(o)
+        if not ok:
+            continue
+        g.log("request", method="POST", path=MARKET, body=market_body(ticker, "sell", held), why="end-of-day close")
+        try:
+            _, resp = guard_send_sell(client, ticker, held)
+        except PlaceError as e:
+            g.log("response", path=MARKET, status=e.status, outcome=e.outcome, error=str(e))
+            if e.outcome != "rejected":
+                g.unclear[ticker] = "end-of-day SELL %s: %s at %s" % (_qty(held), e, out["at"])
+                g.save()
+                out["failed"].append("%s: UNCLEAR whether the end-of-day SELL %s went through (%s); its stop was "
+                                     "cancelled. Check the app NOW" % (ticker, _qty(held), e))
+                continue
+            back = []
+            for o in cancelled:
+                price = _num(o.get("stopPrice"))
+                if price:
+                    r, _ = g.stop(ticker, abs(_num(o.get("quantity")) or held), price, "restore after a failed close")
+                    back.append("stop %.2f %s" % (price, "put back" if r == "ok" else "NOT put back"))
+            out["failed"].append("%s: the end-of-day SELL %s was REFUSED (%s); %s. The position is still open"
+                                 % (ticker, _qty(held), e, "; ".join(back) or "it had no stop"))
+            continue
+        g.log("response", path=MARKET, body=resp)
+        out["placed"] += 1
+        out["closed"].append("%s: SELL %s at market, order id %s%s" % (
+            ticker, _qty(held), _ident(resp.get("id")),
+            "" if not cancelled else ", cancelled %s" % ", ".join(
+                "%s %s" % (o.get("type", "?"), _fmt(o.get("stopPrice"))) for o in cancelled)))
+    g.state["eod"] = {"date": _today_ny(tk), "at": out["at"], "closed": out["closed"], "failed": out["failed"]}
+    g.save()
+    out["nothing"] = not out["closed"] and not out["failed"]
+    return out
+
+
+def render_eod(res):
+    lines = ["END-OF-DAY CLOSE (%s) %s" % (res["env"], res["at"])]
+    if res["nothing"]:
+        lines.append("  nothing open: nothing sold")
+    lines += ["  closed: " + x for x in res["closed"]]
+    lines += ["  !!! " + x for x in res["failed"]]
+    return "\n".join(lines)
+
+
+def eod_done_today(state_dir):
+    st = _read_json(os.path.join(state_dir, "state", "t212-guard.json"), {}) or {}
+    return (st.get("eod") or {}).get("date") == _today_ny(ticket_module())
+
+
+def run_eod(client, state_dir):
+    """The close, then your phone: what was sold, and a loud alarm for anything that was not."""
+    res = eod_close(client, state_dir)
+    text = render_eod(res)
+    _say(text)
+    _phone_push(client, text)
+    for f in res["failed"]:
+        guard_alarm(client, "END-OF-DAY CLOSE FAILED: " + f)
+    return res
+
+
 GUARD_FAIL_ALERT = 3          # failed checks in a row before the guard says so out loud
 AUTH_STATUSES = (401, 403)    # the key is rejected or lacks a permission: retrying cannot fix it
 
@@ -1640,10 +1774,60 @@ def _notify(title, text):
         return False
 
 
+_PHONE = []
+
+
+def phone_module():
+    if not _PHONE:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phone.py")
+        spec = importlib.util.spec_from_file_location("trader_broker_phone", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PHONE.append(mod)
+    return _PHONE[0]
+
+
+def _phone_push(client, text, once_key=None):
+    """Best effort, to your phone if one is paired (trader-broker/phone.py). Tests replace it."""
+    try:
+        return phone_module().push(client.state_dir, scrub(text, client._secrets),
+                                   environ=getattr(client, "environ", None), once_key=once_key)
+    except Exception:
+        return False
+
+
 def guard_alarm(client, text):
-    """Say it in the log in capitals, and as a notification."""
+    """Say it in the log in capitals, as a notification, and on your phone."""
     _say("!!! GUARD ALERT (%s): %s !!!" % (client.env.upper(), text))
     _notify("Trading 212 stop guard (%s)" % client.env, text)
+    _phone_push(client, "GUARD ALERT (%s): %s" % (client.env.upper(), text))
+
+
+GUARD_NEWS = ("stop placed", "SOLD AT STOP", "STOP SALE FAILED", "stop failed", "unclear", "below stop")
+
+
+def guard_news(res):
+    """What in one pass is worth your phone: orders the guard sent or could not send, and warnings."""
+    out = []
+    for r in res.get("positions") or []:
+        st, tr = r.get("status") or "", r.get("trail") or ""
+        if st in GUARD_NEWS or tr.startswith(("RAISED", "SOLD HALF")) or "SOLD HALF" in tr:
+            line = "%s %s" % (r["ticker"], st)
+            if st == "stop placed":
+                line += ": SELL %s at %.2f, good till cancelled" % (_qty(r.get("placed_qty")), r["stop"])
+            if tr and not tr.startswith(("not trailed", "stop ")):
+                line += "; " + tr
+            elif r.get("note"):
+                line += ": " + r["note"]
+            out.append(line)
+    return out
+
+
+def guard_phone(client, res):
+    for line in guard_news(res):
+        _phone_push(client, "GUARD (%s): %s" % (client.env, line))
+    for w in res.get("warnings") or []:
+        _phone_push(client, "GUARD WARNING (%s): %s" % (client.env, w), once_key=w)
 
 
 def _auth_failed(client, e):
@@ -1696,9 +1880,33 @@ def cmd_guard(client, args):
             _say("%s  waiting for the open (9:30 New York)" % now_et.strftime("%H:%M"))
             _sleep(wait)
             continue
+        eod = None
+        try:
+            eod = eod_settings(_read_json(os.path.join(args.state_dir, "config.json"), {}) or {})
+        except T212Error as e:
+            guard_alarm(client, "the guard has STOPPED: %s" % e)
+            raise
+        eod_at = now_et.replace(hour=eod["at"][0], minute=eod["at"][1], second=0) if eod else None
+        if eod_at is not None and client.env == "demo" and now_et >= eod_at and not eod_done_today(args.state_dir):
+            try:
+                run_eod(client, args.state_dir)
+            except T212Error as e:
+                if e.status in AUTH_STATUSES:
+                    raise _auth_failed(client, e)
+                guard_alarm(client, "END-OF-DAY CLOSE FAILED, positions may still be open: %s. Sell them in the app."
+                            % scrub(e, client._secrets))
+                ticket_module()
+                st_path = os.path.join(args.state_dir, "state", "t212-guard.json")
+                st = _read_json(st_path, {}) or {}
+                st["eod"] = {"date": _today_ny(tk), "at": tk.ny_iso(_utc_now()), "error": scrub(e, client._secrets)}
+                _write_json(st_path, st)       # alarmed once; not retried every pass
+            passes += 1
+            _sleep(every)
+            continue
         try:
             res = guard_pass(client, args.state_dir)
             _say(json.dumps(res, sort_keys=True) if args.json else render_guard(res))
+            guard_phone(client, res)
             if fails >= GUARD_FAIL_ALERT:
                 guard_alarm(client, "the guard is checking again after %d failed checks" % fails)
             fails = 0
@@ -1715,7 +1923,10 @@ def cmd_guard(client, args):
                 guard_alarm(client, "%d checks in a row have failed (%s). Positions are not being watched until "
                                     "it gets through." % (fails, scrub(e, client._secrets)))
         passes += 1
-        _sleep(every)
+        wait = every
+        if eod_at is not None and client.env == "demo" and now_et < eod_at:
+            wait = max(1.0, min(every, (eod_at - now_et).total_seconds() + 1))   # wake for the close on time
+        _sleep(wait)
 
 
 COMMANDS = {"status": cmd_status, "cash": cmd_cash, "info": cmd_info, "positions": cmd_positions,
@@ -1779,6 +1990,7 @@ def main(argv=None, environ=None):
         key, secret = credentials(environ)
         secrets = _secrets(key, secret)
         client = Client(env, key, secret, state_dir=args.state_dir)
+        client.environ = environ
         if env == "live":
             client.live_ok = live_switch(_read_json(os.path.join(args.state_dir, "config.json"), {}) or {})
         out = COMMANDS[args.cmd](client, args)
