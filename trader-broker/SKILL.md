@@ -207,6 +207,12 @@ nothing and says why when:
 - a sell is already pending, or an earlier guard stop came back unclear (it is
   never sent twice; check the app, then clear it in `trader/state/t212-guard.json`)
 
+If Trading 212 rejects the key (401) or a permission (403), the guard stops at
+once, writes a `GUARD ALERT` line to `trader/logs/guard.log` and shows a macOS
+notification with a sound: it is protecting nothing until the key is fixed and
+it is restarted. Three failed checks in a row (say, no network) raise the same
+alert once, and another when it gets through again.
+
 It also reports a pending sell stop with no position under it, and never
 cancels anything except a stop it is about to raise (below).
 

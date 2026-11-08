@@ -168,6 +168,69 @@ class Guard(Base):
         self.assertIn("past 11:00 New York", text)
         self.assertEqual(self.router.posts(), [])
 
+    def at_930(self):
+        self.clock[0] = float(calendar.timegm((2026, 11, 5, 14, 30, 30)))    # 9:30:30 in New York
+
+    def test_a_rejected_key_stops_the_watch_and_alerts(self):
+        self.at_930()
+        self.router.add("GET", "/equity/positions", http_error(401, "bad key"))
+        code, text, err = self.guard("--watch")
+        self.assertEqual(code, 4)
+        self.assertIn("GUARD ALERT (DEMO)", text)
+        self.assertIn("has STOPPED and is not protecting any position", text)
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn("rejected the API key", self.notes[0][1])
+        self.assertEqual(len([c for c in self.router.calls if c[1] == "/equity/positions"]), 1)   # no retries
+        self.assert_no_secrets(text, err, self.notes[0][1])
+
+    def test_a_missing_permission_also_stops_it(self):
+        self.at_930()
+        self.router.add("GET", "/equity/positions", http_error(403))
+        code, _, _ = self.guard("--watch")
+        self.assertEqual(code, 4)
+        self.assertEqual(len(self.notes), 1)
+
+    def test_a_single_pass_with_a_rejected_key_alerts_too(self):
+        self.router.add("GET", "/equity/positions", http_error(401))
+        code, text, err = self.guard()
+        self.assertEqual(code, 4)
+        self.assertIn("guard stopped", err)
+        self.assertEqual(len(self.notes), 1)
+
+    def test_repeated_failures_alert_once_then_say_when_it_recovers(self):
+        self.at_930()
+        down = t212.urllib.error.URLError("offline")
+        self.router.add("GET", "/equity/positions", down, down, down, down, FakeResp([]))
+        self.router.add("GET", "/equity/orders", FakeResp([]))
+        code, text, _ = self.guard("--watch", "--every", "10", "--until", "10:30")
+        self.assertEqual(code, 0)
+        self.assertIn("(4 in a row)", text)
+        self.assertEqual([n[1].split(" ")[0] for n in self.notes], ["3", "the"])     # one alarm, one all-clear
+        self.assertIn("checking again after 4 failed checks", self.notes[1][1])
+
+    def test_a_config_problem_stops_the_watch_with_an_alert(self):
+        self.at_930()
+        self.write("config.json", dict(self.cfg, stop_mode="sometimes"))
+        self.router.add("GET", "/equity/positions", FakeResp([position()]))
+        self.router.add("GET", "/equity/orders", FakeResp([]))
+        code, text, _ = self.guard("--watch")
+        self.assertEqual(code, 2)
+        self.assertIn("did not start", self.notes[0][1])
+
+    def test_the_notification_text_goes_as_an_argument_never_as_script(self):
+        calls = []
+        saved = (t212.subprocess.run, t212.sys.platform)
+        t212.subprocess.run = lambda argv, **kw: calls.append(argv)
+        try:
+            t212.sys.platform = "darwin"
+            real = self._saved[-1]
+            real("title", 'say "hi" & rm -rf ~')
+        finally:
+            t212.subprocess.run, t212.sys.platform = saved
+        if calls:                                      # only where /usr/bin/osascript exists
+            self.assertEqual(calls[0][-2:], ["title", 'say "hi" & rm -rf ~'])
+            self.assertNotIn('rm -rf', " ".join(calls[0][:-2]))
+
     def test_watch_does_nothing_on_a_weekend(self):
         self.clock[0] = float(calendar.timegm((2026, 11, 7, 15, 0, 0)))     # Saturday
         code, text, _ = self.guard("--watch")

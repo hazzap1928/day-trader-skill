@@ -73,6 +73,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -116,9 +117,10 @@ USER_AGENT = "day-trader-skill-t212/1"
 class T212Error(Exception):
     """A failure to report to the user. Exit code 2 means refused before any request."""
 
-    def __init__(self, msg, code=1):
+    def __init__(self, msg, code=1, status=None):
         Exception.__init__(self, msg)
         self.code = code
+        self.status = status      # the HTTP status when Trading 212 answered with an error
 
 
 class PlaceError(T212Error):
@@ -326,7 +328,7 @@ class Client(object):
                              % (path, attempt + 1, MAX_RETRIES, wait))
                     _sleep(wait)
                     continue
-                raise T212Error(self._http_message(path, e))
+                raise T212Error(self._http_message(path, e), status=e.code)
             except urllib.error.URLError as e:
                 raise T212Error(self._clean("could not reach %s: %s" % (self.base, e.reason)))
             except OSError as e:
@@ -1620,23 +1622,64 @@ def render_guard(res):
     return "\n".join(lines)
 
 
+GUARD_FAIL_ALERT = 3          # failed checks in a row before the guard says so out loud
+AUTH_STATUSES = (401, 403)    # the key is rejected or lacks a permission: retrying cannot fix it
+
+
+def _notify(title, text):
+    """A macOS notification with a sound, so a guard that cannot protect you is not silent.
+    Best effort: the same text always goes to the log as well."""
+    if sys.platform != "darwin" or not os.path.exists("/usr/bin/osascript"):
+        return False
+    try:
+        subprocess.run(["/usr/bin/osascript", "-e", "on run argv",
+                        "-e", 'display notification (item 2 of argv) with title (item 1 of argv) sound name "Basso"',
+                        "-e", "end run", title, text], timeout=10, capture_output=True)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def guard_alarm(client, text):
+    """Say it in the log in capitals, and as a notification."""
+    _say("!!! GUARD ALERT (%s): %s !!!" % (client.env.upper(), text))
+    _notify("Trading 212 stop guard (%s)" % client.env, text)
+
+
+def _auth_failed(client, e):
+    msg = scrub(e, client._secrets)
+    guard_alarm(client, "Trading 212 rejected the API key (%s). The guard has STOPPED and is not protecting any "
+                        "position. Check the key in the Trading 212 app, update ~/.zshrc, then restart the guard. "
+                        "Set any missing stop in the app now." % msg)
+    return T212Error("guard stopped: %s" % msg, 4, e.status)
+
+
 def cmd_guard(client, args):
     """Stop guardian. Never buys: its one write is a SELL stop for shares you hold."""
     if client.env != "demo" and not (client.live_ok or LIVE_PLACEMENT_ENABLED):
         raise T212Error("live trading is switched off, so the guard does not run on live; nothing was sent", 2)
     if not args.watch:
-        res = guard_pass(client, args.state_dir)
+        try:
+            res = guard_pass(client, args.state_dir)
+        except T212Error as e:
+            if e.status in AUTH_STATUSES:
+                raise _auth_failed(client, e)
+            raise
         return res if args.json else render_guard(res)
     tk = ticket_module()
     if args.every is None:      # a stop the guard enforces itself wants a closer look
         cfg = _read_json(os.path.join(args.state_dir, "config.json"), {}) or {}
-        args.every = 1 if stop_mode(cfg) == "market" else 5
+        try:
+            args.every = 1 if stop_mode(cfg) == "market" else 5
+        except T212Error as e:
+            guard_alarm(client, "the guard did not start: %s" % e)
+            raise
     every = max(1.0, float(args.every)) * 60
     m = re.match(r"^(\d{1,2}):(\d{2})$", str(args.until).strip())
     if not m or not (0 <= int(m.group(1)) < 24 and 0 <= int(m.group(2)) < 60):
         raise T212Error("--until wants a New York time like 16:00", 2)
     uh, um = int(m.group(1)), int(m.group(2))
-    passes = 0
+    passes, fails = 0, 0
     while True:
         now_et = tk.to_eastern(_utc_now())
         if now_et.weekday() >= 5:
@@ -1656,10 +1699,21 @@ def cmd_guard(client, args):
         try:
             res = guard_pass(client, args.state_dir)
             _say(json.dumps(res, sort_keys=True) if args.json else render_guard(res))
+            if fails >= GUARD_FAIL_ALERT:
+                guard_alarm(client, "the guard is checking again after %d failed checks" % fails)
+            fails = 0
         except T212Error as e:
+            if e.status in AUTH_STATUSES:
+                raise _auth_failed(client, e)
             if e.code == 2:
+                guard_alarm(client, "the guard has STOPPED: %s" % scrub(e, client._secrets))
                 raise
-            _say("%s  guard pass failed, will try again: %s" % (now_et.strftime("%H:%M"), scrub(e, client._secrets)))
+            fails += 1
+            _say("%s  guard pass failed (%d in a row), will try again: %s"
+                 % (now_et.strftime("%H:%M"), fails, scrub(e, client._secrets)))
+            if fails == GUARD_FAIL_ALERT:
+                guard_alarm(client, "%d checks in a row have failed (%s). Positions are not being watched until "
+                                    "it gets through." % (fails, scrub(e, client._secrets)))
         passes += 1
         _sleep(every)
 
