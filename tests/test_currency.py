@@ -30,6 +30,7 @@ GBP_CFG = {
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "fractional": True, "broker": "trading212", "paper": True, "blocked": [],
     "allow_options": False, "allow_margin": False, "allow_short": False, "pdt_guard": False,
+    "costs": {"fx_fee_pct": 0, "slippage_pct": 0},     # these tests are about pounds; costs: test_costs.py
 }
 NOW = "2026-10-19 10:15"                                  # New York
 NOW_UTC = datetime.datetime(2026, 10, 19, 14, 15)

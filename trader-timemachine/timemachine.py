@@ -764,6 +764,69 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     }
 
 
+# ---------------------------------------------------------------- costs
+
+FX_FEE_PCT = 0.15          # Trading 212's FX fee on each conversion, Invest and Stocks ISA
+SLIPPAGE_PCT = 0.05        # an allowance per fill for a market order or a stop on a liquid large cap
+
+
+def costs_from(cfg, fee_pct=None, slip_pct=None):
+    """{"fx_fee_pct", "slippage_pct", "from"}: --fee-pct/--slip-pct, then config "costs". A GBP or
+    Trading 212 config defaults to the 0.15 %% FX fee and 0.05 %% slippage; any other config (a USD
+    account converts nothing) counts no costs unless it sets "costs"."""
+    c = (cfg or {}).get("costs") or {}
+    gbp = str((cfg or {}).get("currency", "")).upper() == "GBP" or (cfg or {}).get("broker") == "trading212"
+    fee = fee_pct if fee_pct is not None else c.get("fx_fee_pct", FX_FEE_PCT if gbp else 0.0)
+    slip = slip_pct if slip_pct is not None else c.get("slippage_pct", SLIPPAGE_PCT if gbp else 0.0)
+    for name, v in (("fx_fee_pct", fee), ("slippage_pct", slip)):
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 <= v <= 2:
+            raise TMError("costs.%s must be a percent from 0 to 2, e.g. 0.15" % name)
+    src = "--fee-pct/--slip-pct" if (fee_pct is not None or slip_pct is not None) else \
+        ("trader/config.json costs" if c else "defaults")
+    return {"fx_fee_pct": float(fee), "slippage_pct": float(slip), "from": src}
+
+
+def cost_r(entry, exit_price, risk, costs):
+    """Fee plus slippage on the buy and on the sell, in R."""
+    k = (costs["fx_fee_pct"] + costs["slippage_pct"]) / 100.0
+    return k * (entry + exit_price) / risk
+
+
+def apply_costs(doc, costs):
+    """Average R after costs, for the replays and for each history trade. Costs are linear in the exit
+    price, so the replays' average cost is exact from their average R."""
+    p, m, h = doc["plan"], doc["mc"], doc["history"]
+    e, risk = float(p["entry"]), float(p["risk_per_share"])
+    k = (costs["fx_fee_pct"] + costs["slippage_pct"]) / 100.0
+    mc_cost = k * (2 * e / risk + m["avg_R"])            # mean of k * (e + e + R * risk) / risk
+    out = dict(costs, stop_pct=round(100 * risk / e, 3), mc_avg_R=m["avg_R"], mc_cost_R=round(mc_cost, 3),
+               mc_avg_R_net=round(m["avg_R"] - mc_cost, 3))
+    trades = h.get("trades") or []
+    for t in trades:
+        tr = t["entry"] - t["stop"] if p["side"] == "buy" else t["stop"] - t["entry"]
+        x = t["entry"] + t["R"] * tr if p["side"] == "buy" else t["entry"] - t["R"] * tr
+        t["R_net"] = round(t["R"] - cost_r(t["entry"], x, tr, costs), 3)
+    if trades:
+        out["history_avg_R"] = h["avg_R"]
+        out["history_avg_R_net"] = round(statistics.mean(t["R_net"] for t in trades), 3)
+        out["history_green_net"] = sum(1 for t in trades if t["R_net"] > 0)
+    doc["costs"] = out
+    if k > 0:
+        doc["verdict_notes"] = list(doc.get("verdict_notes") or []) + [cost_note(out)]
+    return doc
+
+
+def cost_note(c):
+    s = ("After costs (FX fee %g %% on the buy and on the sell, slippage %g %% a fill: %.3fR a trade at this %.2f %% "
+         "stop) the average R is %+.3f, before costs %+.3f." % (c["fx_fee_pct"], c["slippage_pct"], c["mc_cost_R"],
+                                                              c["stop_pct"], c["mc_avg_R_net"], c["mc_avg_R"]))
+    if "history_avg_R_net" in c:
+        s += " The real sessions: %+.3f before, %+.3f after." % (c["history_avg_R"], c["history_avg_R_net"])
+    if c["mc_avg_R_net"] <= 0:
+        s += " After costs this plan loses on average."
+    return s
+
+
 # ---------------------------------------------------------------- trailing stop study
 
 TRAIL_DISTANCES = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
@@ -1081,14 +1144,25 @@ def _write(path, doc):
         fh.write("\n")
 
 
+def read_cfg(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def compute(a):
     now = parse_now(a.now)
     plan = load_plan(a, now)
+    costs = costs_from(read_cfg(getattr(a, "config", None) or "trader/config.json"),
+                       getattr(a, "fee_pct", None), getattr(a, "slip_pct", None))
     if a.offline:
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
+    return apply_costs(time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source), costs)
 
 
 def cmd_run(a):
@@ -1166,6 +1240,9 @@ def main(argv=None):
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
         p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
+        p.add_argument("--config", default="trader/config.json", help="for \"costs\" (default trader/config.json)")
+        p.add_argument("--fee-pct", type=float, help="FX fee %% on each side (default 0.15 for a GBP config)")
+        p.add_argument("--slip-pct", type=float, help="slippage allowance %% a fill (default 0.05)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
 

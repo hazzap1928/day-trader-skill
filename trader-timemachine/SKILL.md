@@ -97,6 +97,20 @@ not in the data (wrong date, not closed yet, a future day), or when the plan
 does not make sense (a stop above a buy's entry, an entry off the 5-minute
 grid). A live in-progress bar is never used.
 
+## Costs
+
+`run` also reports the average R **after costs**, saved under `costs` in
+`timemachine.json`. The costs are the FX fee on the buy and on the sell, plus a
+slippage allowance on each fill. Both are percent of the fill's value:
+`"costs": {"fx_fee_pct": 0.15, "slippage_pct": 0.05}` in `trader/config.json`, or
+`--fee-pct` / `--slip-pct`. A GBP or Trading 212 config defaults to those values;
+any other config counts no costs unless it sets them. In R the cost is
+`(fee + slip) x (entry + exit) / risk a share`, so a tight stop pays the most.
+The replays' average cost is exact (costs are linear in the exit price). Each
+history trade is costed at its own exit, with its `R_net` saved. Say plainly when
+the average R after costs is at or below zero: the plan loses on average. The
+trailing stop study does not count costs yet.
+
 ## The trailing stop study (`trail`)
 
 `trail` takes the same plan and compares its fixed target with a trailing stop at

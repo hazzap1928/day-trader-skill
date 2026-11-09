@@ -410,6 +410,24 @@ def fingerprint(order):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
+FX_FEE_PCT = 0.15          # Trading 212's FX fee on each conversion
+SLIPPAGE_PCT = 0.05        # an allowance per fill
+
+
+def trade_costs(c):
+    """{"fx_fee_pct", "slippage_pct", "k"}: config "costs" first. A GBP or Trading 212 config defaults to
+    the 0.15 %% FX fee and 0.05 %% slippage; any other config counts no costs unless it sets "costs".
+    k is the fraction of each fill's value lost to them."""
+    cc = c.get("costs") or {}
+    gbp = c.get("_currency") == "GBP" or str(c.get("currency", "")).upper() == "GBP" or c.get("broker") == "trading212"
+    fee = cc.get("fx_fee_pct", FX_FEE_PCT if gbp else 0.0)
+    slip = cc.get("slippage_pct", SLIPPAGE_PCT if gbp else 0.0)
+    for name, v in (("fx_fee_pct", fee), ("slippage_pct", slip)):
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 <= v <= 2:
+            raise RiskError("costs.%s in trader/config.json must be a percent from 0 to 2, e.g. 0.15" % name)
+    return {"fx_fee_pct": float(fee), "slippage_pct": float(slip), "k": (float(fee) + float(slip)) / 100.0}
+
+
 def _f(x):
     try:
         return float(x)
@@ -721,7 +739,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                "If you bought it, record the fill first (ticket.py fill)" % (sym, _num(held)))
 
         # day-trade checks: stop, loss, reward:risk, daily loss, trades, window, pdt
-        max_loss = risk_ps = rr = stop = target = None
+        max_loss = risk_ps = rr = stop = target = rr_net = None
         if kind == "entry" and side in ("buy", "sell"):
             long = side == "buy"
             leg_stop, plan_stop = _f(o.get("stop_loss_stop_price")), _f(plan.get("stop"))
@@ -763,6 +781,18 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                             if min_rr and rr < min_rr - 1e-9:
                                 later.append("reward:risk: %.2f (target %s, entry %s, stop %s) is under your "
                                              "minimum %s" % (rr, _p(target), _p(ref), _p(stop), _num(min_rr)))
+                            kc = trade_costs(c)
+                            if kc["k"] > 0:
+                                net_reward = abs(target - ref) - kc["k"] * (ref + target)
+                                net_risk = abs(ref - stop) + kc["k"] * (ref + stop)
+                                rr_net = round(net_reward / net_risk, 2)
+                                cost_note = ("FX fee %g %% each way + slippage %g %% a fill"
+                                             % (kc["fx_fee_pct"], kc["slippage_pct"]))
+                                if min_rr and rr_net < min_rr - 1e-9 and not (rr < min_rr - 1e-9):
+                                    later.append("reward:risk after costs: %.2f (%.2f before; %s cost %s a share at "
+                                                 "the target and %s at the stop) is under your minimum %s"
+                                                 % (rr_net, rr, cost_note, _p(kc["k"] * (ref + target)),
+                                                    _p(kc["k"] * (ref + stop)), _num(min_rr)))
                     elif min_rr:
                         later.append("reward:risk: no target to measure it against (min_reward_risk %s)"
                                      % _num(min_rr))
@@ -791,6 +821,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                if _f(c.get("max_loss_per_trade_usd")) else "",
                                ("%.2f" % rr) if rr is not None else "n/a",
                                (" (min %s)" % _num(c["min_reward_risk"])) if _f(c.get("min_reward_risk")) else ""))
+                if rr_net is not None:
+                    info.append("after costs (%s): reward:risk %.2f, max loss about %s"
+                                % (cost_note, rr_net, money(round(shares * net_risk, 2))))
             if daily or cap_t:
                 info.append("today before this: %d of %s trades, %s of %s daily loss"
                             % (len(entries_today) + batch_entries, cap_t or "unlimited",
@@ -841,7 +874,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             "value_usd": round(value, 2) if value is not None else None,
             "entry_ref": round(ref, 2) if ref else None, "entry_ref_from": ref_from,
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,
-            "reward_risk": rr, "fingerprint": fingerprint(o), "verdict": verdict,
+            "reward_risk": rr, "reward_risk_net": rr_net, "fingerprint": fingerprint(o), "verdict": verdict,
             "reasons": reasons, "warnings": warns, "info": info,
         })
 

@@ -321,6 +321,10 @@ chat, and each needs the ticket's one-time nonce, so a second tap does
 nothing. It refuses to start on live (T212_ENV=live, `"paper": false` or
 `live_enabled`), without `allowed_tickers`, or without a paired phone.
 
+A ticket also needs the Time Machine's average R **after costs** above
+`autopilot.min_net_r` (default 0). Its BOUGHT message gives the average R before
+and after costs.
+
 With `"auto_buy": true` (demo only) there is no Approve step. A ticket that passes
 every check is placed at once, after the same placing-time checks an Approve runs.
 Those checks are a fresh quote, no chase past `max_chase_r`, and trader-risk again,

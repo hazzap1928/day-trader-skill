@@ -74,9 +74,16 @@ def et(ts):
 
 
 def run(argv):
+    """Never the real trader/config.json: without --config, no costs (test_costs.py covers them)."""
     out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        code = tm.main(argv)
+    saved = tm.read_cfg
+    if "--config" not in argv:
+        tm.read_cfg = lambda path: {}
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            code = tm.main(argv)
+    finally:
+        tm.read_cfg = saved
     return code, out.getvalue(), err.getvalue()
 
 

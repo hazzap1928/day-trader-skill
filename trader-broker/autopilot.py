@@ -52,7 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 AUTOPILOT_ENV = "demo"           # the one account this ever places on
 DEFAULTS = {"every_minutes": 15, "expire_minutes": 10, "max_chase_r": 0.5, "min_edge": 0.0,
-            "max_tickets_per_day": 10}
+            "max_tickets_per_day": 10, "min_net_r": 0.0}
 FLAGS = {"auto_buy": False}      # true: a ticket that passes every check is placed without a tap (demo only)
 POSITIONS_EVERY = 60             # seconds between fill and exit checks
 POLL_WAIT = 20                   # seconds a phone poll waits for a tap
@@ -156,6 +156,8 @@ def settings(cfg):
                          "or gone before the next cycle")
     if not 0 <= s["max_chase_r"] <= 2:
         raise PilotError("autopilot.max_chase_r must be 0 to 2")
+    if not -1 <= s["min_net_r"] <= 2:
+        raise PilotError("autopilot.min_net_r must be -1 to 2 (R after costs)")
     return s
 
 
@@ -357,7 +359,7 @@ class Pilot(object):
         if code != 0:
             return "no exit plan (%s)" % (err or out).strip()[-160:]
         code, out, err = self.run(["trader-timemachine/timemachine.py", "run", "--plan", self.p("plan.json"),
-                                   "--until", flat, "--write", self.p("timemachine.json"), "--json"],
+                                   "--until", flat, "--config", cfgp, "--write", self.p("timemachine.json"), "--json"],
                                   "the Time Machine")
         if code != 0:
             return "Time Machine could not run (%s)" % (err or out).strip()[-160:]
@@ -365,6 +367,13 @@ class Pilot(object):
         lean = mod("trader-timemachine", "timemachine").lean(doc.get("mc") or {}) if doc.get("mc") else None
         if lean is None or lean[0] <= self.s["min_edge"]:
             return "Time Machine: %s" % (doc.get("verdict") or "no edge")
+        net = (doc.get("costs") or {}).get("mc_avg_R_net")
+        if net is None:
+            return "Time Machine: no average R after costs in its output, so no ticket"
+        if net <= self.s["min_net_r"]:
+            return ("Time Machine: average R after costs %+.3f (before %+.3f; costs %.3fR at a %.2f %% stop) is not "
+                    "above autopilot.min_net_r %g" % (net, doc["costs"].get("mc_avg_R", 0), doc["costs"].get("mc_cost_R", 0),
+                                                      doc["costs"].get("stop_pct", 0), self.s["min_net_r"]))
         self.run(["trader-alerts/alerts.py", "quote", sym, "--write", self.p("prices.json")], "a quote")
         code, out, err = self.run(["trader-budget/size.py", "--plan", self.p("plan.json"), "--config", cfgp,
                                    "--fx", fx, "--prices", self.p("prices.json"),
@@ -379,7 +388,8 @@ class Pilot(object):
         mc = doc.get("mc") or {}
         return {"symbol": sym, "fingerprint": verdict["fingerprint"], "order": order, "risk": verdict,
                 "verdict": doc.get("verdict") or "",
-                "tm": {"p_target": mc.get("p_target"), "p_stop": mc.get("p_stop"), "verdict": doc.get("verdict") or ""}}
+                "tm": {"p_target": mc.get("p_target"), "p_stop": mc.get("p_stop"), "verdict": doc.get("verdict") or "",
+                       "avg_R": mc.get("avg_R"), "avg_R_net": (doc.get("costs") or {}).get("mc_avg_R_net")}}
 
     def risk(self):
         self.run(["trader-risk/check.py", "--orders", self.p("orders.json"), "--config", self.p("config.json"),
@@ -478,6 +488,8 @@ class Pilot(object):
         tm = t.get("tm") or {}
         odds = ("target first %.1f %%, stop first %.1f %%" % (100 * tm["p_target"], 100 * tm["p_stop"])
                 if tm.get("p_target") is not None and tm.get("p_stop") is not None else "no data")
+        if tm.get("avg_R_net") is not None:
+            odds += "; average %+.2fR after costs (%+.2fR before)" % (tm["avg_R_net"], tm.get("avg_R") or 0)
         stop_how = ("a stop order at Trading 212, good till cancelled" if rec.get("status") == "stop_placed"
                     else "enforced by the guard in software: a market sell at the stop")
         lines = ["BOUGHT (demo, automatic): %s %s" % (rec.get("qty") or t["order"].get("qty"), t["symbol"]),

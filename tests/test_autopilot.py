@@ -60,6 +60,7 @@ class Pipeline(object):
 
     def __init__(self, test, mc=GOOD_MC, quote=364.50, verdict="PASS", triggered=("TSLA",), order=None):
         self.t, self.mc, self.quote, self.verdict, self.triggered = test, mc, quote, verdict, triggered
+        self.net_r = 0.12
         self.order = order or tsla_ticket()
         self.calls = []
 
@@ -77,7 +78,9 @@ class Pipeline(object):
             t.write("plan.json", self.order["plan"])
             return 0, "", ""
         if s.endswith("timemachine.py"):
-            t.write("timemachine.json", {"mc": self.mc, "verdict": "Leans toward the target: test"})
+            t.write("timemachine.json", {"mc": dict(self.mc, avg_R=0.3), "verdict": "Leans toward the target: test",
+                                         "costs": {"mc_avg_R": 0.3, "mc_avg_R_net": self.net_r, "mc_cost_R": 0.3 - self.net_r,
+                                                   "stop_pct": 1.6}})
             return 0, "", ""
         if s.endswith("alerts.py"):
             t.write("prices.json", {"as_of": iso(t.clock[0]), "prices": {"TSLA": self.quote}})
@@ -199,6 +202,15 @@ class Cycle(PilotBase):
         line = self.pilot().cycle()
         self.assertIn("NVDA not on allowed_tickers", line)
         self.assertEqual(self.phone.sent, [])
+
+    def test_no_ticket_when_the_average_r_after_costs_is_not_positive(self):
+        self.pipe.net_r = -0.24
+        self.router.add("GET", "/equity/positions", FakeResp([]))
+        line = self.pilot().cycle()
+        self.assertIn("average R after costs -0.240 (before +0.300", line)
+        self.assertEqual(self.phone.sent, [])
+        tm_call = [c for c in self.pipe.calls if c[0].endswith("timemachine.py")][0]
+        self.assertEqual(tm_call[tm_call.index("--config") + 1], os.path.join(self.dir, "config.json"))
 
     def test_a_blocked_ticker_is_neither_scanned_nor_built(self):
         self.write("config.json", dict(self.cfg, blocked_tickers=["TSLA"]))

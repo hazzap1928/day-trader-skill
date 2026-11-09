@@ -102,6 +102,18 @@ Warnings do not block, but say them to the user: a LIVE account, a number
 sent as a number instead of a string, a stop that lives only in the plan and
 not at the broker, a price too old to use, an early close today.
 
+## Costs
+
+With a GBP or Trading 212 config (or any config that sets `"costs"`), reward:risk
+is also measured after costs. The FX fee (0.15 % by default) and slippage (0.05 %
+by default) on each fill are taken off the reward and added to the risk:
+`((target - entry) - k(entry + target)) / ((entry - stop) + k(entry + stop))`, with
+`k` = (fee + slippage) / 100. An entry under `min_reward_risk` after costs is
+blocked, and the reason gives both figures. An exit is never blocked by it.
+`reward_risk_net` is saved in `trader/state/risk.json`. With 1.5R targets and the
+usual 0.5 to 1.5 % opening-range stops, this blocks almost every entry. That is the
+point: after costs those trades lose on average.
+
 ## Steps
 
 1. If the price may have moved since the plan, refresh it first

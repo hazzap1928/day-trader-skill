@@ -284,6 +284,8 @@ class Flow(unittest.TestCase):
         with open(self.cfg) as fh:
             c = json.load(fh)
         c["broker"] = name
+        if name == "trading212":       # a ticket label test; the cost rule is tested in test_costs.py
+            c["costs"] = {"fx_fee_pct": 0, "slippage_pct": 0}
         with open(self.cfg, "w") as fh:
             json.dump(c, fh)
 
