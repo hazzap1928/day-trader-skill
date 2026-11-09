@@ -53,7 +53,8 @@ ROOT = os.path.dirname(HERE)
 AUTOPILOT_ENV = "demo"           # the one account this ever places on
 DEFAULTS = {"every_minutes": 15, "expire_minutes": 10, "max_chase_r": 0.5, "min_edge": 0.0,
             "max_tickets_per_day": 10, "min_net_r": 0.0}
-FLAGS = {"auto_buy": False}      # true: a ticket that passes every check is placed without a tap (demo only)
+FLAGS = {"auto_buy": False,      # true: a ticket that passes every check is placed without a tap (demo only)
+         "evidence_mode": False}  # true: the demo forward test (trader-broker/evidence.py); live refuses it
 POSITIONS_EVERY = 60             # seconds between fill and exit checks
 POLL_WAIT = 20                   # seconds a phone poll waits for a tap
 REPORT_AFTER = 5                 # minutes after the end-of-day close (15:50 New York) the closing report goes
@@ -76,6 +77,8 @@ def _load(folder, name):
 t212 = _load("trader-broker", "t212")
 phone_mod = t212.phone_module()
 net = t212.net_module()
+evidence = _load("trader-broker", "evidence")
+KRONOS_BUDGET = 6 * 60          # seconds of Kronos shadow verdicts a cycle at most (it never blocks a trade)
 tk = t212.ticket_module()
 _MODS = {}
 
@@ -207,6 +210,14 @@ def check_ready(cfg, client_env, phone):
         problems.append("trader/config.json has no allowed_tickers list: add the tickers it may scan")
     if cfg.get("require_stop", True) is not True:
         problems.append("\"require_stop\" must stay true")
+    try:
+        evidence.require_demo(cfg, client_env)
+        if evidence.on(cfg):
+            evidence.window(cfg)
+            if (cfg.get("autopilot") or {}).get("auto_buy") is not True:
+                problems.append("evidence mode needs autopilot.auto_buy true, so passing trades are placed")
+    except evidence.EvidenceError as e:
+        problems.append(str(e))
     if (cfg.get("autopilot") or {}).get("auto_buy") is True and client_env != AUTOPILOT_ENV:
         problems.append("autopilot.auto_buy works on the demo account only; there is no live automatic buying")
     awake, why = _keep_awake()
@@ -322,18 +333,49 @@ class Pilot(object):
             if sym in held:
                 self.state["tried"][sym] = "already held"
                 continue
+            self.sig = None
             got = self.build(sym, cfgp, fx)
             self.state["tried"][sym] = got if isinstance(got, str) else "passed every check"
             self.save()
             if isinstance(got, str):
                 notes.append("%s: %s" % (sym, got))
+                self.log_signal(got)
                 continue
             if self.s["auto_buy"]:
                 t = self.auto_buy(got)
+                self.log_signal("traded" if t["status"] == "placed" else "not placed: %s" % t.get("note", t["status"]),
+                                ticket=t["id"])
+                if self.s["evidence_mode"]:
+                    notes.append("%s: %s" % (sym, t["status"]))
+                    continue                     # evidence mode: every passing signal is placed (limits permitting)
                 return "%s: %s" % (sym, t["status"])
+            self.log_signal("ticket sent to the phone")
             self.send_ticket(got)
             return "%s: ticket sent to your phone" % sym
+        self.kronos_pass()
         return "no ticket: " + ("; ".join(notes) if notes else "nothing triggered that was not tried today")
+
+    def log_signal(self, decision, **extra):
+        """Evidence mode: every triggered signal goes in the log, traded or not."""
+        if not self.s["evidence_mode"] or not getattr(self, "sig", None):
+            return
+        rec = dict(self.sig, decision=decision, **extra)
+        rec["id"] = evidence.log_signal(self.sd, rec)
+        self.cycle_signals = getattr(self, "cycle_signals", []) + [rec]
+
+    def kronos_pass(self):
+        """Kronos's verdict on this cycle's signals, in shadow: logged only, within a time budget."""
+        todo, self.cycle_signals = getattr(self, "cycle_signals", []), []
+        if not todo:
+            return
+        start = _now()
+        for rec in todo:
+            if rec.get("entry") is None:
+                continue
+            if _now() - start > KRONOS_BUDGET:
+                evidence.update_signal(self.sd, rec["id"], kronos={"verdict": "skipped", "why": "time budget"})
+                continue
+            evidence.update_signal(self.sd, rec["id"], kronos=evidence.kronos_verdict(rec))
 
     def fx_fresh(self):
         doc = t212._read_json(self.p("fx.json"), {}) or {}
@@ -350,27 +392,38 @@ class Pilot(object):
         return out
 
     def build(self, sym, cfgp, fx):
-        """entry -> exit -> Time Machine -> budget -> risk for one symbol. A ticket dict, or why not."""
+        """entry -> exit -> Time Machine -> budget -> risk for one symbol. A ticket dict, or why not.
+        self.sig collects the signal for the evidence log as it goes."""
         flat = self.cfg.get("flat_by") or "15:55"
+        ny = _ny()
+        self.sig = sig = {"day": ny.date().isoformat(), "time": ny.strftime("%H:%M"), "symbol": sym, "at": _now()}
         self.run(["trader-entry/entry.py", "check", sym, "--config", cfgp, "--write", self.p("entry.json")],
                  "trader-entry check")
         code, out, err = self.run(["trader-exit/exit.py", "plan", "--from", self.p("entry.json"), "--config", cfgp,
                                    "--write", self.p("plan.json")], "trader-exit")
         if code != 0:
             return "no exit plan (%s)" % (err or out).strip()[-160:]
+        plan = t212._read_json(self.p("plan.json"), {}) or {}
+        sig.update(entry=plan.get("entry"), stop=plan.get("stop"), target=plan.get("target"),
+                   target_r=plan.get("target_r"), stop_rule=plan.get("stop_rule"))
         code, out, err = self.run(["trader-timemachine/timemachine.py", "run", "--plan", self.p("plan.json"),
                                    "--until", flat, "--config", cfgp, "--write", self.p("timemachine.json"), "--json"],
                                   "the Time Machine")
         if code != 0:
             return "Time Machine could not run (%s)" % (err or out).strip()[-160:]
         doc = t212._read_json(self.p("timemachine.json"), {}) or {}
+        mc0, c0 = doc.get("mc") or {}, doc.get("costs") or {}
+        sig.update(tm_p_target=mc0.get("p_target"), tm_p_stop=mc0.get("p_stop"), tm_avg_R=mc0.get("avg_R"),
+                   tm_avg_R_net=c0.get("mc_avg_R_net"), tm_cost_R=c0.get("mc_cost_R"), stop_pct=c0.get("stop_pct"))
         lean = mod("trader-timemachine", "timemachine").lean(doc.get("mc") or {}) if doc.get("mc") else None
         if lean is None or lean[0] <= self.s["min_edge"]:
             return "Time Machine: %s" % (doc.get("verdict") or "no edge")
         net = (doc.get("costs") or {}).get("mc_avg_R_net")
         if net is None:
             return "Time Machine: no average R after costs in its output, so no ticket"
-        if net <= self.s["min_net_r"]:
+        if net <= self.s["min_net_r"] and self.s["evidence_mode"]:
+            sig["cost_block_ignored"] = True       # evidence mode: logged, not blocked
+        elif net <= self.s["min_net_r"]:
             return ("Time Machine: average R after costs %+.3f (before %+.3f; costs %.3fR at a %.2f %% stop) is not "
                     "above autopilot.min_net_r %g" % (net, doc["costs"].get("mc_avg_R", 0), doc["costs"].get("mc_cost_R", 0),
                                                       doc["costs"].get("stop_pct", 0), self.s["min_net_r"]))
@@ -382,6 +435,7 @@ class Pilot(object):
         if code != 0:
             return "trader-budget made no order (%s)" % (err or out).strip()[-160:]
         verdict = self.risk()
+        sig.update(rr_net=verdict.get("reward_risk_net"), rr=verdict.get("reward_risk"), risk_verdict=verdict.get("verdict"))
         if verdict.get("verdict") != "PASS":
             return "trader-risk BLOCKED: %s" % "; ".join(verdict.get("reasons") or ["?"])
         order = self.order()
@@ -453,6 +507,12 @@ class Pilot(object):
         try:
             self._approve(t, by="auto-buy")
             text = self.bought_text(t)
+            if self.s["evidence_mode"]:
+                rec = self.placed_record(t)
+                evidence.log_trade(self.sd, {"day": _ny().date().isoformat(), "symbol": t["symbol"],
+                                             "fingerprint": t["fingerprint"], "t212_ticker": rec.get("t212_ticker"),
+                                             "expected_entry": t.get("quote"), "qty": rec.get("qty"),
+                                             "stop": rec.get("stop"), "target": rec.get("target")})
         except (PilotError, t212.T212Error) as e:
             text = self.not_placed(t, e)
         self.save()
@@ -470,6 +530,13 @@ class Pilot(object):
             return "!!! %s: UNCLEAR whether it was bought (demo). Check the app. !!! %s" % (t["symbol"], msg)
         t["status"] = "refused"
         return "NOT PLACED (demo): %s passed the checks when built, but at placing time: %s" % (t["symbol"], msg)
+
+    def placed_record(self, t):
+        rec = {}
+        for r in (t212._read_json(self.p("state", "broker.json"), {}) or {}).get("orders") or []:
+            if r.get("fingerprint") == t["fingerprint"] and r.get("status") in ("placed", "stop_placed", "software_stop"):
+                rec = r
+        return rec
 
     def bought_text(self, t):
         """What was bought, from the placement record and the position Trading 212 now shows."""
@@ -492,7 +559,8 @@ class Pilot(object):
             odds += "; average %+.2fR after costs (%+.2fR before)" % (tm["avg_R_net"], tm.get("avg_R") or 0)
         stop_how = ("a stop order at Trading 212, good till cancelled" if rec.get("status") == "stop_placed"
                     else "enforced by the guard in software: a market sell at the stop")
-        lines = ["BOUGHT (demo, automatic): %s %s" % (rec.get("qty") or t["order"].get("qty"), t["symbol"]),
+        lines = ["BOUGHT (demo, automatic%s): %s %s" % (", EVIDENCE MODE" if self.s["evidence_mode"] else "",
+                                                        rec.get("qty") or t["order"].get("qty"), t["symbol"]),
                  "Entry: $%s%s" % (t212._fmt(fill) if fill else t212._fmt(rec.get("entry")),
                                    " (filled)" if fill else " (estimate; not filled yet)"),
                  "Cost: about %s with the FX fee" % _gbp(rec.get("cost_gbp")),
@@ -628,6 +696,7 @@ class Pilot(object):
                              % (t["symbol"], float(px), self.s["max_chase_r"], entry, limit))
         if float(px) <= stop:
             raise PilotError("%s is at $%.2f, at or under the $%.2f stop" % (t["symbol"], float(px), stop))
+        t["quote"] = float(px)                  # the price expected when the order goes in (slippage report)
         rv = self.risk()
         if rv.get("fingerprint") != t["fingerprint"] or rv.get("verdict") != "PASS":
             raise PilotError("trader-risk no longer passes it: %s" % "; ".join(rv.get("reasons") or ["changed"]))
@@ -684,8 +753,9 @@ class Pilot(object):
     def status_text(self):
         st = self.state
         placed = sum(1 for t in st["tickets"] if t["status"] == "placed")
-        return ("Autopilot (demo, %s) %s: %d passing tickets today, %d placed, %s pending%s. %d tickers allowed." % (
-            "buys automatically" if self.s["auto_buy"] else "asks for Approve", st["day"], len(st["tickets"]),
+        return ("Autopilot (demo, %s%s) %s: %d passing tickets today, %d placed, %s pending%s. %d tickers allowed." % (
+            "buys automatically" if self.s["auto_buy"] else "asks for Approve",
+            ", EVIDENCE MODE forward test" if self.s["evidence_mode"] else "", st["day"], len(st["tickets"]),
             placed, len(self.pending()), ", PAUSED" if st.get("paused") else "",
             len(t212.allowed_tickers(self.cfg) or [])))
 
@@ -714,6 +784,21 @@ class Pilot(object):
                            % t212.scrub(e, self.client._secrets), phone=self.phone)
         self.state["summary_sent"] = True
         self.save()
+        if self.s["evidence_mode"]:
+            self.evidence_close(report)
+
+    def evidence_close(self, report):
+        """After the closing report: today's virtual results, and on Fridays (or the last day) the report."""
+        try:
+            n = evidence.resolve(self.sd)
+            self.say("evidence: %d virtual results filled in" % n)
+            ny = _ny()
+            if evidence.due(self.cfg, ny.date().isoformat(), ny.weekday()):
+                ok, _, r = evidence.send_report(self.client, self.sd, self.cfg, report, phone=self.phone)
+                self.say("evidence report %s: %s" % ("sent" if ok else "NOT sent", r["status"]))
+        except Exception as e:
+            phone_mod.push(self.sd, "EVIDENCE REPORT (demo): could not be built (%s)"
+                           % t212.scrub(e, self.client._secrets), phone=self.phone)
 
     # ------------------------------------------------------------ no internet
 
@@ -794,7 +879,8 @@ class Pilot(object):
             self.save()
         phone_mod.push(self.sd, "Autopilot started (demo). It %s, checking every %d min from %s to %s New York, "
                                 "from your %d allowed tickers. Reply /pause to stop new %s."
-                       % ("BUYS AUTOMATICALLY what passes every check" if self.s["auto_buy"]
+                       % (("EVIDENCE MODE (forward test): BUYS AUTOMATICALLY what passes; the cost block is off"
+                           if self.s["evidence_mode"] else "BUYS AUTOMATICALLY what passes every check") if self.s["auto_buy"]
                           else "sends tickets for your Approve", self.s["every_minutes"], first.strftime("%H:%M"),
                           last.strftime("%H:%M"), len(t212.allowed_tickers(self.cfg) or []),
                           "buys" if self.s["auto_buy"] else "tickets"), phone=self.phone)

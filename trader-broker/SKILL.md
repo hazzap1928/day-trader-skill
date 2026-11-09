@@ -306,6 +306,36 @@ the full briefing to `trader/briefings/DATE.md`. The briefing covers:
 
 Anything that does not load says "no data". It only ever GETs.
 
+**Evidence mode (`evidence.py`, demo forward test).** Turned on with
+`"autopilot": {"evidence_mode": true, "auto_buy": true}` and
+`"evidence": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}`. Live refuses it everywhere:
+- trader-risk refuses it on a config that is not `"paper": true`
+- `t212.py place --live` refuses to send
+- `go_live.py --check` lists it as a STOP
+
+While it is on:
+- **Cost rules relaxed:** the autopilot ignores its cost block (`min_net_r`), and trader-risk uses a 1.0
+  after-costs reward:risk minimum, so passing trades are placed.
+- **Every other limit stays:** trades a day, the daily loss limit, stops, the guard and the 15:50
+  end-of-day close.
+- **Signal log:** every signal the scanner triggers is logged to
+  `trader/state/evidence/signals.jsonl`, traded or not, with its entry, stop, target and the Time
+  Machine's R after costs. After the close it gets a virtual result: a buy at the first bar after the
+  signal, out at the stop, the target or 15:50, with GBP-account costs.
+- **Slippage:** real trades record the price expected when the order went in, and the guard records
+  the price it saw when it sold. The Friday report measures slippage against Trading 212's fills.
+- **Kronos:** `trader-kronos/` gives a shadow verdict on each signal and never blocks anything.
+- **Friday report:** each Friday after the close, and on the last day, the phone gets the evidence
+  report:
+  - real trades and virtual signals, with their averages after costs
+  - actual against assumed slippage
+  - the return against an S&P 500 tracker over the same days
+  - how the signals Kronos agreed with did, against the ones it disagreed with
+  - the pass status
+
+  To pass, it needs a positive average per real trade after costs AND a better return than the
+  tracker. BOUGHT messages and `/status` say EVIDENCE MODE.
+
 **Autopilot and phone approvals (`autopilot.py`, `phone.py`, demo only).** For
 time away from the Mac. On weekdays launchd runs `run-autopilot.sh`. Every 15
 minutes inside the entry window it runs scanner (orb, `allowed_tickers` only),

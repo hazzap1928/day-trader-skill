@@ -414,6 +414,18 @@ FX_FEE_PCT = 0.15          # Trading 212's FX fee on each conversion
 SLIPPAGE_PCT = 0.05        # an allowance per fill
 
 
+EVIDENCE_MIN_RR_NET = 1.0     # evidence mode (demo forward test): the after-costs reward:risk minimum
+
+
+def evidence_mode(c):
+    """True when the demo forward test is on ("autopilot": {"evidence_mode": true}). It is refused on a
+    live config: evidence mode exists to collect demo results, never to place real-money trades."""
+    on = (c.get("autopilot") or {}).get("evidence_mode") is True
+    if on and (c.get("paper") is not True or c.get("live_enabled")):
+        raise RiskError("evidence mode is demo only: turn off autopilot.evidence_mode, or set \"paper\": true")
+    return on
+
+
 def trade_costs(c):
     """{"fx_fee_pct", "slippage_pct", "k"}: config "costs" first. A GBP or Trading 212 config defaults to
     the 0.15 %% FX fee and 0.05 %% slippage; any other config counts no costs unless it sets "costs".
@@ -538,6 +550,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         raise RiskError(str(e))
     c = dict(DEFAULTS)
     c.update(cfg)
+    evidence_mode(c)                     # refused on a live config before anything else
     frac_ok = bool(c.get("fractional")) and str(c.get("broker") or "").lower() in ("trading212", "t212")
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
     now_utc = now or parse_now(None)
@@ -788,11 +801,13 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                 rr_net = round(net_reward / net_risk, 2)
                                 cost_note = ("FX fee %g %% each way + slippage %g %% a fill"
                                              % (kc["fx_fee_pct"], kc["slippage_pct"]))
-                                if min_rr and rr_net < min_rr - 1e-9 and not (rr < min_rr - 1e-9):
+                                min_net = EVIDENCE_MIN_RR_NET if evidence_mode(c) else min_rr
+                                if min_net and rr_net < min_net - 1e-9 and not (rr < min_rr - 1e-9):
                                     later.append("reward:risk after costs: %.2f (%.2f before; %s cost %s a share at "
-                                                 "the target and %s at the stop) is under your minimum %s"
+                                                 "the target and %s at the stop) is under your minimum %s%s"
                                                  % (rr_net, rr, cost_note, _p(kc["k"] * (ref + target)),
-                                                    _p(kc["k"] * (ref + stop)), _num(min_rr)))
+                                                    _p(kc["k"] * (ref + stop)), _num(min_net),
+                                                    " (evidence mode)" if evidence_mode(c) else ""))
                     elif min_rr:
                         later.append("reward:risk: no target to measure it against (min_reward_risk %s)"
                                      % _num(min_rr))

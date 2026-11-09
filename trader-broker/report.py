@@ -89,7 +89,7 @@ def history(client, since_utc):
                           "side": str(o.get("side") or ("BUY" if (t212._num(o.get("quantity")) or 0) > 0 else "SELL")).upper(),
                           "qty": q, "price": px, "gross_gbp": (q * px / rate) if rate else None, "fees_gbp": fees,
                           "at": at, "type": str(o.get("type") or "").upper(), "from": o.get("initiatedFrom"),
-                          "order_id": o.get("id")})
+                          "order_id": o.get("id"), "stop_price": t212._num(o.get("stopPrice"))})
         nxt = doc.get("nextPagePath")
         if not nxt or (oldest is not None and oldest < since_utc):
             break
@@ -130,7 +130,7 @@ def round_trips(fills):
             continue
         proceeds = (f["gross_gbp"] - f["fees_gbp"]) * matched / f["qty"] if known else None
         closed.append({"ticker": t, "qty": matched, "entry": buy_px_q / matched, "exit": f["price"],
-                       "pl": (proceeds - cost) if known else None, "fees": f["fees_gbp"] + sum(b["fees_gbp"] for b in buys),
+                       "pl": (proceeds - cost) if known else None, "cost_gbp": cost if known else None, "fees": f["fees_gbp"] + sum(b["fees_gbp"] for b in buys),
                        "entry_at": buys[0]["at"], "exit_at": f["at"], "sell": f})
     open_lots = {t: ls for t, ls in lots.items() if ls}
     return closed, open_lots

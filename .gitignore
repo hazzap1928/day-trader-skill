@@ -2,3 +2,8 @@
 trader/
 __pycache__/
 .DS_Store
+
+# trader-kronos: its own Python environment, the Kronos code and the model files (fetched by setup.sh)
+trader-kronos/.venv/
+trader-kronos/vendor/
+trader-kronos/models/

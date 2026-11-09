@@ -87,6 +87,9 @@ def preflight(cfg, state_dir, env_text, run_tests=None, plist_path=PLIST):
         problems.append("the config already says live (live_enabled true or paper false); use --revert first")
     if cfg.get("paper") is not True:
         problems.append("\"paper\" must be true before switching (it is %r)" % cfg.get("paper"))
+    if (cfg.get("autopilot") or {}).get("evidence_mode") or (cfg.get("autopilot") or {}).get("auto_buy"):
+        problems.append("autopilot.evidence_mode and autopilot.auto_buy are demo-only settings: turn both off "
+                        "before going live")
     try:
         allow = t212.allowed_tickers(cfg)
         if not allow:

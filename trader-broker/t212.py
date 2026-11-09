@@ -1031,6 +1031,9 @@ def cmd_place(client, args, confirm=None):
         tk.config_currency(cfg)               # a GBP config with a dollar name in it stops here
     except tk.CurrencyError as e:
         raise T212Error(str(e), 2)
+    if client.env != "demo" and (cfg.get("autopilot") or {}).get("evidence_mode"):
+        raise T212Error("evidence mode is on in trader/config.json; it is a demo forward test and never places on "
+                        "a live account. Turn it off first. Nothing was sent.", 2)
     mode = stop_mode(cfg)
     allow = allowed_tickers(cfg)
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
@@ -1850,7 +1853,7 @@ def eod_close(client, state_dir):
         raise T212Error("the end-of-day close runs on the demo account only; nothing was sent", 2)
     tk = ticket_module()
     out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
-           "closed": [], "failed": []}
+           "closed": [], "failed": [], "sold": []}
     g = _Guard(client, state_dir, out)
     positions = client.get(POSITIONS) or []
     pending = client.get(ORDERS) or []
@@ -1898,11 +1901,14 @@ def eod_close(client, state_dir):
             continue
         g.log("response", path=MARKET, body=resp)
         out["placed"] += 1
+        out["sold"].append({"ticker": ticker, "qty": held, "price_seen": _num(p.get("currentPrice")),
+                            "order_id": resp.get("id")})       # for the evidence report's exit slippage
         out["closed"].append("%s: SELL %s at market, order id %s%s" % (
             ticker, _qty(held), _ident(resp.get("id")),
             "" if not cancelled else ", cancelled %s" % ", ".join(
                 "%s %s" % (o.get("type", "?"), _fmt(o.get("stopPrice"))) for o in cancelled)))
-    g.state["eod"] = {"date": _today_ny(tk), "at": out["at"], "closed": out["closed"], "failed": out["failed"]}
+    g.state["eod"] = {"date": _today_ny(tk), "at": out["at"], "closed": out["closed"], "failed": out["failed"],
+                      "sold": out["sold"]}
     g.save()
     out["nothing"] = not out["closed"] and not out["failed"]
     return out
