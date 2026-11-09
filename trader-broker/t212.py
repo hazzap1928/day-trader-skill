@@ -2170,9 +2170,47 @@ def cmd_guard(client, args):
         _sleep(wait)
 
 
+_BUDGET = []
+
+
+def budget_module():
+    if not _BUDGET:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "account_budget.py")
+        spec = importlib.util.spec_from_file_location("trader_broker_account_budget", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _BUDGET.append(mod)
+    return _BUDGET[0]
+
+
+def cmd_budget(client, args):
+    """Budget and loss limits from the account value (account_budget in the config). Reads one account
+    summary; with --apply writes the figures into trader/config.json (once a day unless --force)."""
+    ab = budget_module()
+    path = os.path.join(args.state_dir, "config.json")
+    s = client.get(SUMMARY) or {}
+    if str(s.get("currency", "")).upper() != "GBP":
+        raise T212Error("this account is in %s; account_budget works with a GBP account" % s.get("currency"), 2)
+    value = _num(s.get("totalValue"))
+    today = _today_ny(ticket_module())
+    try:
+        if args.apply:
+            r, changed = ab.apply(value, path, today, force=args.force)
+            note = ("written to %s" % path) if changed else "already set today (use --force to read it again)"
+        else:
+            r = ab.compute(value, ab.settings(_read_json(path, {}) or {}) or
+                           ab.settings({"account_budget": {"enabled": True}, "currency": "GBP"}))
+            note = "not written (add --apply)"
+    except ab.BudgetError as e:
+        raise T212Error(str(e), 2)
+    if args.json:
+        return dict(r, env=client.env, today=today, note=note)
+    return "%s\n%s\n%s" % (_env_line(client), ab.plain(r, today), note)
+
+
 COMMANDS = {"status": cmd_status, "cash": cmd_cash, "info": cmd_info, "positions": cmd_positions,
             "orders": cmd_orders, "ticker": cmd_ticker, "instruments": cmd_instruments, "place": cmd_place,
-            "guard": cmd_guard}
+            "guard": cmd_guard, "budget": cmd_budget}
 
 
 def _add_common(parser, defaults):
@@ -2208,6 +2246,9 @@ def build_parser():
     pl.add_argument("--resend", action="store_true",
                     help="send again after a failed or unclear send (checks for a duplicate first)")
     pl.add_argument("--fx-rate", type=float, help="USD per GBP to use instead of Yahoo's current rate")
+    b = sub.add_parser("budget", parents=[common], help="budget and loss limits from the account value")
+    b.add_argument("--apply", action="store_true", help="write them into trader/config.json")
+    b.add_argument("--force", action="store_true", help="with --apply: read the account again even if done today")
     g = sub.add_parser("guard", parents=[common],
                        help="protect open positions with the ticket's stop (exits only, never buys)")
     g.add_argument("--watch", action="store_true", help="wait for the open, then check every --every minutes")

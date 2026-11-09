@@ -805,7 +805,7 @@ class Pilot(object):
         m = alerts.market_status(_utc())
         lines = ["", "Market: %s%s" % ("OPEN" if m.get("open") else "closed (%s)" % (m.get("reason") or "closed"),
                                        "" if m.get("open") else "; next open %s New York" % m.get("next_open", "?")),
-                 "Guard: %s" % _guard_state(self.sd)[1], "Keep-awake: %s" % _keep_awake()[1]]
+                 "Guard: %s" % _guard_state(self.sd)[1], "Keep-awake: %s" % _keep_awake()[1], self.budget_line()]
         if self.s["evidence_mode"]:
             lines.append("EVIDENCE MODE is ON: %s" % self.evidence_day())
         return "\n".join(lines)
@@ -933,6 +933,39 @@ class Pilot(object):
                os.path.join(self.sd, "logs", "briefing.log"))
         self.say("the morning briefing had not reached the phone: started it again")
 
+    def apply_budget(self):
+        """account_budget: today's budget and loss limits from the account value, once a trading day."""
+        ab = t212.budget_module()
+        today = _ny().date().isoformat()
+        try:
+            if not ab.settings(self.cfg) or self.state.get("budget_day") == today:
+                return
+            value = t212._num((self.client.get(t212.SUMMARY) or {}).get("totalValue"))
+            r, changed = ab.apply(value, self.p("config.json"), today)
+        except (ab.BudgetError, t212.T212Error) as e:
+            phone_mod.push(self.sd, "BUDGET NOT UPDATED (demo): %s. Yesterday's budget and limits stay."
+                           % t212.scrub(e, self.client._secrets), phone=self.phone, once_key="budget-" + today)
+            return
+        self.cfg = self.read_cfg()
+        self.s = settings(self.cfg)
+        self.state["budget_day"] = today
+        self.save()
+        self.say("budget %s: %s" % ("updated" if changed else "already set today", ab.plain(r).replace("\n", ";")))
+
+    def budget_line(self):
+        c = self.cfg
+        last = ((c.get("account_budget") or {}).get("last") or {})
+        f = last.get("figures") or {}
+        if (c.get("account_budget") or {}).get("enabled") and f:
+            return ("Budget (from the GBP {:,.2f} account on {}): invest up to GBP {:,.2f}, keep GBP {:,.2f} cash; "
+                    "max loss GBP {:,.2f} a trade, GBP {:,.2f} a day{}".format(
+                        f["account_value"], last.get("date"), f["invest_gbp"], f["cash_gbp"],
+                        f["max_loss_per_trade_gbp"], f["max_daily_loss_gbp"],
+                        " (capped by max_budget_gbp)" if f.get("capped") else ""))
+        b = c.get("budget_gbp")
+        return "Budget (fixed): GBP {}, cash buffer {}%, max loss GBP {} a trade, GBP {} a day".format(
+            b, c.get("cash_buffer_pct"), c.get("max_loss_per_trade_gbp"), c.get("max_daily_loss_gbp"))
+
     def open_message(self, first=None, last=None):
         """The confirmation at the open: guard and autopilot running, positions and their stops, evidence mode."""
         ny = _ny()
@@ -947,6 +980,7 @@ class Pilot(object):
                      ", PAUSED (send /resume)" if self.state.get("paused") else "")]
         if self.s["evidence_mode"]:
             lines.append("EVIDENCE MODE is ON: %s" % self.evidence_day())
+        lines.append(self.budget_line())
         lines += self.positions_lines()
         if first and last:
             lines.append("Checks every %d min from %s to %s New York. /pause stops new buys." % (
@@ -1043,6 +1077,7 @@ class Pilot(object):
             if not self.state.get("summary_sent"):
                 self.send_summary()
             return "after the close"
+        self.apply_budget()
         if ny < open_at:
             self.say("waiting for the open (%s New York); answering the phone meanwhile" % st["opens"])
             while _ny() < open_at:

@@ -243,6 +243,19 @@ one exception, and it only ever protects shares you already hold. Its log is
 every guard alert, every stop it places, trails or sells at, and each new
 warning (once a day) also goes to the phone.
 
+**Budget from the account value (`account_budget.py`, demo and live).** With
+`"account_budget": {"enabled": true, "budget_pct": 90, "max_loss_pct": 1, "daily_loss_pct": 3, "max_budget_gbp": null}`,
+the account's total value is read from Trading 212 each trading morning, and these keys are written into
+`trader/config.json`:
+- `budget_gbp` = the account value, with `cash_buffer_pct` = 10, so 90% can be invested
+- `max_loss_per_trade_gbp` = 1% of the account value
+- `max_daily_loss_gbp` = 3% of the value at the start of the day
+
+`run-guard.sh` does it before the guard starts, and the autopilot before the open. With
+`max_budget_gbp` set, the amount invested never goes over it, and the loss limits come from the capped
+account. A failed reading keeps yesterday's limits and tells the phone. To do it by hand:
+`t212.py budget [--apply] [--live]`.
+
 **Every stop is checked after it is placed.** On 6 Nov Trading 212 accepted a stop
 and then REJECTED it, and the record said "stop placed". The order history gives no
 reason. The likely cause is timing: the stop was sent 1 second after the fill,

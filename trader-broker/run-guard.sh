@@ -24,4 +24,7 @@ else
 fi
 mkdir -p trader/logs
 echo "---- $(date -u +%Y-%m-%dT%H:%M:%SZ) guard start (${T212_ENV:-demo})"
+# account_budget (if on): today's budget and loss limits from the account value. A failure leaves
+# yesterday's limits in place and never stops the guard.
+/usr/bin/python3 trader-broker/t212.py budget --apply "${live[@]}" || echo "budget: not updated; yesterday's limits stay"
 exec /usr/bin/python3 trader-broker/t212.py guard --watch "${live[@]}" "$@"
