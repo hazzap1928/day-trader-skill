@@ -167,7 +167,10 @@ class Base(unittest.TestCase):
         """A clean demo account; the entry fills on the first positions check after it."""
         r = self.router
         r.add("GET", "/equity/account/summary", FakeResp(SUMMARY))
-        r.add("GET", "/equity/orders", FakeResp(pending or []))
+        stop_echo = {"id": 5002, "ticker": "TSLA_US_EQ", "type": "STOP", "side": "SELL", "quantity": -7,
+                     "status": "NEW"}
+        # the duplicate check sees what was pending; the check a minute after the stop sees the stop
+        r.add("GET", "/equity/orders", FakeResp(pending or []), FakeResp(list(pending or []) + [stop_echo]))
         r.add("GET", "/equity/positions", FakeResp(positions or []), FakeResp(filled if filled is not None else HELD7))
         r.add("POST", "/equity/orders/market",
               market or FakeResp({"id": 5001, "status": "NEW", "side": "BUY", "ticker": "TSLA_US_EQ", "quantity": 7}))
@@ -681,7 +684,8 @@ class Records(Base):
         self.assertEqual(code, 0, err)
         events = [(e["event"], e.get("path")) for e in self.order_log()]
         self.assertEqual(events, [("request", "/equity/orders/market"), ("response", "/equity/orders/market"),
-                                  ("request", "/equity/orders/stop"), ("response", "/equity/orders/stop")])
+                                  ("request", "/equity/orders/stop"), ("response", "/equity/orders/stop"),
+                                  ("stop_check", None)])
         log = self.order_log()
         self.assertEqual(log[0]["body"], {"ticker": "TSLA_US_EQ", "quantity": 7, "extendedHours": False})
         self.assertEqual(log[1]["body"]["id"], 5001)

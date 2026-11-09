@@ -243,6 +243,25 @@ one exception, and it only ever protects shares you already hold. Its log is
 every guard alert, every stop it places, trails or sells at, and each new
 warning (once a day) also goes to the phone.
 
+**Every stop is checked after it is placed.** On 6 Nov Trading 212 accepted a stop
+and then REJECTED it, and the record said "stop placed". The order history gives no
+reason. The likely cause is timing: the stop was sent 1 second after the fill,
+before the shares were free to sell. Fractional size is unlikely to be the cause:
+Trading 212's own API example is a 0.1-share stop, and an identical 10.51-share stop
+placed later was accepted. So now:
+- `place` waits until the bought shares are free to sell before sending the stop.
+- `place` checks the stop again 60 seconds after sending it.
+- The guard checks it on every cycle after that (a minute after the guard places one).
+
+A stop that is REJECTED, cancelled or missing switches that position to a
+**software stop**. The guard then sells at market at or under the stop, checking
+every minute, and never re-sends a stop order that was refused. It also raises a
+loud alert in the log, on the Mac and on the phone. A rejected status still on the
+pending list does not count as cover.
+
+`"fractional_stops": "software"` (default `"broker"`) gives every fractional
+position a software stop from the start, with no stop order sent.
+
 **End-of-day close (demo, exits only, off unless set).** With
 `"eod_close": {"enabled": true, "at": "15:50"}`, the watching guard wakes at that
 New York time once a day. For each open position it cancels the pending sells

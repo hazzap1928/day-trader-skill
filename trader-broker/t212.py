@@ -963,9 +963,9 @@ def render_place(index, total, client, order, inst, sz, side, price_src, fx, bod
             lines.append("  stop:        %.2f %s, sent as a separate STOP order once the entry fills: SELL %s, "
                          "good till cancelled" % (sz["stop_usd"], ccy, _qty(sz["qty"])))
         else:
-            lines.append("  stop:        %.2f %s, enforced by t212.py guard (stop_mode market): it sells at market "
+            lines.append("  stop:        %.2f %s, enforced by t212.py guard (%s): it sells at market "
                          "when the price is at or under it. No stop order is sent; keep the guard running"
-                         % (sz["stop_usd"], ccy))
+                         % (sz["stop_usd"], ccy, "fractional_stops software" if mode == "software" else "stop_mode market"))
         target = _num((order.get("plan") or {}).get("target")) or _num(order.get("take_profit_limit_price"))
         if target:
             lines.append("  target:      %.2f %s (shown only, not sent: Trading 212's API has no bracket order)"
@@ -989,13 +989,22 @@ def render_place(index, total, client, order, inst, sz, side, price_src, fx, bod
     return "\n".join(lines)
 
 
-def wait_for_fill(client, ticker, want, before):
-    for _ in range(FILL_POLLS):
+def wait_for_fill(client, ticker, want, before, before_free=None):
+    """True once the bought shares are held AND free to sell (quantityAvailableForTrading): a stop
+    sent while they are still settling can be accepted and then REJECTED (DHR, 6 Nov)."""
+    held_ok = False
+    for i in range(FILL_POLLS + SELLABLE_POLLS):
         pos = client.get(POSITIONS, {"ticker": ticker})
-        held = sum(_num(p.get("quantity")) or 0 for p in pos or [] if _o_ticker(p) == ticker)
+        mine = [p for p in pos or [] if _o_ticker(p) == ticker]
+        held = sum(_num(p.get("quantity")) or 0 for p in mine)
+        free = sum(_num(p.get("quantityAvailableForTrading", p.get("quantity"))) or 0 for p in mine)
         if held - before + 1e-9 >= want:
-            return True
-    return False
+            held_ok = True
+            if free - (before if before_free is None else before_free) + 1e-9 >= want:
+                return True
+        elif i >= FILL_POLLS - 1 and not held_ok:
+            return False
+    return held_ok
 
 
 def cmd_place(client, args, confirm=None):
@@ -1102,6 +1111,8 @@ def cmd_place(client, args, confirm=None):
         stop = _num(order.get("stop_loss_stop_price")) or _num((order.get("plan") or {}).get("stop"))
         sz = size_entry(price, stop, ticket_qty, fx[0], cash, cfg, fractional_for(cfg, inst))
         bodies = [(MARKET, market_body(ticker, "buy", sz["qty"]))]
+        if mode == "broker" and is_fractional(sz["qty"]) and fractional_stops(cfg) == "software":
+            mode = "software"                     # fractional position: the guard holds the stop
         if mode == "broker":
             bodies.append((STOP, stop_body(ticker, sz["qty"], stop)))
     else:
@@ -1165,12 +1176,19 @@ def cmd_place(client, args, confirm=None):
     # 8. the stop, once the entry has filled: the same on demo and live
     if side != "buy":
         return result
+    if mode == "software":
+        _record(paths["state"], state, dict(base, at=tk.ny_iso(_utc_now()), status="software_stop"))
+        _say("STOP %.2f is enforced by t212.py guard (fractional_stops software): %s is a fractional position, so no "
+             "stop order was sent; the guard sells at market at or under the stop. Keep the guard running."
+             % (sz["stop_usd"], _qty(sz["qty"])))
+        result["stop_mode"] = "software"
+        return result
     if mode == "market":
         _say("STOP %.2f is enforced by t212.py guard (stop_mode market): it sells %s %s at market when the price "
              "is at or under it. No stop order was sent. Keep the guard running." % (sz["stop_usd"], _qty(sz["qty"]), ticker))
         result["stop_mode"] = "market"
         return result
-    if not wait_for_fill(client, ticker, sz["qty"], held):
+    if not wait_for_fill(client, ticker, sz["qty"], held, avail):
         msg = ("the entry has not filled yet (the market may be closed), so the stop was NOT placed. "
                "When it fills, set a stop in the app: SELL %s %s at %.2f" % (_qty(sz["qty"]), ticker, sz["stop_usd"]))
         log_event(sd, secrets, "stop_skipped", env=client.env, ticket=index, reason=msg)
@@ -1188,10 +1206,24 @@ def cmd_place(client, args, confirm=None):
                         % ("NOT PLACED" if e.outcome == "rejected" else "UNCLEAR", e, _qty(sz["qty"]), ticker,
                            sz["stop_usd"]), 3)
     log_event(sd, secrets, "response", env=client.env, ticket=index, path=path, status=status, body=sresp)
-    _record(paths["state"], state, dict(base, at=tk.ny_iso(_utc_now()), status="stop_placed",
-                                        broker_order_id=sresp.get("id")))
-    _say("STOP PLACED: SELL %s %s at %.2f, good till cancelled, order id %s"
-         % (_qty(sz["qty"]), ticker, sz["stop_usd"], _ident(sresp.get("id"))))
+    _say("STOP SENT: SELL %s %s at %.2f, good till cancelled, order id %s; checking it again in %ds"
+         % (_qty(sz["qty"]), ticker, sz["stop_usd"], _ident(sresp.get("id")), VERIFY_AFTER))
+    _sleep(VERIFY_AFTER)
+    how, raw = stop_status(client, ticker, sresp.get("id"))
+    log_event(sd, secrets, "stop_check", env=client.env, ticket=index, order_id=sresp.get("id"), result=how, status=raw)
+    rec_base = dict(base, broker_order_id=sresp.get("id"))
+    if how != "ok" and how != "filled":
+        _record(paths["state"], state, dict(rec_base, at=tk.ny_iso(_utc_now()), status="stop_rejected",
+                                            note="stop %s (%s) a minute after it was sent" % (how, raw)))
+        software_on(sd, ticker, rec_base, sz["stop_usd"], "the stop order was %s (%s)" % (how, raw))
+        stop_rejected_alarm(client, ticker, sz["qty"], sz["stop_usd"],
+                            "REJECTED by Trading 212" if how == "rejected" else "GONE (%s)" % raw)
+        raise T212Error("ENTRY PLACED, STOP %s by Trading 212 (%s). The guard enforces the %.2f stop in software "
+                        "now (market sell at or under it); keep it running, or set a stop in the app."
+                        % ("REJECTED" if how == "rejected" else "NOT WORKING", raw, sz["stop_usd"]), 3)
+    _record(paths["state"], state, dict(rec_base, at=tk.ny_iso(_utc_now()), status="stop_placed", verified=raw))
+    verify_track(sd, ticker, sresp.get("id"), rec_base, sz["stop_usd"])
+    _say("STOP PLACED and checked a minute later: Trading 212 shows it as %s" % raw)
     result["stop"] = sresp
     return result
 
@@ -1199,8 +1231,12 @@ def cmd_place(client, args, confirm=None):
 # ---------------------------------------------------------------- the stop guardian (demo only)
 
 GUARD_STOP_TYPES = ("STOP", "STOP_LIMIT")
+DEAD_STATUSES = ("REJECTED", "CANCELLED", "CANCELLING")   # a pending order in one of these protects nothing
+VERIFY_AFTER = 60             # seconds after placing a stop before its status is checked again
+SELLABLE_POLLS = 15           # positions checks (1 a second) waiting for bought shares to be free to sell
+FRACTIONAL_STOP_MODES = ("broker", "software")
 GUARD_OPEN = (9, 30)
-GUARD_STATUSES = ("placed", "stop_placed", "stop_not_placed")
+GUARD_STATUSES = ("placed", "stop_placed", "stop_not_placed", "stop_rejected", "software_stop")
 GUARD_GONE_POLLS = 3          # looks at the pending list after a cancel, before the new stop goes in
 
 
@@ -1213,8 +1249,79 @@ def guard_sell_orders(pending, ticker):
         q = _num(o.get("quantity")) or 0
         if not (q < 0 or str(o.get("side", "")).upper() == "SELL"):
             continue
+        if str(o.get("status", "")).upper() in DEAD_STATUSES:
+            continue
         (stops if str(o.get("type", "")).upper() in GUARD_STOP_TYPES else others).append(o)
     return stops, others
+
+
+def fractional_stops(cfg):
+    """"broker" (default): fractional positions get a real stop order like any other.
+    "software": a fractional position gets no stop order; the guard sells at market at the stop."""
+    m = str((cfg or {}).get("fractional_stops") or "broker").strip().lower()
+    if m not in FRACTIONAL_STOP_MODES:
+        raise T212Error("fractional_stops in trader/config.json must be \"broker\" or \"software\"", 2)
+    return m
+
+
+def is_fractional(qty):
+    return abs(float(qty) - round(float(qty))) > 1e-9
+
+
+def stop_status(client, ticker, order_id, pending=None):
+    """Is this stop still working at Trading 212? ("ok" | "rejected" | "cancelled" | "filled" | "missing", raw
+    status). A stop on the pending list counts unless its status is dead; otherwise the order history says."""
+    if pending is None:
+        pending = client.get(ORDERS) or []
+    for o in pending:
+        if o.get("id") == order_id:
+            st = str(o.get("status", "")).upper()
+            if st not in DEAD_STATUSES:
+                return "ok", st
+            return ("rejected" if st == "REJECTED" else "cancelled"), st
+    try:
+        doc = client.get(HISTORY, {"ticker": ticker, "limit": 20}) or {}
+    except T212Error as e:
+        if e.status in (401, 403):
+            raise
+        return "missing", "not pending, and the order history did not load (%s)" % scrub(e, client._secrets)
+    for it in doc.get("items") or []:
+        o = it.get("order") or {}
+        if o.get("id") == order_id:
+            st = str(o.get("status", "")).upper()
+            if st == "FILLED" or (_num(o.get("filledQuantity")) or 0) > 0:
+                return "filled", st
+            if st == "REJECTED":
+                return "rejected", st
+            if st in ("CANCELLED", "CANCELLING"):
+                return "cancelled", st
+            return "missing", st or "?"
+    return "missing", "not pending and not in the recent order history"
+
+
+def software_on(state_dir, ticker, rec, stop, why):
+    """From now on the guard enforces this position's stop itself (sells at market at the stop)."""
+    path = os.path.join(state_dir, "state", "t212-guard.json")
+    st = _read_json(path, {}) or {}
+    st.setdefault("software", {})[ticker] = {"fingerprint": (rec or {}).get("fingerprint"), "stop": stop,
+                                             "why": why, "since": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")}
+    (st.get("verify") or {}).pop(ticker, None)
+    _write_json(path, st)
+
+
+def verify_track(state_dir, ticker, order_id, rec, stop):
+    path = os.path.join(state_dir, "state", "t212-guard.json")
+    st = _read_json(path, {}) or {}
+    st.setdefault("verify", {})[ticker] = {"id": order_id, "fingerprint": (rec or {}).get("fingerprint"),
+                                           "stop": stop, "placed_at": _now()}
+    _write_json(path, st)
+
+
+def stop_rejected_alarm(client, ticker, qty, stop, how):
+    guard_alarm(client, "STOP %s for %s (SELL %s at %.2f). The guard now ENFORCES IT IN SOFTWARE: it sells at "
+                        "market when the price is at or under %.2f, checking every minute. Keep the Mac awake and "
+                        "the guard running, or set a stop yourself in the app."
+                % (how, ticker, _qty(qty), stop, stop))
 
 
 def guard_ticket(state, ticker, env):
@@ -1531,6 +1638,19 @@ def guard_market(g, row, rec, held, ticket_qty, price, trail, cfg):
     g.save()
 
 
+def guard_known_stop(g, rec, ticker, stops):
+    """The newest stop order id this pack placed for the ticket: the guard's own, else place's."""
+    best = None
+    for x in g.state.get("placed") or []:
+        if x.get("ticker") == ticker and x.get("order_id"):
+            best = x["order_id"]
+    if best is None and rec.get("status") == "stop_placed":
+        best = rec.get("broker_order_id")
+    if best is None:
+        return None
+    return {"id": best, "fingerprint": rec.get("fingerprint"), "stop": rec.get("stop"), "placed_at": 0}
+
+
 def guard_pass(client, state_dir):
     """One look at every open position. Returns {"at", "positions": [...], "warnings": [...], "placed": n}."""
     if client.env != "demo" and not (client.live_ok or LIVE_PLACEMENT_ENABLED):
@@ -1548,6 +1668,9 @@ def guard_pass(client, state_dir):
     out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
            "trailing": trail, "stop_mode": mode}
     g = _Guard(client, state_dir, out)
+    software = g.state.setdefault("software", {})
+    verify = g.state.setdefault("verify", {})
+    frac_mode = fractional_stops(cfg)
     held_tickers = set()
     for p in positions:
         ticker = _o_ticker(p)
@@ -1567,6 +1690,49 @@ def guard_pass(client, state_dir):
                 str(o.get("type", "?")) for o in others + (stops if mode == "market" else []))
             continue
         rec = guard_ticket(state, ticker, client.env)
+        if rec is not None and mode == "broker":
+            v = verify.get(ticker)
+            if v is None:                         # a stop placed before verification existed: track the latest
+                v = guard_known_stop(g, rec, ticker, stops)
+                if v:
+                    verify[ticker] = v
+            if v and v.get("fingerprint") == rec.get("fingerprint"):
+                alive = [o for o in stops if o.get("id") == v["id"]]
+                if alive:
+                    v["checked"] = out["at"]
+                else:
+                    how, raw = stop_status(client, ticker, v["id"], pending)
+                    if how == "filled":
+                        verify.pop(ticker, None)
+                    elif how != "ok":
+                        verify.pop(ticker, None)
+                        stop_now = max(float(rec["stop"]), _num((g.trail.get(ticker) or {}).get("stop")) or 0)
+                        software[ticker] = {"fingerprint": rec.get("fingerprint"), "stop": stop_now,
+                                            "why": "stop order %s was %s (%s)" % (_ident(v["id"]), how, raw),
+                                            "since": out["at"]}
+                        g.save()
+                        stop_rejected_alarm(client, ticker, held, stop_now,
+                                            "REJECTED by Trading 212" if how == "rejected" else
+                                            "GONE at Trading 212 (%s)" % raw)
+                g.save()
+        sw = software.get(ticker) if rec is not None else None
+        use_software = rec is not None and mode == "broker" and (
+            (sw and sw.get("fingerprint") == rec.get("fingerprint")) or rec.get("status") == "software_stop"
+            or (frac_mode == "software" and is_fractional(held)))
+        if use_software and covered + 1e-9 < held:
+            if g.unclear.get(ticker):
+                row["status"] = "unclear"
+                g.warn("%s: an earlier guard order came back unclear (%s). Nothing is sent for it; check the app"
+                       % (ticker, g.unclear[ticker]))
+                continue
+            row["software"] = (sw or {}).get("why") or "fractional_stops software"
+            ticket_qty = min(float(_num(rec["qty"])), held - covered)
+            guard_market(g, row, rec, held - covered, ticket_qty, row["price"], trail_settings(cfg), cfg)
+            if row.get("status") == "watching":
+                row["status"] = "software stop"
+                row["note"] = "the guard sells at market at or under %.2f (%s)" % (row["stop"], row["software"])
+            out["software"] = out.get("software", 0) + 1
+            continue
         if rec is None:
             if covered + 1e-9 >= held:
                 row["status"] = "covered"
@@ -1609,8 +1775,17 @@ def guard_pass(client, state_dir):
             row["status"] = "stop failed" if o == "rejected" else "unclear"
             g.warn("%s: the guard's stop (SELL %s at %.2f) %s: %s. Not retried."
                    % (ticker, _qty(want), stop, "was refused" if o == "rejected" else "is UNCLEAR", err))
+            if o == "rejected":           # refused outright: protect it in software from now on
+                software[ticker] = {"fingerprint": rec.get("fingerprint"), "stop": stop,
+                                    "why": "the guard's stop was refused (%s)" % err, "since": out["at"]}
+                g.save()
+                stop_rejected_alarm(client, ticker, want, stop, "REFUSED by Trading 212")
             continue
-        row.update(status="stop placed", placed_qty=want, order_id=err.get("id") if isinstance(err, dict) else None)
+        oid = err.get("id") if isinstance(err, dict) else None
+        row.update(status="stop placed", placed_qty=want, order_id=oid)
+        verify[ticker] = {"id": oid, "fingerprint": rec.get("fingerprint"), "stop": stop, "placed_at": _now()}
+        g.save()
+        out["verify_soon"] = True
         out["placed"] += 1
     for o in pending:
         t = _o_ticker(o)
@@ -1890,7 +2065,7 @@ def cmd_guard(client, args):
             _say("%s  waiting for the open (9:30 New York)" % now_et.strftime("%H:%M"))
             _sleep(wait)
             continue
-        eod = None
+        eod, res = None, None
         try:
             eod = eod_settings(_read_json(os.path.join(args.state_dir, "config.json"), {}) or {})
         except T212Error as e:
@@ -1934,6 +2109,8 @@ def cmd_guard(client, args):
                                     "it gets through." % (fails, scrub(e, client._secrets)))
         passes += 1
         wait = every
+        if res is not None and (res.get("verify_soon") or res.get("software")):
+            wait = min(wait, float(VERIFY_AFTER))   # a new stop is checked again in a minute; software stops every minute
         if eod_at is not None and client.env == "demo" and now_et < eod_at:
             wait = max(1.0, min(every, (eod_at - now_et).total_seconds() + 1))   # wake for the close on time
         _sleep(wait)

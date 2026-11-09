@@ -441,7 +441,7 @@ class Pilot(object):
         odds = ("target first %.1f %%, stop first %.1f %%" % (100 * tm["p_target"], 100 * tm["p_stop"])
                 if tm.get("p_target") is not None and tm.get("p_stop") is not None else "no data")
         stop_how = ("a stop order at Trading 212, good till cancelled" if rec.get("status") == "stop_placed"
-                    else "enforced by the guard (stop_mode market)")
+                    else "enforced by the guard in software: a market sell at the stop")
         lines = ["BOUGHT (demo, automatic): %s %s" % (rec.get("qty") or t["order"].get("qty"), t["symbol"]),
                  "Entry: $%s%s" % (t212._fmt(fill) if fill else t212._fmt(rec.get("entry")),
                                    " (filled)" if fill else " (estimate; not filled yet)"),
@@ -595,7 +595,7 @@ class Pilot(object):
         t["status"] = "placed"
         entry_id = t212._ident((res.get("entry") or {}).get("id"))
         stop_note = ("stop at $%.2f is in, good till cancelled" % stop if res.get("stop")
-                     else "the guard enforces the $%.2f stop (stop_mode market)" % stop)
+                     else "the guard enforces the $%.2f stop in software (market sell at the stop)" % stop)
         return "PLACED on demo: BUY %s %s, order id %s; %s" % (o.get("qty"), t["symbol"], entry_id, stop_note)
 
     # ------------------------------------------------------------ fills, exits, summary
