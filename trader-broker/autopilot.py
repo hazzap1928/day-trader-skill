@@ -57,6 +57,7 @@ FLAGS = {"auto_buy": False,      # true: a ticket that passes every check is pla
          "evidence_mode": False}  # true: the demo forward test (trader-broker/evidence.py); live refuses it
 POSITIONS_EVERY = 60             # seconds between fill and exit checks
 POLL_WAIT = 20                   # seconds a phone poll waits for a tap
+BRIEFING_CATCHUP = (7, 45)       # UK time on the Mac: from then until the open a missed briefing is run again
 REPORT_AFTER = 5                 # minutes after the end-of-day close (15:50 New York) the closing report goes
 EOD_DEFAULT = "15:50"
 STEP_TIMEOUT = 900
@@ -97,6 +98,18 @@ def _now():
 
 def _sleep(s):
     time.sleep(s)
+
+
+def _local(ts):
+    """The Mac's own clock (UK time). Tests replace this."""
+    return datetime.datetime.fromtimestamp(ts)
+
+
+def _spawn(args, log_path):
+    """Start a process in the background, its output appended to a log. Tests replace this."""
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "a") as fh:
+        subprocess.Popen(list(args), cwd=ROOT, stdout=fh, stderr=fh, start_new_session=True)
 
 
 def _run(args, timeout=STEP_TIMEOUT):
@@ -165,23 +178,51 @@ def settings(cfg):
 
 
 KEEP_AWAKE_LABEL = "com.daytraderskill.caffeinate"
+GUARD_LABEL = "com.daytraderskill.t212-guard"
+AUTOPILOT_LABEL = "com.daytraderskill.autopilot"
+
+
+def _launchd(label):
+    """{"loaded", "running", "pid", "out"} for one of this user's launchd jobs."""
+    try:
+        p = subprocess.run(["/bin/launchctl", "print", "gui/%d/%s" % (os.getuid(), label)],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"loaded": False, "running": False, "pid": None, "out": "", "error": str(e)}
+    if p.returncode != 0:
+        return {"loaded": False, "running": False, "pid": None, "out": p.stdout}
+    pid = re.search(r"^\s*pid = (\d+)", p.stdout, re.M)
+    return {"loaded": True, "running": bool(re.search(r"^\s*state = running", p.stdout, re.M)),
+            "pid": pid.group(1) if pid else None, "out": p.stdout}
 
 
 def _keep_awake():
     """(running, detail): is the launchd job that runs `caffeinate -s` up?"""
-    try:
-        p = subprocess.run(["/bin/launchctl", "print", "gui/%d/%s" % (os.getuid(), KEEP_AWAKE_LABEL)],
-                           capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, "could not ask launchd (%s)" % e
-    if p.returncode != 0:
+    j = _launchd(KEEP_AWAKE_LABEL)
+    if j.get("error"):
+        return False, "could not ask launchd (%s)" % j["error"]
+    if not j["loaded"]:
         return False, "the %s launchd job is not loaded" % KEEP_AWAKE_LABEL
-    running = re.search(r"^\s*state = running", p.stdout, re.M)
-    args_ok = "caffeinate" in p.stdout and "-s" in p.stdout
-    if running and args_ok:
-        pid = re.search(r"^\s*pid = (\d+)", p.stdout, re.M)
-        return True, "caffeinate -s is running (pid %s)" % (pid.group(1) if pid else "?")
+    if j["running"] and "caffeinate" in j["out"] and "-s" in j["out"]:
+        return True, "caffeinate -s is running (pid %s)" % (j["pid"] or "?")
     return False, "the %s job is loaded but not running" % KEEP_AWAKE_LABEL
+
+
+def _guard_state(state_dir):
+    """(running, line) about the stop guard: its launchd job and its last check in trader/logs/guard.log."""
+    j = _launchd(GUARD_LABEL)
+    last = None
+    try:
+        with open(os.path.join(state_dir, "logs", "guard.log"), encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}[-+]\d{2}:\d{2}  stop guard", line)
+                if m:
+                    last = "%s %s New York" % m.groups()
+    except OSError:
+        pass
+    if j["running"]:
+        return True, "running (pid %s)%s" % (j["pid"] or "?", "; last check %s" % last if last else "; no check yet today")
+    return False, "!!! NOT RUNNING (%s): stops are not being checked !!!" % ("not loaded" if not j["loaded"] else "loaded, stopped")
 
 
 def _on_mains():
@@ -757,7 +798,17 @@ class Pilot(object):
             "buys automatically" if self.s["auto_buy"] else "asks for Approve",
             ", EVIDENCE MODE forward test" if self.s["evidence_mode"] else "", st["day"], len(st["tickets"]),
             placed, len(self.pending()), ", PAUSED" if st.get("paused") else "",
-            len(t212.allowed_tickers(self.cfg) or [])))
+            len(t212.allowed_tickers(self.cfg) or [])) + self.status_extra())
+
+    def status_extra(self):
+        alerts = mod("trader-alerts", "alerts")
+        m = alerts.market_status(_utc())
+        lines = ["", "Market: %s%s" % ("OPEN" if m.get("open") else "closed (%s)" % (m.get("reason") or "closed"),
+                                       "" if m.get("open") else "; next open %s New York" % m.get("next_open", "?")),
+                 "Guard: %s" % _guard_state(self.sd)[1], "Keep-awake: %s" % _keep_awake()[1]]
+        if self.s["evidence_mode"]:
+            lines.append("EVIDENCE MODE is ON: %s" % self.evidence_day())
+        return "\n".join(lines)
 
     def record_day(self):
         """Start and close value of the account for today, for the morning briefing's result."""
@@ -843,6 +894,131 @@ class Pilot(object):
                            phone=self.phone)
         return nc
 
+    # ------------------------------------------------------------ always on: the phone at any hour
+
+    def flush_phone(self):
+        """Send what waited in the phone outbox, when there is any and the phone answers."""
+        try:
+            if (t212._read_json(phone_mod.outbox_path(self.sd), {}) or {}).get("items"):
+                phone_mod.flush_outbox(self.phone, self.sd)
+        except Exception as e:
+            self.say("outbox not sent yet: %s" % e)
+
+    def roll_day(self):
+        if self.state.get("day") != _ny().date().isoformat():
+            self.state = self._load_state()
+            self.save()
+            self.cfg = self.read_cfg()
+            self.s = settings(self.cfg)
+
+    def catch_up_briefing(self):
+        """On a trading day, from 07:45 UK until the open: if the morning briefing has not started (the Mac was
+        asleep at 07:30, say) or started over 40 minutes ago and never got through, run it. Once a day."""
+        alerts = mod("trader-alerts", "alerts")
+        ny = _ny()
+        today = ny.date().isoformat()
+        if not alerts.trading_day(ny.date())[0] or self.state.get("briefing_catchup") == today:
+            return
+        local = _local(_now())
+        if (local.hour, local.minute) < BRIEFING_CATCHUP or (ny.hour, ny.minute) >= (9, 30):
+            return
+        mark = t212._read_json(self.p("state", "briefing.json"), {}) or {}
+        if mark.get("sent") == today:
+            return
+        if mark.get("started") == today and _now() - float(mark.get("started_at") or 0) < 40 * 60:
+            return
+        self.state["briefing_catchup"] = today
+        self.save()
+        _spawn([sys.executable, os.path.join(HERE, "briefing.py"), "--state-dir", self.sd],
+               os.path.join(self.sd, "logs", "briefing.log"))
+        self.say("the morning briefing had not reached the phone: started it again")
+
+    def open_message(self, first=None, last=None):
+        """The confirmation at the open: guard and autopilot running, positions and their stops, evidence mode."""
+        ny = _ny()
+        g_ok, g_line = _guard_state(self.sd)
+        aj = _launchd(AUTOPILOT_LABEL)
+        lines = ["MARKET OPEN (demo) %s New York" % ny.strftime("%a %d %b %H:%M"),
+                 "Guard: %s" % g_line,
+                 "Autopilot: %s, %s%s" % (
+                     ("running, always on (pid %s)" % aj["pid"]) if aj["running"] else
+                     "!!! the always-on service is NOT RUNNING (this message is from pid %d) !!!" % os.getpid(),
+                     "buys automatically" if self.s["auto_buy"] else "asks for Approve",
+                     ", PAUSED (send /resume)" if self.state.get("paused") else "")]
+        if self.s["evidence_mode"]:
+            lines.append("EVIDENCE MODE is ON: %s" % self.evidence_day())
+        lines += self.positions_lines()
+        if first and last:
+            lines.append("Checks every %d min from %s to %s New York. /pause stops new buys." % (
+                self.s["every_minutes"], first.strftime("%H:%M"), last.strftime("%H:%M")))
+        return "\n".join(lines)
+
+    def evidence_day(self):
+        alerts = mod("trader-alerts", "alerts")
+        try:
+            start, end = evidence.window(self.cfg)
+        except evidence.EvidenceError as e:
+            return "but %s" % e
+        d0, d1, today = (datetime.date.fromisoformat(x) for x in (start, end, _ny().date().isoformat()))
+        days, n, d = [], 0, d0
+        while d <= d1:
+            if alerts.trading_day(d)[0]:
+                days.append(d)
+            d += datetime.timedelta(days=1)
+        n = sum(1 for x in days if x <= today)
+        return "forward test %s to %s, trading day %d of %d" % (start, end, n, len(days))
+
+    def positions_lines(self):
+        try:
+            pos = [p for p in self.client.get(t212.POSITIONS) or [] if (t212._num(p.get("quantity")) or 0) > 0]
+            pending = self.client.get(t212.ORDERS) or []
+        except t212.T212Error as e:
+            return ["Positions: no data (%s)" % t212.scrub(e, self.client._secrets)]
+        if not pos:
+            return ["Open positions: none."]
+        soft = (t212._read_json(self.p("state", "t212-guard.json"), {}) or {}).get("software") or {}
+        out = ["Open positions:"]
+        for p in pos:
+            ticker = t212._o_ticker(p)
+            qty = t212._num(p.get("quantity")) or 0
+            stops, _ = t212.guard_sell_orders(pending, ticker)
+            covered = sum(abs(t212._num(o.get("quantity")) or 0) for o in stops)
+            if stops and covered + 1e-9 >= qty:
+                how = "stop $%s (stop order, %s)" % (t212._fmt(stops[0].get("stopPrice")), stops[0].get("status", "?"))
+            elif soft.get(ticker):
+                how = "software stop $%s (the guard sells at it)" % t212._fmt(soft[ticker].get("stop"))
+            elif stops:
+                how = "!!! stop covers only %s of %s !!!" % (t212._qty(covered), t212._qty(qty))
+            else:
+                how = "!!! NO STOP !!!"
+            out.append("  %s %s at $%s: %s" % (ticker, t212._qty(qty), t212._fmt(p.get("currentPrice")), how))
+        return out
+
+    def serve(self, max_loops=None):
+        """Always on (launchd keeps it alive): answer /status, /pause and /resume at any hour, deliver the outbox,
+        catch up a missed briefing, and run each trading day."""
+        alerts = mod("trader-alerts", "alerts")
+        self.say("always on: the phone gets an answer at any hour")
+        n = 0
+        while max_loops is None or n < max_loops:
+            n += 1
+            try:
+                self.roll_day()
+                self.flush_phone()
+                self.catch_up_briefing()
+                st = alerts.market_status(_utc())
+                if st.get("opens") and not self.state.get("summary_sent"):
+                    self.day()
+                    continue
+                if getattr(self, "net_down", False):
+                    self.net_down = False
+                    _sleep(60)
+                    continue
+                self.listen(POLL_WAIT)
+            except Exception as e:
+                self.say("serve: %s; carrying on" % t212.scrub(e, self.client._secrets))
+                _sleep(30)
+
     # ------------------------------------------------------------ the day
 
     def day(self):
@@ -868,8 +1044,15 @@ class Pilot(object):
                 self.send_summary()
             return "after the close"
         if ny < open_at:
-            self.say("waiting for the open (%s New York)" % st["opens"])
-            _sleep((open_at - ny).total_seconds() + 5)
+            self.say("waiting for the open (%s New York); answering the phone meanwhile" % st["opens"])
+            while _ny() < open_at:
+                self.flush_phone()
+                self.catch_up_briefing()
+                if getattr(self, "net_down", False):
+                    self.net_down = False
+                    _sleep(min(60.0, max(1.0, (open_at - _ny()).total_seconds())))
+                    continue
+                self.listen(int(max(1, min(POLL_WAIT, (open_at - _ny()).total_seconds() + 5))))
         self.cfg = self.read_cfg()
         if self.state.get("start_value") is None:
             try:
@@ -877,13 +1060,10 @@ class Pilot(object):
             except t212.T212Error:
                 pass
             self.save()
-        phone_mod.push(self.sd, "Autopilot started (demo). It %s, checking every %d min from %s to %s New York, "
-                                "from your %d allowed tickers. Reply /pause to stop new %s."
-                       % (("EVIDENCE MODE (forward test): BUYS AUTOMATICALLY what passes; the cost block is off"
-                           if self.s["evidence_mode"] else "BUYS AUTOMATICALLY what passes every check") if self.s["auto_buy"]
-                          else "sends tickets for your Approve", self.s["every_minutes"], first.strftime("%H:%M"),
-                          last.strftime("%H:%M"), len(t212.allowed_tickers(self.cfg) or []),
-                          "buys" if self.s["auto_buy"] else "tickets"), phone=self.phone)
+        if self.state.get("open_sent") != self.state["day"]:
+            phone_mod.push(self.sd, self.open_message(first, last), phone=self.phone)
+            self.state["open_sent"] = self.state["day"]
+            self.save()
         step = datetime.timedelta(minutes=self.s["every_minutes"])
         next_cycle = first
         last_pos = 0
@@ -935,7 +1115,11 @@ def main(argv=None, environ=None):
     sub.add_parser("cycle", help="one cycle now, then wait for your tap until the ticket expires")
     sub.add_parser("report", help="send today's closing report to your phone now")
     sub.add_parser("summary", help="the same as report")
-    sub.add_parser("status", help="what it has done today")
+    s = sub.add_parser("status", help="what it has done today")
+    s.add_argument("--send", action="store_true", help="also send it to the phone")
+    o = sub.add_parser("open-check", help="the market-open confirmation, now")
+    o.add_argument("--send", action="store_true", help="send it to the phone")
+    sub.add_parser("serve", help="always on: answer the phone at any hour and run each trading day (launchd)")
     a = ap.parse_args(argv)
     environ = os.environ if environ is None else environ
     client = None
@@ -944,11 +1128,24 @@ def main(argv=None, environ=None):
         phone = phone_mod.open_phone(a.state_dir, environ)
         cfg = tk.read_config(os.path.join(a.state_dir, "config.json"))
         problems = check_ready(cfg, client.env, phone)
+        if problems and a.cmd == "serve" and phone is not None:
+            return serve_unready(a.state_dir, client, phone, problems, environ)
         if problems:
             raise PilotError("not starting:\n  - " + "\n  - ".join(problems))
         pilot = Pilot(client, phone, a.state_dir)
+        if a.cmd == "serve":
+            pilot.serve()
+            return 0
+        if a.cmd == "open-check":
+            text = "TEST, not the real open:\n" + pilot.open_message()
+            print(text)
+            if a.send:
+                pilot.phone.send(text)
+            return 0
         if a.cmd == "status":
             print(pilot.status_text())
+            if a.send:
+                pilot.phone.send(pilot.status_text())
             print("keep-awake: %s; %s" % (_keep_awake()[1], _on_mains()[1]))
             if not _on_mains()[0]:
                 print("WARNING: %s" % _on_mains()[1])
@@ -971,6 +1168,30 @@ def main(argv=None, environ=None):
         sys.stderr.write("autopilot: %s\n" % msg)
         phone_mod.push(a.state_dir, "AUTOPILOT STOPPED (demo): %s" % msg, environ=environ)
         return 2
+
+
+def serve_unready(state_dir, client, phone, problems, environ, max_loops=None):
+    """Not ready to trade, but still on: answer every command with the reason, re-check every 5 minutes,
+    and say so on the phone once a day (not on every launchd restart)."""
+    why = "Autopilot NOT RUNNING (demo):\n  - " + "\n  - ".join(problems)
+    sys.stderr.write("autopilot: %s\n" % why)
+    mark = os.path.join(state_dir, "state", "autopilot-unready.json")
+    today = _ny().date().isoformat()
+    if (t212._read_json(mark, {}) or {}).get("day") != today:
+        phone_mod.push(state_dir, why, phone=phone)
+        t212._write_json(mark, {"day": today})
+    started, n = _now(), 0
+    while (max_loops is None or n < max_loops) and _now() - started < 300:
+        n += 1
+        try:
+            for u in phone.updates(wait=POLL_WAIT):
+                if u["kind"] == "text":
+                    phone.send(why + "\nFix it, and it starts within 5 minutes.")
+                elif u["kind"] == "tap":
+                    phone.answer(u["id"], "The autopilot is not running: nothing done.")
+        except phone_mod.PhoneError:
+            _sleep(60)
+    return 3                                     # launchd starts it again: the checks run afresh
 
 
 if __name__ == "__main__":

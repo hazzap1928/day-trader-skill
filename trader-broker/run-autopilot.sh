@@ -1,6 +1,6 @@
 #!/bin/zsh
-# Start the autopilot for the day (DEMO ONLY): tickets every 15 minutes to your phone,
-# placed only when you tap Approve. launchd runs this on weekdays; see trader-broker/PHONE.md.
+# The autopilot, always on (DEMO ONLY): it answers /status, /pause and /resume at any hour and runs
+# each trading day. launchd starts it at login and restarts it if it stops; see trader-broker/PHONE.md.
 # Like run-guard.sh it reads only these export lines from T212_ENV_FILE (default ~/.zshrc):
 # T212_API_KEY, T212_API_SECRET, T212_ENV and TELEGRAM_BOT_TOKEN. Nothing else in that file is run.
 # With T212_ENV=live it refuses to start: there is no live path in the autopilot.
@@ -20,4 +20,5 @@ fi
 unset T212_ENV
 mkdir -p trader/logs
 echo "---- $(date -u +%Y-%m-%dT%H:%M:%SZ) autopilot start (demo)"
-exec /usr/bin/python3 trader-broker/autopilot.py run "$@"
+if [[ $# -eq 0 ]]; then set -- serve; fi        # always on: launchd keeps it running (KeepAlive)
+exec /usr/bin/python3 trader-broker/autopilot.py "$@"

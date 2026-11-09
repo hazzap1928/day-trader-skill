@@ -364,6 +364,14 @@ max loss in GBP and the Time Machine's odds. A passing ticket that is not placed
 gets a NOT PLACED message saying why. Live refuses automatic buying: it needs
 its own setting, built and checked separately, and it does not exist yet.
 
+The autopilot runs always on (`autopilot.py serve`, launchd KeepAlive):
+- **Any hour:** it answers `/status`, `/pause` and `/resume`, before the open and at weekends too, and
+  sends the phone outbox.
+- **Briefing catch-up:** it reruns a morning briefing that has not reached the phone, using the
+  `trader/state/briefing.json` marker.
+- **The open:** it sends a MARKET OPEN message with the guard's and autopilot's launchd state, evidence
+  mode, and each position with its stop.
+
 It also sends fills and exits (positions are checked each minute). About 5 minutes
 after the 15:50 end-of-day close it sends the closing report (`report.py`, read-only),
 built from Trading 212's own fills:

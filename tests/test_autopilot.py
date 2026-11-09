@@ -106,8 +106,13 @@ class PilotBase(Base):
         self.cfg = dict(self.cfg, allowed_tickers=["TSLA", "AAPL"], paper=True)
         self.write("config.json", self.cfg)
         self.write("fx.json", {"usd_per_gbp": 1.25, "fetched_at": iso(NOW)})
-        self._ap = (ap._now, ap._sleep, ap._run, ap._keep_awake)
+        self._ap = (ap._now, ap._sleep, ap._run, ap._keep_awake, ap._launchd, ap._spawn)
         ap._keep_awake = lambda: (True, "caffeinate -s is running (test)")
+        self.jobs = {"com.daytraderskill.t212-guard": {"loaded": True, "running": True, "pid": "4242", "out": ""},
+                     "com.daytraderskill.autopilot": {"loaded": True, "running": True, "pid": "4343", "out": ""}}
+        ap._launchd = lambda label: self.jobs.get(label, {"loaded": False, "running": False, "pid": None, "out": ""})
+        self.spawned = []
+        ap._spawn = lambda args, log: self.spawned.append(list(args))
         ap._now = lambda: self.clock[0]
         ap._sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)
         self.pipe = Pipeline(self)
@@ -118,7 +123,7 @@ class PilotBase(Base):
         self.out = []
 
     def tearDown(self):
-        ap._now, ap._sleep, ap._run, ap._keep_awake = self._ap
+        ap._now, ap._sleep, ap._run, ap._keep_awake, ap._launchd, ap._spawn = self._ap
         super().tearDown()
 
     def pilot(self):
@@ -445,12 +450,13 @@ class Day(PilotBase):
         self.router.add("GET", "/equity/positions", FakeResp([]))
         self.router.add("GET", "/equity/account/summary", FakeResp(test_t212_place.SUMMARY))
         self.router.add("GET", "/equity/history/orders", FakeResp({"items": [], "nextPagePath": None}))
+        self.router.add("GET", "/equity/orders", FakeResp([]))
         p = self.pilot()
         with redirect_stdout(io.StringIO()):
             self.assertEqual(p.day(), "done")
         scans = [c for c in self.pipe.calls if c[0].endswith("scan.py")]
         self.assertEqual(len(scans), 24)              # 9:45, 10:00 ... 15:30
-        self.assertIn("Autopilot started (demo)", self.phone.sent[0][0])
+        self.assertIn("MARKET OPEN (demo) Thu 05 Nov 09:30 New York", self.phone.sent[0][0])
         self.assertIn("CLOSING REPORT (demo) Thu 05 Nov", self.phone.sent[-1][0])
         self.assertLessEqual(self.clock[0], NOW + (5 * 60 + 26) * 60)   # by about 15:56 New York
         self.assertEqual(self.router.posts(), [])

@@ -160,13 +160,14 @@ def log_trade(sd, rec):
 
 # ---------------------------------------------------------------- virtual results
 
-def fetch_bars(symbol, rng="5d", interval="5m"):
-    """[(utc timestamp, open, high, low, close)] from Yahoo (unofficial, can lag). Raises on failure."""
+def fetch_bars(symbol, rng="5d", interval="5m", volume=False):
+    """[(utc timestamp, open, high, low, close[, volume])] from Yahoo (unofficial, can lag). Raises on failure."""
     req = urllib.request.Request(CHART % (symbol, rng, interval), headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=30) as r:
         res = json.loads(r.read().decode("utf-8"))["chart"]["result"][0]
     q = res["indicators"]["quote"][0]
-    return [(t, o, h, l, c) for t, o, h, l, c in zip(res["timestamp"], q["open"], q["high"], q["low"], q["close"])
+    rows = zip(res["timestamp"], q["open"], q["high"], q["low"], q["close"], q.get("volume") or [0] * len(res["timestamp"]))
+    return [((t, o, h, l, c, v or 0) if volume else (t, o, h, l, c)) for t, o, h, l, c, v in rows
             if None not in (o, h, l, c)]
 
 
@@ -242,7 +243,13 @@ def kronos_verdict(sig, run=None, timeout=KRONOS_TIMEOUT):
     any failure is a verdict of "unavailable" or "error", and nothing ever waits on it to place a trade."""
     if run is None and not kronos_available():
         return {"verdict": "unavailable", "why": "trader-kronos is not set up (see trader-kronos/README.md)"}
-    payload = json.dumps({k: sig.get(k) for k in ("symbol", "at", "entry", "stop", "target")})
+    payload = {k: sig.get(k) for k in ("symbol", "at", "entry", "stop", "target")}
+    if run is None:
+        try:          # fetched here, by the system Python: Kronos's own environment never touches the network
+            payload["bars"] = fetch_bars(sig["symbol"], "5d", "5m", volume=True)
+        except Exception as e:
+            return {"verdict": "error", "why": "no bars for Kronos: %s" % str(e)[:120]}
+    payload = json.dumps(payload)
     try:
         if run is not None:
             out = run(payload)

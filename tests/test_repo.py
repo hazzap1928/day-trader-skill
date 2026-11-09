@@ -26,7 +26,8 @@ def frontmatter(path):
 
 def every_text_file():
     for base, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+        # git-ignored downloads (trader-kronos's environment, Kronos's code and model files) are not ours
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".venv", "vendor", "models")]
         for f in files:
             if f.endswith((".md", ".py", ".json", ".csv", ".txt", ".xml")) or f == "LICENSE":
                 yield os.path.join(base, f)

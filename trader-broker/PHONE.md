@@ -62,7 +62,7 @@ Why Telegram:
 
 | Message | When |
 |---|---|
-| Autopilot started | each trading day at the open |
+| MARKET OPEN | each trading day at the open: guard and autopilot running, evidence mode, positions and their stops |
 | DEMO TICKET + Approve / Reject | a ticket passed every check (only when `auto_buy` is off) |
 | BOUGHT (demo, automatic) | with `"autopilot": {"auto_buy": true}`: what was bought, the cost and max loss in GBP, the stop, the target and the Time Machine's odds |
 | PLACED / NOT PLACED | after your Approve, or when an automatic buy failed a placing-time check (and why) |
@@ -72,6 +72,17 @@ Why Telegram:
 | MORNING BRIEFING | 07:30 UK on weekdays (`briefing.py`) |
 | EVIDENCE MODE REPORT | Fridays after the close, and the last day, during the forward test: real and virtual results after costs, slippage, the tracker, Kronos and the pass status |
 | CLOSING REPORT | about 15:55 New York: each trade with entry, exit, reason and P&L after fees; day and week totals; win rate; account; anything open; results against the Time Machine |
+
+The autopilot is **always on**: launchd starts `com.daytraderskill.autopilot` at login and restarts it if
+it stops. Whenever the Mac is on it answers commands, weekends and before the open included. It also:
+- **Sends the outbox:** delivers anything that could not be sent earlier.
+- **Catches up the briefing:** on a trading day it reruns a morning briefing that never started or never
+  got through, from 07:45 UK until the open.
+- **Confirms the open:** at each open it sends a MARKET OPEN message with the guard's state and last check,
+  the autopilot's state, evidence mode, and every open position with its stop. It shouts if a position
+  has no stop.
+
+The briefing itself tries to send every 2 minutes for 30 minutes, then waits in the outbox.
 
 From the chat, send `/pause` to stop new tickets and automatic buys (the guard keeps
 protecting positions), `/resume` to start them again, and `/status` to see

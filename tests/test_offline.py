@@ -251,8 +251,8 @@ class KeepAwakeCheck(unittest.TestCase):
 class Briefing(BriefBase):
     def run_main(self):
         sent = []
-        saved = br.phone_mod.push
-        br.phone_mod.push = lambda sd, text, **kw: sent.append(text) or True
+        saved = br.send_with_retry
+        br.send_with_retry = lambda sd, text, environ=None: sent.append(text) or True
         self._sleep = br._sleep
         br._sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)
         out, err = io.StringIO(), io.StringIO()
@@ -260,7 +260,7 @@ class Briefing(BriefBase):
             with redirect_stdout(out), redirect_stderr(err):
                 code = br.main(["--state-dir", self.dir], environ=CREDS)
         finally:
-            br.phone_mod.push = saved
+            br.send_with_retry = saved
             br._sleep = self._sleep
         return code, sent
 
@@ -270,9 +270,10 @@ class Briefing(BriefBase):
         self.trading212()
         code, sent = self.run_main()
         self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)                  # one message: the late note, then the briefing
         self.assertTrue(sent[0].startswith("BACK ONLINE: The morning briefing had no internet from"))
         self.assertIn("the briefing ran 6 minutes late", sent[0])
-        self.assertTrue(sent[1].startswith("MORNING BRIEFING"))
+        self.assertIn("\n\nMORNING BRIEFING", sent[0])
 
     def test_no_internet_for_thirty_minutes_gives_up_and_leaves_a_note(self):
         self.net._connect = BackAt(self, 10 ** 12)

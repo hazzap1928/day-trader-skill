@@ -497,6 +497,9 @@ def main(argv=None, environ=None):
     if not ok and not a.force:
         print("briefing: %s in New York, no briefing today" % why)
         return 0
+    mark_path = os.path.join(a.state_dir, "state", "briefing.json")
+    t212._write_json(mark_path, dict(t212._read_json(mark_path, {}) or {}, started=today_ny.isoformat(),
+                                     started_at=_now()))
     late = None
     if not net.online():
         w = net.wait_online(_sleep, _now, log=lambda t: print("briefing: " + t), label="the briefing")
@@ -522,14 +525,36 @@ def main(argv=None, environ=None):
     if late is not None:
         missed = ["the briefing ran %d minutes late, at %s" % (net.minutes(late["start"], late["end"]), net.hm(late["end"]))]
         net.record(a.state_dir, "briefing", late["start"], late["end"], missed)
-        if not a.no_send:
-            phone_mod.push(a.state_dir, net.back_online("The morning briefing", late["start"], late["end"], missed),
-                           environ=environ)
+        msg = net.back_online("The morning briefing", late["start"], late["end"], missed) + "\n\n" + msg
     if not a.no_send:
-        if not phone_mod.push(a.state_dir, msg, environ=environ):
-            sys.stderr.write("briefing: not sent to the phone (no paired phone, or Telegram failed); saved %s\n" % path)
+        if not send_with_retry(a.state_dir, msg, environ):
+            sys.stderr.write("briefing: not sent to the phone after %d tries; it waits in the outbox; saved %s\n"
+                             % (SEND_TRIES, path))
             return 1
+        t212._write_json(mark_path, dict(t212._read_json(mark_path, {}) or {}, sent=today_ny.isoformat(), sent_at=_now()))
     return 0
+
+
+SEND_TRIES = 16          # the first try, then every 2 minutes for 30 minutes
+
+
+def send_with_retry(state_dir, text, environ=None, phone=None):
+    """Send the briefing itself, trying again every 2 minutes for 30 minutes. If it still fails it goes to the
+    outbox once, and the always-on autopilot delivers it as soon as Telegram answers."""
+    p = phone or phone_mod.open_phone(state_dir, environ)
+    if p is None:
+        return False
+    for i in range(SEND_TRIES):
+        try:
+            phone_mod.flush_outbox(p, state_dir)
+            p.send(text)
+            return True
+        except Exception as e:
+            sys.stderr.write("briefing: send %d of %d failed: %s\n" % (i + 1, SEND_TRIES, p.scrub(e)))
+            if i + 1 < SEND_TRIES:
+                _sleep(net.RETRY_EVERY)
+    phone_mod.queue(state_dir, text)
+    return False
 
 
 class _NoAccount(object):

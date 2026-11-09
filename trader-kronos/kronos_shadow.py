@@ -136,7 +136,8 @@ def main():
         res = self_test(predictor, name)
     else:
         sig = json.loads(sys.stdin.read())
-        res = verdict(fetch(sig["symbol"]), float(sig["at"]), float(sig["entry"]), float(sig["stop"]),
+        bars = [tuple(b) for b in sig["bars"]] if sig.get("bars") else fetch(sig["symbol"])   # evidence.py sends them
+        res = verdict(bars, float(sig["at"]), float(sig["entry"]), float(sig["stop"]),
                       float(sig["target"]), predictor, name)
     res["seconds"] = round(time.time() - t0, 1)
     print(json.dumps(res))

@@ -206,14 +206,14 @@ class Message(BriefBase):
         if clock:
             self.clock[0] = clock
         sent = []
-        saved = br.phone_mod.push
-        br.phone_mod.push = lambda sd, text, **kw: sent.append(text) or True
+        saved = br.send_with_retry
+        br.send_with_retry = lambda sd, text, environ=None: sent.append(text) or True
         out, err = io.StringIO(), io.StringIO()
         try:
             with redirect_stdout(out), redirect_stderr(err):
                 code = br.main(["--state-dir", self.dir] + list(extra), environ=CREDS)
         finally:
-            br.phone_mod.push = saved
+            br.send_with_retry = saved
         return code, sent, out.getvalue()
 
     def test_short_message_has_three_points_and_the_full_one_is_saved(self):
