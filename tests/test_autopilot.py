@@ -17,6 +17,7 @@ ap = load("trader-broker", "autopilot")
 ap.t212 = t212                        # one module instance, so the fakes in Base reach the autopilot
 ap.tk = t212.ticket_module()
 ap.phone_mod = t212.phone_module()
+ap.net = t212.net_module()
 
 GOOD_MC = {"p_target": 0.6, "p_stop": 0.4, "r_at_target": 1.0}
 BAD_MC = {"p_target": 0.3, "p_stop": 0.7, "r_at_target": 1.0}
@@ -102,7 +103,8 @@ class PilotBase(Base):
         self.cfg = dict(self.cfg, allowed_tickers=["TSLA", "AAPL"], paper=True)
         self.write("config.json", self.cfg)
         self.write("fx.json", {"usd_per_gbp": 1.25, "fetched_at": iso(NOW)})
-        self._ap = (ap._now, ap._sleep, ap._run)
+        self._ap = (ap._now, ap._sleep, ap._run, ap._keep_awake)
+        ap._keep_awake = lambda: (True, "caffeinate -s is running (test)")
         ap._now = lambda: self.clock[0]
         ap._sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)
         self.pipe = Pipeline(self)
@@ -113,7 +115,7 @@ class PilotBase(Base):
         self.out = []
 
     def tearDown(self):
-        ap._now, ap._sleep, ap._run = self._ap
+        ap._now, ap._sleep, ap._run, ap._keep_awake = self._ap
         super().tearDown()
 
     def pilot(self):

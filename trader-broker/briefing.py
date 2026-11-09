@@ -58,6 +58,7 @@ def _load(folder, name):
 t212 = _load("trader-broker", "t212")
 tk = t212.ticket_module()
 phone_mod = t212.phone_module()
+net = t212.net_module()
 alerts = _load("trader-alerts", "alerts")
 
 
@@ -65,6 +66,10 @@ alerts = _load("trader-alerts", "alerts")
 
 def _now():
     return time.time()
+
+
+def _sleep(s):
+    time.sleep(s)
 
 
 def _fetch(url, browser=False, timeout=20):
@@ -492,6 +497,17 @@ def main(argv=None, environ=None):
     if not ok and not a.force:
         print("briefing: %s in New York, no briefing today" % why)
         return 0
+    late = None
+    if not net.online():
+        w = net.wait_online(_sleep, _now, log=lambda t: print("briefing: " + t), label="the briefing")
+        if not w["ok"]:
+            net.record(a.state_dir, "briefing", w["start"], w["end"], ["the morning briefing"], gave_up=True)
+            phone_mod.queue(a.state_dir, "MORNING BRIEFING MISSED: no internet from %s for %d minutes, so it was "
+                                         "not built. Run python3 trader-broker/briefing.py when you can."
+                            % (net.hm(w["start"]), net.minutes(w["start"], w["end"])))
+            sys.stderr.write("briefing: no internet for %d minutes; gave up\n" % net.minutes(w["start"], w["end"]))
+            return 1
+        late = w
     client = None
     try:
         env = t212.pick_env(False, environ)        # demo; T212_ENV=live without --live is refused
@@ -503,6 +519,12 @@ def main(argv=None, environ=None):
     path = save(b, a.state_dir)
     msg = short_text(b, path)
     print(msg)
+    if late is not None:
+        missed = ["the briefing ran %d minutes late, at %s" % (net.minutes(late["start"], late["end"]), net.hm(late["end"]))]
+        net.record(a.state_dir, "briefing", late["start"], late["end"], missed)
+        if not a.no_send:
+            phone_mod.push(a.state_dir, net.back_online("The morning briefing", late["start"], late["end"], missed),
+                           environ=environ)
     if not a.no_send:
         if not phone_mod.push(a.state_dir, msg, environ=environ):
             sys.stderr.write("briefing: not sent to the phone (no paired phone, or Telegram failed); saved %s\n" % path)

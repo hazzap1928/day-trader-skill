@@ -19,6 +19,7 @@ br = load("trader-broker", "briefing")
 br.t212 = t212                                  # the same module the fakes patch
 br.tk = t212.ticket_module()
 br.phone_mod = t212.phone_module()
+br.net = t212.net_module()
 
 LONDON = zoneinfo.ZoneInfo("Europe/London")
 MORNING = float(calendar.timegm((2026, 11, 5, 7, 30, 0)))       # Thu 07:30 UK

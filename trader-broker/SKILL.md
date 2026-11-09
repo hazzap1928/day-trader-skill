@@ -262,6 +262,23 @@ pending list does not count as cover.
 `"fractional_stops": "software"` (default `"broker"`) gives every fractional
 position a software stop from the start, with no stop order sent.
 
+**No internet (`netwait.py`).** When the briefing, the guard or the autopilot cannot
+reach the internet (a TCP check of Telegram, Trading 212 and Yahoo), it checks every
+2 minutes for up to 30 minutes. Each outage is logged to `trader/logs/outages.jsonl`.
+Once back, the phone gets a BACK ONLINE message saying what was missed:
+- **Briefing:** it runs late. After 30 minutes it gives up and leaves a note.
+- **Guard:** it reports the guard checks it missed, and an end-of-day close that
+  then runs late. After 30 minutes it raises a loud alarm and keeps trying, because
+  it never stops while it should be watching.
+- **Autopilot:** it reports the scan cycles it missed. After 30 minutes it pauses
+  buying for the rest of the day (`/resume` starts it again).
+
+A phone message that cannot be sent waits in `trader/state/phone-outbox.json` and
+goes out with the next one that gets through. The `com.daytraderskill.caffeinate`
+launchd job runs `caffeinate -s` (no sleep on mains power).
+`autopilot.py status` refuses to start the autopilot without it, and warns when the
+Mac is on battery.
+
 **End-of-day close (demo, exits only, off unless set).** With
 `"eod_close": {"enabled": true, "at": "15:50"}`, the watching guard wakes at that
 New York time once a day. For each open position it cancels the pending sells

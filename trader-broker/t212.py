@@ -118,10 +118,11 @@ USER_AGENT = "day-trader-skill-t212/1"
 class T212Error(Exception):
     """A failure to report to the user. Exit code 2 means refused before any request."""
 
-    def __init__(self, msg, code=1, status=None):
+    def __init__(self, msg, code=1, status=None, network=False):
         Exception.__init__(self, msg)
         self.code = code
         self.status = status      # the HTTP status when Trading 212 answered with an error
+        self.network = network    # True when Trading 212 could not be reached at all
 
 
 class PlaceError(T212Error):
@@ -343,9 +344,9 @@ class Client(object):
                     continue
                 raise T212Error(self._http_message(path, e), status=e.code)
             except urllib.error.URLError as e:
-                raise T212Error(self._clean("could not reach %s: %s" % (self.base, e.reason)))
+                raise T212Error(self._clean("could not reach %s: %s" % (self.base, e.reason)), network=True)
             except OSError as e:
-                raise T212Error(self._clean("could not reach %s: %s" % (self.base, e)))
+                raise T212Error(self._clean("could not reach %s: %s" % (self.base, e)), network=True)
             try:
                 headers = dict(resp.headers.items()) if resp.headers is not None else {}
                 status = getattr(resp, "status", None) or resp.getcode()
@@ -1951,6 +1952,18 @@ def _notify(title, text):
 
 
 _PHONE = []
+_NET = []
+
+
+def net_module():
+    """trader-broker/netwait.py: is the internet there, and waiting for it to come back."""
+    if not _NET:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "netwait.py")
+        spec = importlib.util.spec_from_file_location("trader_broker_netwait", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _NET.append(mod)
+    return _NET[0]
 
 
 def phone_module():
@@ -2021,6 +2034,36 @@ def _auth_failed(client, e):
                         "position. Check the key in the Trading 212 app, update ~/.zshrc, then restart the guard. "
                         "Set any missing stop in the app now." % msg)
     return T212Error("guard stopped: %s" % msg, 4, e.status)
+
+
+def guard_offline(client, state_dir, every, end_ts, eod_at, began_et):
+    """No internet: check every 2 minutes. After 30 minutes say so loudly (the Mac's notification works
+    offline; the phone gets it later) and keep trying: the guard never gives up while it should be
+    watching. Once back, tell the phone what was missed."""
+    net = net_module()
+    say = lambda t: _say("%s  %s" % (ticket_module().to_eastern(_utc_now()).strftime("%H:%M"), t))
+    w = net.wait_online(_sleep, _now, deadline=end_ts, log=say, label="the guard")
+    start = w["start"]
+    if not w["ok"] and w["gave_up"]:
+        guard_alarm(client, "GUARD OFFLINE for %d minutes: positions are NOT being watched and software stops are "
+                            "NOT enforced. It keeps trying every %d minutes. Check the Mac's internet."
+                    % (net.minutes(start, _now()), net.RETRY_EVERY // 60))
+        w = net.wait_online(_sleep, _now, limit=max(0.0, end_ts - _now()), deadline=end_ts, log=say,
+                            label="the guard")
+    end = _now()
+    checks = int((end - start) // every)
+    missed = ["%d guard check%s" % (checks, "" if checks == 1 else "s")] if checks else []
+    if eod_at is not None:
+        eod_ts = start + (eod_at - began_et).total_seconds()
+        if start <= eod_ts <= end:
+            missed.append("the %s end-of-day close, which runs now that it is back" % eod_at.strftime("%H:%M"))
+    net.record(state_dir, "guard", start, end, missed, gave_up=not w["ok"])
+    if w["ok"]:
+        _phone_push(client, net.back_online("The guard (%s)" % client.env, start, end, missed,
+                                            ["It is checking your positions again now."]))
+    else:
+        say("still offline at the end of the guard's day; giving up for today")
+    return w
 
 
 def cmd_guard(client, args):
@@ -2101,6 +2144,11 @@ def cmd_guard(client, args):
             if e.code == 2:
                 guard_alarm(client, "the guard has STOPPED: %s" % scrub(e, client._secrets))
                 raise
+            if getattr(e, "network", False) and not net_module().online():
+                end_ts = _now() + (end_et - now_et).total_seconds()
+                guard_offline(client, args.state_dir, every, end_ts, eod_at, now_et)
+                fails = 0
+                continue                       # back online (or out of time): check again at once
             fails += 1
             _say("%s  guard pass failed (%d in a row), will try again: %s"
                  % (now_et.strftime("%H:%M"), fails, scrub(e, client._secrets)))

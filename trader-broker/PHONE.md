@@ -48,9 +48,12 @@ Why Telegram:
       these and refuses to start without the list.
 - [ ] `python3 trader-broker/autopilot.py status` prints no "not starting"
       lines.
-- [ ] **The Mac stays awake.** It must be plugged in, with the lid open (or
-      on an external display), and set never to sleep (System Settings,
-      Battery / Energy). launchd cannot run anything on a sleeping Mac.
+- [ ] **The Mac stays awake.** The `com.daytraderskill.caffeinate` launchd
+      job runs `caffeinate -s` all the time, and `autopilot.py status` checks it.
+      It only works on mains power, and **closing a laptop's lid still sleeps
+      it** unless an external display, keyboard and power are attached. So keep
+      it plugged in with the lid open. launchd cannot run anything on a
+      sleeping Mac.
 - [ ] Both jobs are loaded: the guard (`com.daytraderskill.t212-guard`) and
       the autopilot (`com.daytraderskill.autopilot`). Both start at 13:00 UK
       time on weekdays and wait for the 9:30 New York open.

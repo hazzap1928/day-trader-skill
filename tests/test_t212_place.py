@@ -110,6 +110,14 @@ class Base(unittest.TestCase):
         self.pushed = []
         t212._notify = lambda title, text: self.notes.append((title, text))   # no real pop-ups in tests
         t212._phone_push = lambda client, text, once_key=None: self.pushed.append(text)   # nor real phones
+        self.net = t212.net_module()
+        self._net = self.net._connect
+        self.online = [True]          # the internet is there unless a test says otherwise; never the real one
+
+        def connect(host, port, timeout):
+            if not self.online[0]:
+                raise OSError("offline (test)")
+        self.net._connect = connect
 
         def fake_sleep(s):
             self.sleeps.append(s)
@@ -138,6 +146,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         (t212._open, t212._sleep, t212._now, t212._fx_open, t212._is_tty, t212._ask,
          t212.LIVE_PLACEMENT_ENABLED, t212._notify, t212._phone_push) = self._saved
+        self.net._connect = self._net
         shutil.rmtree(self.dir)
 
     def write(self, rel, data):

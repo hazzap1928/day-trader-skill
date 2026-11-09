@@ -75,6 +75,7 @@ def _load(folder, name):
 
 t212 = _load("trader-broker", "t212")
 phone_mod = t212.phone_module()
+net = t212.net_module()
 tk = t212.ticket_module()
 _MODS = {}
 
@@ -158,6 +159,39 @@ def settings(cfg):
     return s
 
 
+KEEP_AWAKE_LABEL = "com.daytraderskill.caffeinate"
+
+
+def _keep_awake():
+    """(running, detail): is the launchd job that runs `caffeinate -s` up?"""
+    try:
+        p = subprocess.run(["/bin/launchctl", "print", "gui/%d/%s" % (os.getuid(), KEEP_AWAKE_LABEL)],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, "could not ask launchd (%s)" % e
+    if p.returncode != 0:
+        return False, "the %s launchd job is not loaded" % KEEP_AWAKE_LABEL
+    running = re.search(r"^\s*state = running", p.stdout, re.M)
+    args_ok = "caffeinate" in p.stdout and "-s" in p.stdout
+    if running and args_ok:
+        pid = re.search(r"^\s*pid = (\d+)", p.stdout, re.M)
+        return True, "caffeinate -s is running (pid %s)" % (pid.group(1) if pid else "?")
+    return False, "the %s job is loaded but not running" % KEEP_AWAKE_LABEL
+
+
+def _on_mains():
+    """(on_mains, detail) from pmset: caffeinate -s only holds the Mac awake on mains power."""
+    try:
+        out = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True, "power source unknown"
+    if "AC Power" in out:
+        return True, "on mains power"
+    if "Battery Power" in out:
+        return False, "ON BATTERY: caffeinate -s does not stop sleep on battery; plug the Mac in"
+    return True, "power source unknown"
+
+
 def check_ready(cfg, client_env, phone):
     """Every reason the autopilot will not start. Empty means ready."""
     problems = []
@@ -173,6 +207,10 @@ def check_ready(cfg, client_env, phone):
         problems.append("\"require_stop\" must stay true")
     if (cfg.get("autopilot") or {}).get("auto_buy") is True and client_env != AUTOPILOT_ENV:
         problems.append("autopilot.auto_buy works on the demo account only; there is no live automatic buying")
+    awake, why = _keep_awake()
+    if not awake:
+        problems.append("the Mac may sleep: %s. Load it with: launchctl bootstrap gui/$(id -u) "
+                        "~/Library/LaunchAgents/%s.plist" % (why, KEEP_AWAKE_LABEL))
     if phone is None:
         problems.append("no phone paired: set TELEGRAM_BOT_TOKEN, then run python3 trader-broker/phone.py setup")
     try:
@@ -483,6 +521,9 @@ class Pilot(object):
             ups = self.phone.updates(wait=wait)
         except phone_mod.PhoneError as e:
             self.say("phone poll failed: %s" % e)
+            if not net.online():
+                self.net_down = True
+                return
             _sleep(min(wait, 10))
             return
         for u in ups:
@@ -662,6 +703,49 @@ class Pilot(object):
         self.state["summary_sent"] = True
         self.save()
 
+    # ------------------------------------------------------------ no internet
+
+    def offline(self, next_cycle, step, last, summary_at):
+        """Check every 2 minutes. Back within 30 minutes: carry on with the next scheduled cycle. Longer:
+        buying is paused for the rest of the day (nothing is bought blind), and it keeps trying for the
+        closing report. Once back, the phone is told what was missed. Returns the next cycle time."""
+        self.net_down = False
+        deadline = _now() + (summary_at - _ny()).total_seconds()
+        w = net.wait_online(_sleep, _now, deadline=deadline, log=self.say, label="the autopilot")
+        start = w["start"]
+        paused = False
+        if not w["ok"] and w["gave_up"]:
+            paused = True
+            self.state["paused"] = True
+            self.state["paused_why"] = "no internet for %d minutes" % net.minutes(start, _now())
+            self.save()
+            phone_mod.push(self.sd, "AUTOPILOT OFFLINE for %d minutes: buying is PAUSED for the rest of today. "
+                                    "The guard is separate and keeps protecting positions when it can reach "
+                                    "Trading 212." % net.minutes(start, _now()), phone=self.phone)
+            w = net.wait_online(_sleep, _now, limit=max(0.0, deadline - _now()), deadline=deadline,
+                                log=self.say, label="the autopilot")
+        end = _now()
+        slots, nc = [], next_cycle
+        while nc <= _ny() and nc <= last:
+            slots.append(nc.strftime("%H:%M"))
+            nc += step
+        missed = []
+        if slots:
+            missed.append("%d scan cycle%s (%s New York), so no tickets then" % (
+                len(slots), "" if len(slots) == 1 else "s", ", ".join(slots)))
+        extra = ["Fills and exits during the outage are reported next, from the positions."]
+        if paused:
+            extra.append("Buying is PAUSED for the rest of today because the outage lasted %d minutes or more. "
+                         "Send /resume to start again." % (net.GIVE_UP_AFTER // 60))
+        net.record(self.sd, "autopilot", start, end, missed, gave_up=paused)
+        self.state["events"].append({"at": _ny().strftime("%H:%M"),
+                                     "text": "offline %d min; missed %s" % (net.minutes(start, end), "; ".join(missed) or "nothing")})
+        self.save()
+        if w["ok"]:
+            phone_mod.push(self.sd, net.back_online("The autopilot (demo)", start, end, missed, extra),
+                           phone=self.phone)
+        return nc
+
     # ------------------------------------------------------------ the day
 
     def day(self):
@@ -710,11 +794,16 @@ class Pilot(object):
             if ny >= summary_at:
                 break
             self.expire()
+            if getattr(self, "net_down", False):
+                next_cycle = self.offline(next_cycle, step, last, summary_at)
+                continue
             if ny >= next_cycle and next_cycle <= last:
                 try:
                     self.say("cycle: " + self.cycle())
                 except (PilotError, t212.T212Error) as e:
                     self.say("cycle failed: %s" % t212.scrub(e, self.client._secrets))
+                    if getattr(e, "network", False) and not net.online():
+                        self.net_down = True
                 while next_cycle <= ny:
                     next_cycle += step
             if _now() - last_pos >= POSITIONS_EVERY and ny < close_at + datetime.timedelta(minutes=2):
@@ -762,6 +851,9 @@ def main(argv=None, environ=None):
         pilot = Pilot(client, phone, a.state_dir)
         if a.cmd == "status":
             print(pilot.status_text())
+            print("keep-awake: %s; %s" % (_keep_awake()[1], _on_mains()[1]))
+            if not _on_mains()[0]:
+                print("WARNING: %s" % _on_mains()[1])
             for t in pilot.state["tickets"]:
                 print("  %s %s %s: %s" % (t["id"], t["symbol"], t["order"].get("qty"), t["status"]))
             return 0

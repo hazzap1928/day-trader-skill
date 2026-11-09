@@ -199,7 +199,9 @@ def open_phone(state_dir, environ=None):
 
 def push(state_dir, text, environ=None, once_key=None, phone=None):
     """Best effort: a message to your phone. Never raises (the log has the text anyway).
-    once_key: send this at most once per New York day (for warnings a check repeats)."""
+    once_key: send this at most once per New York day (for warnings a check repeats).
+    A message that fails is queued and goes out with the next one that gets through."""
+    p = None
     try:
         p = phone or open_phone(state_dir, environ)
         if p is None:
@@ -215,11 +217,47 @@ def push(state_dir, text, environ=None, once_key=None, phone=None):
                 return False
             sent[key] = 1
             p.save()
+        flush_outbox(p, state_dir)
         p.send(text)
         return True
     except Exception as e:
         sys.stderr.write("phone: could not send: %s\n" % (phone.scrub(e) if phone else _scrub_env(e, environ)))
+        if p is not None:
+            queue(state_dir, text)
         return False
+
+
+OUTBOX_MAX = 50
+
+
+def outbox_path(state_dir):
+    return os.path.join(state_dir, "state", "phone-outbox.json")
+
+
+def queue(state_dir, text):
+    """Keep a message that could not be sent; the next one that gets through takes it along."""
+    doc = _read(outbox_path(state_dir), {}) or {}
+    items = doc.get("items") or []
+    items.append({"at": _now(), "text": str(text)[:1500]})
+    doc["items"] = items[-OUTBOX_MAX:]
+    doc["dropped"] = int(doc.get("dropped") or 0) + max(0, len(items) - OUTBOX_MAX)
+    _write(outbox_path(state_dir), doc)
+
+
+def flush_outbox(p, state_dir):
+    """Send what waited while the phone could not be reached, oldest first, in one message."""
+    doc = _read(outbox_path(state_dir), {}) or {}
+    items = doc.get("items") or []
+    if not items:
+        return 0
+    head = "DELIVERED LATE: %d message%s that could not be sent at the time%s:" % (
+        len(items), "" if len(items) == 1 else "s",
+        "" if not doc.get("dropped") else " (%d older ones dropped)" % doc["dropped"])
+    body = "\n".join("- %s %s" % (datetime.datetime.fromtimestamp(i["at"]).strftime("%a %H:%M"), i["text"])
+                     for i in items)
+    p.send((head + "\n" + body)[:MAX_TEXT])
+    _write(outbox_path(state_dir), {"items": []})
+    return len(items)
 
 
 def _scrub_env(e, environ):
