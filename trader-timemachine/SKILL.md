@@ -115,7 +115,8 @@ trailing stop study does not count costs yet.
 
 `trail` takes the same plan and compares its fixed target with a trailing stop at
 0.5, 0.75, 1, 1.5, 2 and 3R (`--distances`), and with `--half` also "sell half at
-the target, trail the rest". The trail follows the highest 5-minute CLOSE and is
+the target, trail the rest". The trail follows the highest 5-minute CLOSE, starts
+once that close is 1R over the entry (`--activate`, as the guard's `activate_r`), and is
 never lowered, the way `t212.py guard` raises it on its checks. Every row uses the
 same 10,000 replays (same seed as `run`, so the plan row matches `run` exactly)
 and the same real past sessions.

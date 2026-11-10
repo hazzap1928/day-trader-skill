@@ -830,6 +830,7 @@ def cost_note(c):
 # ---------------------------------------------------------------- trailing stop study
 
 TRAIL_DISTANCES = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
+TRAIL_ACTIVATE_R = 1.0      # like t212.py guard: the trail starts once the high is 1R over the entry
 TRAIL_MIN_HISTORY = 15      # fewer real trades than this and the suggestion leans on the replays
 
 
@@ -837,12 +838,13 @@ def _cent_down(x):
     return math.floor(round(x * 100, 6)) / 100.0
 
 
-def trail_outcome(path, entry, stop, target, dist_r, half):
+def trail_outcome(path, entry, stop, target, dist_r, half, activate_r=0.0):
     """R for one long trade over bars [(high, low, close), ...] after the entry.
 
     dist_r None = the plan as it is: the stop and a fixed target (touched by a bar's high).
     Otherwise the stop trails dist_r x risk under the highest CLOSE so far and is never
-    lowered, the way t212.py guard raises it on its 5-minute checks. With half, half is
+    lowered, the way t212.py guard raises it on its 5-minute checks; with activate_r it starts
+    only once the highest close is activate_r x risk over the entry. With half, half is
     sold at the first close at or above the target and the rest keeps trailing. The stop
     is checked first in each bar (conservative); a stop fills at the stop, a gap can be worse."""
     risk = entry - stop
@@ -860,7 +862,8 @@ def trail_outcome(path, entry, stop, target, dist_r, half):
                 pos, half_done = 0.5, True
             if cl > hw:
                 hw = cl
-                cur = max(cur, _cent_down(hw - dist_r * risk))
+                if hw + 1e-9 >= entry + activate_r * risk:
+                    cur = max(cur, _cent_down(hw - dist_r * risk))
         last = cl
     got += pos * (last - entry)
     return got / risk, "close"
@@ -913,7 +916,7 @@ def _summary(Rs, kinds):
 
 
 def trail_study(text, plan, now_utc, distances=TRAIL_DISTANCES, half=False, replays=10000, seed=19, window=2,
-                until=None, source="yahoo"):
+                until=None, source="yahoo", activate_r=TRAIL_ACTIVATE_R):
     """Compare the plan's fixed target with trailing stops at several distances, on the
     same Monte Carlo replays and the same real past sessions, and suggest a distance."""
     if plan["side"] != "buy":
@@ -923,6 +926,8 @@ def trail_study(text, plan, now_utc, distances=TRAIL_DISTANCES, half=False, repl
     dists = sorted({float(d) for d in distances})
     if not dists or any(not 0.1 <= d <= 10 for d in dists):
         raise TMError("--distances are in R, each between 0.1 and 10, e.g. 0.5,1,1.5")
+    if not 0 <= activate_r <= 10:
+        raise TMError("--activate is in R, between 0 and 10")
     P = prepare(text, plan, now_utc, until)
     entry, stop, target = plan["entry"], plan["stop"], plan["target"]
     paths = mc_paths(P["pool"], entry, P["k"], P["last"], replays, seed, window)
@@ -932,8 +937,8 @@ def trail_study(text, plan, now_utc, distances=TRAIL_DISTANCES, half=False, repl
     rows = []
     for label, dist, hf in [("plan: fixed target", None, False)] + [
             (m, d, hf) for m, hf in modes for d in dists]:
-        mc = [trail_outcome(pth, entry, stop, target, dist, hf) for pth in paths]
-        hs = [trail_outcome(b, e, s, t, dist, hf) for _, e, s, t, b in hist]
+        mc = [trail_outcome(pth, entry, stop, target, dist, hf, activate_r) for pth in paths]
+        hs = [trail_outcome(b, e, s, t, dist, hf, activate_r) for _, e, s, t, b in hist]
         rows.append({"mode": label, "distance_r": dist, "half": hf,
                      "mc": _summary([r for r, _ in mc], [x for _, x in mc]),
                      "history": _summary([r for r, _ in hs], [x for _, x in hs])})
@@ -954,7 +959,7 @@ def trail_study(text, plan, now_utc, distances=TRAIL_DISTANCES, half=False, repl
         "plan": {kk: v for kk, v in plan.items() if v is not None},
         "replays": replays, "seed": seed, "window": window, "until": clock24(P["until_min"]),
         "pool_sessions": len(P["sessions"]), "pool_from": P["sessions"][0][0], "pool_to": P["sessions"][-1][0],
-        "history_trades": len(hist), "history_rule": rule, "basis": basis,
+        "history_trades": len(hist), "history_rule": rule, "basis": basis, "activate_r": activate_r,
         "rows": rows,
         "suggestion": {"distance_r": best["distance_r"], "sell_half_at_target": best["half"],
                        "score": best["score"], "beats_plan": beats,
@@ -963,6 +968,7 @@ def trail_study(text, plan, now_utc, distances=TRAIL_DISTANCES, half=False, repl
                        "at_edge": "widest" if best["distance_r"] == dists[-1] else
                                   "tightest" if best["distance_r"] == dists[0] else None,
                        "config": {"trailing_stop": {"enabled": True, "distance_r": best["distance_r"],
+                                                    "activate_r": activate_r,
                                                     "sell_half_at_target": best["half"]}}},
         "warnings": P["warn"],
     }
@@ -988,7 +994,8 @@ def trail_report(doc):
     L = ["%s buy %s: entry %.2f at %s, stop %.2f (risk %.2f a share), target %.2f."
          % (p["symbol"], p["date"], p["entry"], p.get("entry_time", "?"), p["stop"], risk, p["target"]),
          "Trailing stop study: the stop trails N x risk under the highest 5-minute close, never lowered, "
-         "like t212.py guard. To %s, seed %d." % (doc["until"], doc["seed"]),
+         "starting once that close is %gR over the entry, like t212.py guard. To %s, seed %d."
+         % (doc.get("activate_r", 0), doc["until"], doc["seed"]),
          "Replays: %d, drawn from %d full sessions (%s to %s). History: the same rule fired on %d of them."
          % (doc["replays"], doc["pool_sessions"], doc["pool_from"], doc["pool_to"], doc["history_trades"]), "",
          "  %-18s %6s | %8s %7s %8s | %8s %7s %4s" % ("", "trail", "avg R", "green", "full -1R",
@@ -1191,7 +1198,7 @@ def cmd_trail(a):
         dists = [float(x) for x in str(a.distances).split(",") if x.strip()]
     except ValueError:
         raise TMError("--distances wants numbers in R, e.g. 0.5,1,1.5")
-    doc = trail_study(text, plan, now, dists, a.half, a.replays, a.seed, a.window, a.until, source)
+    doc = trail_study(text, plan, now, dists, a.half, a.replays, a.seed, a.window, a.until, source, a.activate)
     if a.write:
         _write(a.write, doc)
     if a.json:
@@ -1256,6 +1263,8 @@ def main(argv=None):
     p.add_argument("--distances", default=",".join("%g" % d for d in TRAIL_DISTANCES),
                    help="trail distances in R (default 0.5,0.75,1,1.5,2,3)")
     p.add_argument("--half", action="store_true", help="also try selling half at the target, then trailing")
+    p.add_argument("--activate", type=float, default=TRAIL_ACTIVATE_R, metavar="R",
+                   help="the trail starts once the trade is this many R in profit (default 1, as the guard)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--write", nargs="?", const="trader/trail.json", metavar="PATH",
                    help="save the result (default trader/trail.json)")

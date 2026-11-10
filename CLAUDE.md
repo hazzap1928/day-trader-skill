@@ -30,7 +30,7 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 The guard's protections:
 - stops are good till cancelled, and checked again 1 minute after placing and on every cycle
 - a REJECTED or missing stop becomes a **software stop**: a market sell at the stop, with a loud alert
-- trailing stop at 1R
+- trailing stop: starts once 1R in profit (`activate_r`, default 1), then trails 1R under the high
 - end-of-day close at 15:50 New York: it cancels each stop, then sells at market
 
 ## Scheduling (launchd, `~/Library/LaunchAgents/com.daytraderskill.*.plist`)
@@ -51,7 +51,7 @@ The guard's protections:
 ## Current config (`trader/config.json`, git-ignored; backups beside it as `config.json.bak-*`)
 
 - **Account:** GBP, Trading 212 **demo** (`"paper": true`), fractional shares, `stop_mode` broker,
-  trailing stop 1R, `eod_close` 15:50.
+  trailing stop 1R (from 1R profit), `eod_close` 15:50.
 - **`account_budget` on:**
   - `budget_gbp` = the account value with `cash_buffer_pct` 10, so 90% can be invested
   - max loss 1% a trade, 3% a day of the start-of-day value

@@ -85,6 +85,14 @@ class MarketMode(Base):
         self.assertEqual(self.router.posts()[0][2]["quantity"], -7)
         self.assertIn("366.14 stop", text)
 
+    def test_the_guards_own_stop_waits_for_1r_of_profit(self):
+        self.config(stop_mode="market", trailing_stop={"enabled": True, "distance_r": 1.0})
+        self.set_account(368.0)                  # under 1R (370.04): the stop stays at 358.32
+        code, text, _ = self.guard()
+        self.assertEqual(self.router.posts(), [])
+        self.assertEqual(self.read("state/t212-guard.json")["trail"][TICKER]["stop"], 358.32)
+        self.assertIn("the trail starts at 1R profit", text)
+
     def test_it_never_lowers_its_stop(self):
         self.config(stop_mode="market", trailing_stop={"enabled": True, "distance_r": 1.0})
         self.write("state/t212-guard.json", {"trail": {TICKER: {"fingerprint": "fp1", "high": 372.0,

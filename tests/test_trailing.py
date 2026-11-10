@@ -61,6 +61,16 @@ class TrailOutcome(unittest.TestCase):
         self.assertAlmostEqual(r, 0.5 * 1.25 + 0.5 * 2.0)
         self.assertEqual(kind, "trailed out")
 
+    def test_with_activation_the_trail_waits_for_1r_of_profit(self):
+        path = [(101.8, 100.2, 101.5),     # close 101.5 < 1R (102): no raise (without activation: 99.5)
+                (101.6, 99.2, 99.6)]       # low 99.2 is over the first stop 98: still in, out at the close
+        r, kind = tm.trail_outcome(path, self.E, self.S, self.T, 1.0, False, 1.0)
+        self.assertEqual((round(r, 6), kind), (-0.2, "close"))
+        self.assertEqual(tm.trail_outcome(path, self.E, self.S, self.T, 1.0, False, 0.0)[1], "trailed out")
+        path = [(102.5, 100.5, 102.0),     # close 102 = 1R: the stop moves to 102 - 2 = 100 (break-even)
+                (101.0, 99.5, 100.5)]      # low 99.5 <= 100: out at the entry
+        self.assertEqual(tm.trail_outcome(path, self.E, self.S, self.T, 1.0, False, 1.0), (0.0, "trailed out"))
+
     def test_a_full_loss_is_minus_one_r(self):
         self.assertEqual(tm.trail_outcome([(100.2, 97.0, 97.5)], self.E, self.S, self.T, 0.5, True), (-1.0, "stop"))
 
@@ -90,6 +100,7 @@ class TrailStudy(unittest.TestCase):
         self.assertEqual(sg["score"], max(r["score"] for r in cands))
         self.assertIn(sg["distance_r"], tm.TRAIL_DISTANCES)
         self.assertEqual(sg["config"]["trailing_stop"]["distance_r"], sg["distance_r"])
+        self.assertEqual(sg["config"]["trailing_stop"]["activate_r"], 1.0)     # the guard's default
         self.assertEqual(self.doc["basis"], "history")          # 33 real trades >= 15
 
     def test_same_seed_same_numbers(self):
@@ -162,6 +173,95 @@ class GuardTrail(Base):
         self.assertEqual(self.read("state/t212-guard.json")["trail"][TICKER]["stop"], 366.14)
         self.assert_exits_only()
 
+    def test_no_raise_until_the_trade_is_1r_in_profit(self):
+        # entry 364.18, risk 5.86: 1R of profit is 370.04. At 368 the old trail would have raised to 362.14
+        self.set_account(368.0)
+        code, text, err = self.guard()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.router.posts(), [])
+        self.assertEqual(self.calls("DELETE"), [])
+        self.assertIn("the trail starts at 1R profit (370.04), high so far 368.00", text)
+        self.assertEqual(self.read("state/t212-guard.json")["trail"][TICKER]["high"], 368.0)
+
+    def test_at_1r_of_profit_the_first_raise_is_to_break_even(self):
+        self.set_account(370.04)
+        self.guard()
+        self.assertEqual(self.router.posts("/equity/orders/stop")[0][2]["stopPrice"], 364.18)
+
+    def test_the_gddy_case_three_small_raises_under_1r_never_happen(self):
+        # GDDY 10 Nov: stop 112.11, risk 1.17 (1R at 114.45); highs 113.43, 113.58, 113.85 each raised it
+        rec = dict(RECORD, entry=113.28, stop=112.11, target=115.62, qty="44.5")
+        self.write("state/broker.json", {"orders": [rec]})
+        for high in (113.43, 113.58, 113.85):
+            self.router.routes.clear()
+            self.set_account(high, pending=[stop_order(stop=112.11, qty=-44.5)], qty=44.5)
+            self.guard()
+        self.assertEqual(self.router.posts(), [])
+        self.assertEqual(self.calls("DELETE"), [])
+
+    def test_activate_r_zero_trails_from_the_entry_as_before(self):
+        self.set_trail(distance_r=1.0, activate_r=0)
+        self.set_account(368.0)                 # 368 - 5.86 = 362.14
+        self.guard()
+        self.assertEqual(self.router.posts("/equity/orders/stop")[0][2]["stopPrice"], 362.14)
+
+    def test_a_raise_is_tracked_so_the_next_check_finds_the_new_stop(self):
+        # place tracks the first stop (7001); the raise cancels it and places 8001
+        self.write("state/t212-guard.json", {"verify": {TICKER: {"id": 7001, "fingerprint": "fp1",
+                                                                 "stop": 358.32, "placed_at": 0}}})
+        self.set_account(372.0)
+        code, text, err = self.guard()
+        self.assertEqual(code, 0, err)
+        self.assertIn("RAISED the stop 358.32 -> 366.14", text)
+        st = self.read("state/t212-guard.json")
+        self.assertEqual(st["verify"][TICKER]["id"], 8001)
+        self.assertEqual(st["verify"][TICKER]["stop"], 366.14)
+        # 5 minutes later: Trading 212 lists 8001, and 7001 is CANCELLED in the history (by the guard)
+        self.router.routes.clear()
+        self.set_account(372.0, pending=[stop_order(stop=366.14, oid=8001)])
+        self.router.add("GET", "/equity/history/orders", FakeResp({"items": [{"order": dict(
+            stop_order(), status="CANCELLED")}], "nextPagePath": None}))
+        code, text, err = self.guard()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.pushed, [])
+        self.assertEqual(self.notes, [])
+        self.assertNotIn("GONE", text + err)
+        st = self.read("state/t212-guard.json")
+        self.assertNotIn(TICKER, st.get("software", {}))
+        self.assertNotIn("/equity/history/orders", [c[1] for c in self.router.calls])   # no lookup needed
+
+    def test_an_old_tracked_id_the_guard_cancelled_itself_is_not_an_alarm(self):
+        # state written by the old code: verify still on 7001, which the guard cancelled to raise it
+        self.write("state/t212-guard.json", {
+            "verify": {TICKER: {"id": 7001, "fingerprint": "fp1", "stop": 358.32, "placed_at": 0}},
+            "cancelled": [{"at": "x", "ticker": TICKER, "order_id": 7001}],
+            "trail": {TICKER: {"fingerprint": "fp1", "high": 372.0, "stop": 366.14, "half_sold": False}}})
+        self.set_account(372.0, pending=[stop_order(stop=366.14, oid=8001)])
+        self.router.add("GET", "/equity/history/orders", FakeResp({"items": [{"order": dict(
+            stop_order(), status="CANCELLED")}], "nextPagePath": None}))
+        code, text, err = self.guard()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.pushed, [])
+        st = self.read("state/t212-guard.json")
+        self.assertEqual(st["verify"][TICKER]["id"], 8001)
+        self.assertNotIn(TICKER, st.get("software", {}))
+
+    def test_a_stop_cancelled_by_someone_else_still_raises_the_alarm(self):
+        self.write("state/t212-guard.json", {"verify": {TICKER: {"id": 7001, "fingerprint": "fp1",
+                                                                 "stop": 358.32, "placed_at": 0}}})
+        self.set_account(368.0, pending=[])
+        self.router.add("GET", "/equity/history/orders", FakeResp({"items": [{"order": dict(
+            stop_order(), status="CANCELLED")}], "nextPagePath": None}))
+        self.guard()
+        self.assertTrue(any("GONE at Trading 212 (CANCELLED)" in p for p in self.pushed))
+        self.assertIn(TICKER, self.read("state/t212-guard.json")["software"])
+
+    def test_the_guards_own_cancels_are_remembered(self):
+        self.set_account(372.0)
+        self.guard()
+        own = self.read("state/t212-guard.json")["cancelled"]
+        self.assertEqual([(x["ticker"], x["order_id"]) for x in own], [(TICKER, 7001)])
+
     def test_it_never_lowers_the_stop(self):
         self.write("state/t212-guard.json", {"trail": {TICKER: {"fingerprint": "fp1", "high": 372.0,
                                                                 "stop": 366.14, "half_sold": False}}})
@@ -222,7 +322,8 @@ class GuardTrail(Base):
         self.assertEqual(self.router.posts("/equity/orders/stop")[0][2]["stopPrice"], 366.14)
 
     def test_bad_settings_are_refused(self):
-        for bad in ({"distance_r": 0}, {"distance_r": 1, "distance_pct": 2}, {}):
+        for bad in ({"distance_r": 0}, {"distance_r": 1, "distance_pct": 2}, {},
+                    {"distance_r": 1, "activate_r": -1}, {"distance_r": 1, "activate_r": "soon"}):
             with self.subTest(bad=bad):
                 self.set_trail(**bad)
                 code, _, err = self.guard()

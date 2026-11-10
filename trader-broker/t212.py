@@ -1242,6 +1242,7 @@ FRACTIONAL_STOP_MODES = ("broker", "software")
 GUARD_OPEN = (9, 30)
 GUARD_STATUSES = ("placed", "stop_placed", "stop_not_placed", "stop_rejected", "software_stop")
 GUARD_GONE_POLLS = 3          # looks at the pending list after a cancel, before the new stop goes in
+GUARD_CANCELLED_KEEP = 200    # stop ids the guard cancelled itself (to raise them), newest kept
 
 
 def guard_sell_orders(pending, ticker):
@@ -1363,8 +1364,12 @@ def guard_send_sell(client, ticker, qty):
 
 # ---------------------------------------------------------------- trailing stop
 
+TRAIL_ACTIVATE_R = 1.0        # the rule: move the stop up only once the trade is 1R in profit
+
+
 def trail_settings(cfg):
-    """None (off) or {"distance_r" | "distance_pct", "half"} from "trailing_stop" in the config."""
+    """None (off) or {"distance_r" | "distance_pct", "half", "activate_r"} from "trailing_stop" in the config.
+    activate_r (default 1): the trail starts only once the high is that many R over the entry; 0 = at once."""
     t = (cfg or {}).get("trailing_stop")
     if not t or not t.get("enabled"):
         return None
@@ -1377,7 +1382,10 @@ def trail_settings(cfg):
         raise T212Error("trailing_stop.distance_r must be between 0.1 and 10 (R)", 2)
     if p is not None and not 0.1 <= p <= 50:
         raise T212Error("trailing_stop.distance_pct must be between 0.1 and 50", 2)
-    return {"distance_r": r, "distance_pct": p, "half": bool(t.get("sell_half_at_target"))}
+    a = _num(t.get("activate_r")) if t.get("activate_r") is not None else TRAIL_ACTIVATE_R
+    if a is None or not 0 <= a <= 10:
+        raise T212Error("trailing_stop.activate_r must be between 0 and 10 (R in profit before the trail starts)", 2)
+    return {"distance_r": r, "distance_pct": p, "half": bool(t.get("sell_half_at_target")), "activate_r": a}
 
 
 def _cent_down(x):
@@ -1391,6 +1399,20 @@ def trail_level(trail, high, risk):
             return None
         return _cent_down(high - trail["distance_r"] * risk)
     return _cent_down(high * (1 - trail["distance_pct"] / 100.0))
+
+
+def trail_armed(trail, high, entry, risk):
+    """(True, None) once the high is activate_r x risk over the entry (the "1R in profit" rule),
+    else (False, why). activate_r 0 trails from the entry."""
+    a = trail.get("activate_r") or 0
+    if a <= 0:
+        return True, None
+    if not entry or not risk or risk <= 0:
+        return False, "not trailed: no entry price in the ticket record to measure %gR of profit from" % a
+    at = entry + a * risk
+    if high + 1e-9 < at:
+        return False, "not trailed yet: the trail starts at %gR profit (%.2f), high so far %.2f" % (a, at, high)
+    return True, None
 
 
 def _gone(client, order_id):
@@ -1420,8 +1442,10 @@ class _Guard(object):
     def warn(self, text):
         self.out["warnings"].append(text)
 
-    def stop(self, ticker, qty, price, why):
-        """Place a stop; returns ('ok', resp) / ('rejected', err) / ('unknown', err)."""
+    def stop(self, ticker, qty, price, why, rec=None):
+        """Place a stop; returns ('ok', resp) / ('rejected', err) / ('unknown', err). A placed stop
+        becomes the one the check a minute later (and every cycle after) looks up, so a stop the
+        guard replaced is never mistaken for the one that protects the position."""
         self.log("request", method="POST", path=STOP, body=stop_body(ticker, qty, price), why=why)
         try:
             _, resp = guard_send_stop(self.client, ticker, qty, price)
@@ -1434,6 +1458,10 @@ class _Guard(object):
         self.log("response", path=STOP, body=resp)
         self.state.setdefault("placed", []).append({"at": self.out["at"], "ticker": ticker, "qty": qty,
                                                     "stop": price, "why": why, "order_id": resp.get("id")})
+        if rec is not None and resp.get("id") is not None:
+            self.state.setdefault("verify", {})[ticker] = {"id": resp.get("id"), "fingerprint": rec.get("fingerprint"),
+                                                           "stop": price, "placed_at": _now()}
+            self.out["verify_soon"] = True
         self.save()
         return "ok", resp
 
@@ -1448,7 +1476,14 @@ class _Guard(object):
                 self.save()
             return e.outcome, e
         self.log("response", path=CANCEL, order_id=order_id, status=200)
+        own = self.state.setdefault("cancelled", [])
+        own.append({"at": self.out["at"], "ticker": ticker, "order_id": order_id})
+        del own[:-GUARD_CANCELLED_KEEP]
+        self.save()
         return "ok", None
+
+    def cancelled_by_guard(self, order_id):
+        return any(x.get("order_id") == order_id for x in self.state.get("cancelled") or [])
 
 
 def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
@@ -1479,6 +1514,9 @@ def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
     new = max(new, cur, _num(t.get("stop")) or 0)            # never lower
     if new >= price - 0.01:
         new = cur                                             # a stop at the price would sell at once
+    armed, why = trail_armed(trail, t["high"], entry, risk)
+    if not armed:
+        new = max(cur, _num(t.get("stop")) or 0)              # under the activation profit: no raise at all
     step = max(0.05, 0.1 * (risk or new * 0.01))
 
     if trail["half"] and not t.get("half_sold") and target and price >= target and sq > 0:
@@ -1503,14 +1541,14 @@ def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
             except PlaceError as e:
                 g.log("response", path=MARKET, status=e.status, outcome=e.outcome, error=str(e))
                 if e.outcome == "rejected":
-                    o2, _ = g.stop(ticker, sq, cur, "put back after a refused half sale")
+                    o2, _ = g.stop(ticker, sq, cur, "put back after a refused half sale", rec)
                     g.warn("%s: the half sale at the target was refused (%s); the stop %s"
                            % (ticker, e, "was put back at %.2f" % cur if o2 == "ok" else
                               "COULD NOT BE PUT BACK: the position has NO STOP. Set one in the app now"))
                     return
                 g.unclear[ticker] = "half sale SELL %s: %s at %s" % (_qty(half), e, g.out["at"])
                 g.save()
-                o2, _ = g.stop(ticker, rest, new, "after an unclear half sale")
+                o2, _ = g.stop(ticker, rest, new, "after an unclear half sale", rec)
                 g.warn("%s: the half sale is UNCLEAR (%s). A stop for the other %s was %s. The guard stops "
                        "touching %s until you check the app and clear it in %s."
                        % (ticker, e, _qty(rest), "placed at %.2f" % new if o2 == "ok" else "NOT placed", ticker, g.path))
@@ -1520,7 +1558,7 @@ def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
             g.state.setdefault("sold", []).append({"at": g.out["at"], "ticker": ticker, "qty": half,
                                                    "price_seen": price, "target": target, "order_id": resp.get("id")})
             g.save()
-            o2, err2 = g.stop(ticker, rest, new, "the rest after half at target")
+            o2, err2 = g.stop(ticker, rest, new, "the rest after half at target", rec)
             if o2 == "ok":
                 t["stop"] = new
                 g.save()
@@ -1532,6 +1570,9 @@ def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
             g.out["placed"] += 1
             return
 
+    if not armed:
+        row["trail"] = "stop %.2f; %s" % (cur, why)
+        return
     if new < cur + step - 1e-9:
         row["trail"] = "stop %.2f, high %.2f: no raise yet (trail at %.2f)" % (cur, t["high"], max(new, cur))
         return
@@ -1542,7 +1583,7 @@ def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
                   else "UNCLEAR: check the app; the guard leaves %s alone until you clear it." % ticker))
         return
     _gone(g.client, oid)
-    o, err = g.stop(ticker, sq, new, "trail raise from %.2f" % cur)
+    o, err = g.stop(ticker, sq, new, "trail raise from %.2f" % cur, rec)
     if o == "ok":
         t["stop"] = new
         g.save()
@@ -1550,7 +1591,7 @@ def guard_trail(g, row, rec, stop_order, held, price, trail, cfg):
         g.out["placed"] += 1
         return
     if o == "rejected":
-        o2, _ = g.stop(ticker, sq, cur, "put back after a refused raise")
+        o2, _ = g.stop(ticker, sq, cur, "put back after a refused raise", rec)
         g.warn("%s: the raised stop %.2f was refused (%s); the old stop %s"
                % (ticker, new, err, "was put back at %.2f" % cur if o2 == "ok" else
                   "COULD NOT BE PUT BACK: the position has NO STOP. Set one in the app now"))
@@ -1632,7 +1673,10 @@ def guard_market(g, row, rec, held, ticket_qty, price, trail, cfg):
     row["high"] = t["high"]
     if trail:
         new = trail_level(trail, t["high"], risk)
-        if new is not None and level < new < price - 0.01:
+        armed, why = trail_armed(trail, t["high"], entry, risk)
+        if new is not None and not armed:
+            row["trail"] = ((row.get("trail") or "") + "; " if row.get("trail") else "") + why
+        elif new is not None and level < new < price - 0.01:
             row["trail"] = ((row.get("trail") or "") + "; " if row.get("trail") else "") + \
                 "raised the guard's stop %.2f -> %.2f (high %.2f)" % (level, new, t["high"])
             level = t["stop"] = new
@@ -1708,6 +1752,14 @@ def guard_pass(client, state_dir):
                     how, raw = stop_status(client, ticker, v["id"], pending)
                     if how == "filled":
                         verify.pop(ticker, None)
+                    elif how == "cancelled" and g.cancelled_by_guard(v["id"]):
+                        # the guard cancelled it itself to raise it: not gone, replaced. Track the live one;
+                        # with none live, the missing-stop step below puts a stop back
+                        verify.pop(ticker, None)
+                        if len(stops) == 1 and stops[0].get("id") is not None:
+                            verify[ticker] = {"id": stops[0]["id"], "fingerprint": rec.get("fingerprint"),
+                                              "stop": _num(stops[0].get("stopPrice")), "placed_at": _now(),
+                                              "checked": out["at"]}
                     elif how != "ok":
                         verify.pop(ticker, None)
                         stop_now = max(float(rec["stop"]), _num((g.trail.get(ticker) or {}).get("stop")) or 0)
@@ -1774,7 +1826,7 @@ def guard_pass(client, state_dir):
                    "place it. Decide yourself in the app."
                    % (ticker, _fmt(price) if price is not None else "an unknown price", stop))
             continue
-        o, err = g.stop(ticker, want, stop, "missing stop")
+        o, err = g.stop(ticker, want, stop, "missing stop", rec)
         if o != "ok":
             row["status"] = "stop failed" if o == "rejected" else "unclear"
             g.warn("%s: the guard's stop (SELL %s at %.2f) %s: %s. Not retried."
@@ -1787,9 +1839,6 @@ def guard_pass(client, state_dir):
             continue
         oid = err.get("id") if isinstance(err, dict) else None
         row.update(status="stop placed", placed_qty=want, order_id=oid)
-        verify[ticker] = {"id": oid, "fingerprint": rec.get("fingerprint"), "stop": stop, "placed_at": _now()}
-        g.save()
-        out["verify_soon"] = True
         out["placed"] += 1
     for o in pending:
         t = _o_ticker(o)

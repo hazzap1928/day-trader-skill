@@ -221,16 +221,20 @@ cancels anything except a stop it is about to raise (below).
 **Trailing stop (demo, exits only, off by default).** In `trader/config.json`:
 
 ```json
-"trailing_stop": {"enabled": true, "distance_r": 1.0, "sell_half_at_target": false}
+"trailing_stop": {"enabled": true, "distance_r": 1.0, "activate_r": 1.0, "sell_half_at_target": false}
 ```
 
 `distance_r` is in R (the ticket's entry minus its first stop); `distance_pct`
 works instead. On each check the guard keeps the highest price it has seen for
-the position and raises its one pending stop to that high minus the distance,
-rounded down to the cent. It never lowers a stop, never moves it to the price or
+the position. Nothing moves until that high is `activate_r` R over the entry
+(default 1: "move the stop up once 1R in profit"; 0 trails from the entry). From
+then on it raises its one pending stop to that high minus the distance, rounded
+down to the cent, so with 1R and 1R the first raise is to break-even. It never lowers a stop, never moves it to the price or
 above, and skips a raise under 0.1R (or 5 cents) so it does not churn orders.
 Trading 212 has no trailing order and no "modify", so a raise is: cancel the stop,
-wait for it to leave the pending list, place the higher stop. A refused raise puts
+wait for it to leave the pending list, place the higher stop. The new stop's id
+becomes the one the guard checks a minute later and on every cycle, and a stop the
+guard cancelled itself is never reported as gone. A refused raise puts
 the old stop back; an unclear one is never repeated and the guard leaves that
 stock alone until the user checks the app. A stop it later has to put back comes
 back at the trailed level, not the first one.
