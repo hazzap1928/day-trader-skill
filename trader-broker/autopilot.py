@@ -62,6 +62,7 @@ POLL_WAIT = 20                   # seconds a phone poll waits for a tap
 BRIEFING_CATCHUP = (7, 45)       # UK time on the Mac: from then until the open a missed briefing is run again
 REPORT_AFTER = 5                 # minutes after the end-of-day close (15:50 New York) the closing report goes
 EOD_DEFAULT = "15:50"
+DRIFT_SCAN_AT = "15:35"          # New York: the drift shadow scan, after the last entry cycle, before the report
 STEP_TIMEOUT = 900
 
 
@@ -879,6 +880,7 @@ class Pilot(object):
 
     def send_summary(self):
         """The closing report (trader-broker/report.py), and today's value for the morning briefing."""
+        self.drift_scan()                         # a missed 15:35 scan runs now, so the report can show it
         self.record_day()
         report = mod("trader-broker", "report")
         report.t212, report.tk, report.phone_mod = t212, tk, phone_mod
@@ -893,6 +895,50 @@ class Pilot(object):
         self.save()
         if self.s["evidence_mode"]:
             self.evidence_close(report)
+        self.drift_resolve()
+
+    # ------------------------------------------------------------ post-earnings drift (SHADOW, never an order)
+
+    def drift_cfg(self):
+        """The config as written (drift reads the universe itself), or {} when it cannot be read."""
+        return t212._read_json(self.p("config.json"), {}) or {}
+
+    def drift_scan(self):
+        """Tomorrow's drift shortlist (trader-broker/drift.py), once a day, before the closing report.
+        Shadow only: drift.py has no Trading 212 connection. Any error is reported and never stops the day."""
+        if self.state.get("drift_scan") == self.state.get("day"):
+            return
+        self.state["drift_scan"] = self.state.get("day")
+        self.save()
+        try:
+            drift = mod("trader-broker", "drift")
+            cfg = self.drift_cfg()
+            if not drift.enabled(cfg):
+                return
+            doc = drift.scan(self.sd, cfg)
+            if doc is not None:
+                self.say("drift scan (shadow): %s" % (doc.get("error") or "%d reports, %d qualified, %d shortlisted"
+                                                      % (doc.get("rows", 0), doc.get("qualified", 0),
+                                                         len(doc.get("shortlist") or []))))
+        except Exception as e:
+            self.say("drift scan failed (shadow, nothing affected): %s" % t212.scrub(e, self.client._secrets))
+
+    def drift_resolve(self):
+        """After the closing report: the drift log's virtual results. Never stops the day."""
+        try:
+            drift = mod("trader-broker", "drift")
+            cfg = self.drift_cfg()
+            if drift.enabled(cfg):
+                self.say("drift: %d virtual results updated (shadow)" % drift.resolve(self.sd, cfg))
+        except Exception as e:
+            self.say("drift results failed (shadow, nothing affected): %s" % t212.scrub(e, self.client._secrets))
+
+    def drift_due(self, ny):
+        try:
+            h, m = _hm((self.drift_cfg().get("drift") or {}).get("scan_at"), DRIFT_SCAN_AT)
+        except Exception:
+            h, m = _hm(DRIFT_SCAN_AT, DRIFT_SCAN_AT)
+        return ny >= ny.replace(hour=h, minute=m, second=0, microsecond=0)
 
     def evidence_close(self, report):
         """After the closing report: today's virtual results, and every Friday the report."""
@@ -1196,6 +1242,8 @@ class Pilot(object):
                         self.net_down = True
                 while next_cycle <= ny:
                     next_cycle += step
+            if self.drift_due(ny) and self.state.get("drift_scan") != self.state.get("day"):
+                self.drift_scan()
             if _now() - last_pos >= POSITIONS_EVERY and ny < close_at + datetime.timedelta(minutes=2):
                 self.watch_positions()
                 last_pos = _now()

@@ -235,6 +235,7 @@ def build(client, state_dir):
         r["errors"].append("positions: %s" % t212.scrub(e, client._secrets))
     r["alerts"] = guard_alerts(state_dir, alerts.eastern_to_utc(datetime.datetime.combine(day, datetime.time(0, 0))))
     r["unclear"] = guard.get("unclear") or {}
+    r["drift"] = drift_line(state_dir, day, "closing")
     return r
 
 
@@ -283,6 +284,19 @@ def tm_line(trades):
                 ("%+.2fR" % (sum(rs) / len(rs))) if rs else "no data"))
 
 
+def drift_line(state_dir, day, which):
+    """The drift shadow line for the phone, or None when the scan is off. Never raises: a missing,
+    old or broken shortlist (or drift.py itself) gives "no drift scan yet"."""
+    head = "Drift shortlist for tomorrow" if which == "closing" else "Drift would buy today"
+    try:
+        drift = _load("trader-broker", "drift")
+        cfg = t212._read_json(os.path.join(state_dir, "config.json"), {}) or {}
+        fn = drift.closing_line if which == "closing" else drift.briefing_line
+        return fn(state_dir, cfg, day)
+    except Exception:
+        return "%s (SHADOW: nothing is bought): no drift scan yet." % head
+
+
 def full_text(r):
     L = ["# Closing report, %s (New York)" % r["day"].strftime("%A %d %B %Y"), "",
          "Demo account. From Trading 212's own fills; P&L in GBP after FX fees. Read-only.", ""]
@@ -325,6 +339,8 @@ def full_text(r):
     L += ["  - " + a for a in r["alerts"]]
     if r["unclear"]:
         L.append("- UNCLEAR guard orders: " + "; ".join("%s (%s)" % kv for kv in sorted(r["unclear"].items())))
+    if r.get("drift"):
+        L += ["", "## Post-earnings drift (shadow)", "- " + r["drift"]]
     L += ["", "## Against the Time Machine", tm_line(r["today"]), "",
           "Education and tooling, not financial advice."]
     return "\n".join(L) + "\n"
@@ -351,6 +367,8 @@ def short_text(r, path):
         lines.append("no data: " + e)
     tm = tm_line(r["today"]).split(" One day")[0]
     lines.append(tm if tm.endswith(".") else tm + ".")
+    if r.get("drift"):
+        lines.append(r["drift"])
     lines.append("Full report: %s" % (os.path.relpath(path, ROOT) if path.startswith(ROOT + os.sep) else path))
     return "\n".join(lines)
 

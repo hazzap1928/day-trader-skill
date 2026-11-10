@@ -366,6 +366,7 @@ def build(client, state_dir):
          "eod": (t212._read_json(os.path.join(state_dir, "state", "t212-guard.json"), {}) or {}).get("eod")}
     b["earnings"] = earnings([session, b["next"]], held, set(b["flagged"]))
     b["todo"] = todo(b)
+    b["drift"] = drift_line(state_dir, session, "briefing")
     return b
 
 
@@ -379,6 +380,19 @@ def universe_line(cfg, state_dir):
 
 def _pct(x):
     return "no data" if x is None else "%+.2f%%" % x
+
+
+def drift_line(state_dir, day, which):
+    """The drift shadow line for the phone, or None when the scan is off. Never raises: a missing,
+    old or broken shortlist (or drift.py itself) gives "no drift scan yet"."""
+    head = "Drift shortlist for tomorrow" if which == "closing" else "Drift would buy today"
+    try:
+        drift = _load("trader-broker", "drift")
+        cfg = t212._read_json(os.path.join(state_dir, "config.json"), {}) or {}
+        fn = drift.closing_line if which == "closing" else drift.briefing_line
+        return fn(state_dir, cfg, day)
+    except Exception:
+        return "%s (SHADOW: nothing is bought): no drift scan yet." % head
 
 
 def full_text(b):
@@ -437,6 +451,8 @@ def full_text(b):
             L.append("- %s: none of yours" % label)
         for e in rows or []:
             L.append("- %s: %s (%s), %s%s" % (label, e["symbol"], e["name"], e["when"], ", YOU HOLD IT" if e["held"] else ""))
+    if b.get("drift"):
+        L += ["", "## Post-earnings drift (shadow)", "- " + b["drift"]]
     L += ["", "## 5. To do, most urgent first"]
     names = {1: "NOW", 2: "before the open", 3: "today", 4: "note"}
     L += ["%d. [%s] %s" % (i, names[pr], t) for i, (pr, t) in enumerate(b["todo"], 1)]
@@ -485,6 +501,8 @@ def short_text(b, path):
     if b.get("universe"):
         head += " " + b["universe"].rstrip(".") + "."
     top = ["%d. %s" % (i, t) for i, t in enumerate(points, 1)]
+    if b.get("drift"):
+        top.append(b["drift"])
     return "\n".join([head] + top + ["Full briefing: %s" % os.path.relpath(path, ROOT)])
 
 

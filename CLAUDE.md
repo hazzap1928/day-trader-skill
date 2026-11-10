@@ -19,6 +19,7 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/t212.py` | Trading 212 API: reads, `place` (a typed yes in a terminal), `guard` (exits only), `budget`, `fx` |
 | `trader-broker/autopilot.py` | always-on demo autopilot: scan, Time Machine, size, risk, place; phone commands |
 | `trader-broker/phone.py` | the user's own Telegram bot: messages, Approve/Reject buttons, an outbox for failed sends |
+| `trader-broker/drift.py` | post-earnings drift **shadow** scan: shortlist, signal log, virtual results. No Trading 212 connection, never an order |
 | `trader-broker/evidence.py` | evidence mode (forward test): signal log, virtual results, slippage, Friday report |
 | `trader-broker/briefing.py`, `report.py` | 07:30 morning briefing; closing report from Trading 212's own fills |
 | `trader-broker/account_budget.py` | budget and loss limits from the account value, every trading morning |
@@ -49,12 +50,41 @@ The guard's protections:
   missing-stop check and the software-stop backup.
 - Tests: `tests/test_drift.py`.
 
+## Drift shadow scan (stage 2 of 4, from 10 Nov 2026): `trader-broker/drift.py`
+
+- **Shadow only.** It has no Trading 212 connection (a test checks the source and fails on any call).
+  It reads Nasdaq's earnings calendar and Yahoo daily bars, and writes only `trader/state/drift/`.
+  Demo only: it refuses when `paper` is not true. Stage 3 adds buying behind a switch; stage 4 turns it on.
+- **The rule** (research/pead_tracker.py, ranking B, 10 slots):
+  - a beat (EPS above forecast), surprise >= 10%, forecast >= $0.10 either side of zero, as tested
+    (`forecast_either_side: false` needs +$0.10)
+  - in the current universe (allowed_tickers when it is off or stale), not on blocked_tickers
+  - report on day D: virtual buy at the open of the 2nd trading day after D; virtual sell at the close
+    of the 20th trading day held (the buy day is day 1)
+  - ranked by (EPS - forecast) / price (the latest price; the buy-day open is recorded later)
+  - a virtual book of `slots` (10): shortlisted only when a slot is free on the buy day
+- **When:** the autopilot runs the scan once a day at `scan_at` (15:35 New York), or just before the
+  closing report if it missed that. After the report it fills in results. Errors are reported, never raised.
+- **Files:**
+  - `trader/state/drift/shortlist.json` is tomorrow's shortlist
+  - `signals.jsonl` holds every qualifying signal, shortlisted or not, with the source and when it
+    reported (Nasdaq leaves the time out for most past reports: "time not given")
+- **Results:** at 5, 10, 20 and 40 trading days, after 0.15% FX + 0.05% slippage each way, each
+  against SPY over the same dates (0.05% a leg). Only final closes (before today) are used.
+- **Untested extras, logged only, never used:** the report-day and reaction-day moves, volume against
+  the 20-day average, the highest gain and its day, the first day at +5/+10/+15%, and the 3xATR stop day.
+- **Phone:** "Drift shortlist for tomorrow" in the closing report and "Drift would buy today" in the
+  briefing, both marked SHADOW. A missing, out-of-date or broken shortlist says "no drift scan yet";
+  with the scan off there is no line.
+- **By hand:** `python3 trader-broker/drift.py scan|resolve|show`.
+- **Tests:** `tests/test_drift_scan.py`.
+
 ## Scheduling (launchd, `~/Library/LaunchAgents/com.daytraderskill.*.plist`)
 
 | Job | When | What |
 |---|---|---|
 | `caffeinate` | always (KeepAlive) | `caffeinate -s`: no sleep on mains power (a closed lid still sleeps the laptop) |
-| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, sends MARKET OPEN, scans every 15 min 09:45 to 15:30 New York, sends the closing report about 15:55 and the evidence report on Fridays |
+| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, sends MARKET OPEN, scans every 15 min 09:45 to 15:30 New York, runs the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results) and the evidence report on Fridays |
 | `t212-guard` | weekdays 13:00 UK | `run-guard.sh`: `t212.py budget --apply`, then `guard --watch` from the 09:30 open to 16:00 New York |
 | `briefing` | weekdays 07:30 UK | `run-briefing.sh`: the briefing; skips US holidays; retries its send for 30 min |
 
@@ -82,6 +112,7 @@ The guard's protections:
 - **Costs** (GBP account): 0.15% FX fee + 0.05% slippage on every buy and sell. Trading 212's API
   trades only in the primary currency, so a USD balance cannot avoid the fee for API orders.
 - **`autopilot`:** `auto_buy: true`, `evidence_mode: true`.
+- **`drift`:** `scan_enabled: true` since 10 Nov (shadow only; every threshold below is a setting).
 
 ## Evidence mode: the forward test (from 9 Nov 2026, no end date)
 
