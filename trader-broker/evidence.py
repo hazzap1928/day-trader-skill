@@ -12,6 +12,11 @@ With "autopilot": {"evidence_mode": true} (demo only; live refuses it):
   - Kronos (trader-kronos/, shadow mode) gives a verdict on each signal. It never blocks anything.
   - Each signal and trade carries list_from: "allowed_tickers" (the hand list, before the 10 Nov switch) or
     "universe" (the filtered universe). The Friday report shows the two separately.
+  - Each signal and trade also carries rules: "v1" (to 10 Nov: virtual results and the Time Machine
+    used a fixed 2R target, and the daily loss limit counted the full risk of every entry) or "v2"
+    (from 11 Nov: both model the real exit, the stop, the 1R trailing stop and the 15:50 close, and
+    the daily loss limit counts losses realised today plus risk still open at the stops). Rows logged
+    before the tag existed are v1. The Friday report shows the two separately.
   - Each Friday after the close, a report goes to the phone, every Friday with no end date.
 
 "evidence": {"start": "YYYY-MM-DD", "min_trades": 20}. There is no end date and no final PASS/FAIL day.
@@ -44,6 +49,10 @@ KRONOS_PY = os.path.join(KRONOS_DIR, ".venv", "bin", "python")
 KRONOS_SCRIPT = os.path.join(KRONOS_DIR, "kronos_shadow.py")
 KRONOS_TIMEOUT = 420                 # one verdict took 286 s on this Mac (Kronos-small, 10 paths, 69 steps)
 UNIVERSE_FROM = "2026-11-10"         # the day the filtered universe replaced allowed_tickers (evidence.universe_from)
+RULES = ("v1", "v2")
+RULES_NOW = "v2"                     # what this code logs: real-exit simulations, open-risk daily loss count
+RULES_NAMES = {"v1": "Old rules (2R target in the simulations, full-risk daily loss count)",
+               "v2": "New rules (real exit in the simulations, open-risk daily loss count)"}
 LISTS = ("allowed_tickers", "universe")
 LIST_NAMES = {"allowed_tickers": "Hand list (allowed_tickers)", "universe": "Filtered universe"}
 FEE, SLIP = 0.0015, 0.0005           # the GBP account: FX fee and assumed slippage, each fill
@@ -158,14 +167,22 @@ def list_of(rec, cfg=None):
     return "universe" if (rec.get("day") or "") >= universe_from(cfg) else "allowed_tickers"
 
 
+def rules_of(rec):
+    """"v1" or "v2": the rules a signal or trade was logged under. An untagged row is older than the tag: v1."""
+    tag = rec.get("rules")
+    return tag if tag in RULES else "v1"
+
+
 def tag_lists(sd, cfg=None):
-    """Tag every untagged signal and trade with list_from (before or after the universe switch). Returns how many."""
+    """Tag every untagged signal and trade with list_from (before or after the universe switch) and rules
+    (v1 before the real-exit change). Returns how many rows changed."""
     n = 0
     for name in ("signals", "trades"):
         rows = load(sd, name)
-        todo = [r for r in rows if r.get("list_from") not in LISTS]
+        todo = [r for r in rows if r.get("list_from") not in LISTS or r.get("rules") not in RULES]
         for r in todo:
             r["list_from"] = list_of(r, cfg)
+            r["rules"] = rules_of(r)
         if todo:
             _save(sd, name, rows)
             n += len(todo)
@@ -173,8 +190,10 @@ def tag_lists(sd, cfg=None):
 
 
 def log_signal(sd, rec):
-    """One scanner signal, traded or not. Returns its id. list_from says which ticker list it came from."""
+    """One scanner signal, traded or not. Returns its id. list_from says which ticker list it came from,
+    rules which rules it was logged under (this code: v2)."""
     rec = dict(rec)
+    rec.setdefault("rules", RULES_NOW)
     rec.setdefault("at", _now())
     rec["id"] = rec.get("id") or "%s-%s-%d" % (rec.get("day", ""), rec.get("symbol", ""), int(rec["at"]))
     append(sd, "signals", rec)
@@ -191,7 +210,7 @@ def update_signal(sd, sig_id, **fields):
 
 def log_trade(sd, rec):
     """A real order the autopilot placed: the expected entry price, for the slippage report."""
-    append(sd, "trades", dict(rec, at=rec.get("at") or _now()))
+    append(sd, "trades", dict(rec, at=rec.get("at") or _now(), rules=rec.get("rules") or RULES_NOW))
 
 
 # ---------------------------------------------------------------- virtual results
@@ -211,10 +230,27 @@ def _ny(ts):
     return t212().ticket_module().to_eastern(datetime.datetime.utcfromtimestamp(ts))
 
 
-def virtual_result(bars, at, entry_plan, stop, target, k=FEE + SLIP):
-    """What a market buy at the first bar after `at` would have done: stop first (a gap opens under it),
-    target first, else out at the 15:50 close. Stop and target in the same bar count as the stop.
+_TM = []
+
+
+def timemachine():
+    if not _TM:
+        _TM.append(_load("trader-timemachine", "timemachine"))
+    return _TM[0]
+
+
+def virtual_result(bars, at, entry_plan, stop, target, k=FEE + SLIP, exits=None):
+    """What a market buy at the first bar after `at` would have done.
+
+    exits None (v1 rows): stop first (a gap opens under it), target first, else out at the 15:50 close.
+    Stop and target in the same bar count as the stop.
+    exits (v2 rows, timemachine.exits_from(config)): the exit the guard really runs: the stop (a gap
+    sells at the open), the trailing stop from its activation profit, half at the target only if
+    sell_half_at_target is on, else out at the 15:50 close. "how" is "stop", "trailed out" or
+    "15:50 close". A half sale's price counts in R and in the costs.
     Returns {"entry", "exit", "how", "R", "R_net", "ret_net"} or None when there is no bar after `at`."""
+    if exits is not None:
+        return _virtual_real(bars, at, stop, target, k, exits)
     day = _ny(at).date()
     todays = [b for b in bars if _ny(b[0]).date() == day]
     after = [b for b in todays if b[0] >= at]
@@ -245,9 +281,40 @@ def virtual_result(bars, at, entry_plan, stop, target, k=FEE + SLIP):
             "R_net": round(R - cost / risk, 3), "ret_net": round(exit_ * (1 - k) / (entry * (1 + k)) - 1, 5)}
 
 
-def resolve(sd, day=None, fetch=None):
-    """Fill in the virtual result of every logged signal of `day` (default today, New York) that has none."""
+def _virtual_real(bars, at, stop, target, k, exits):
+    day = _ny(at).date()
+    todays = [b for b in bars if _ny(b[0]).date() == day]
+    after = [b for b in todays if b[0] >= at]
+    end = [b for b in todays if (_ny(b[0]).hour, _ny(b[0]).minute) < EOD]
+    if not after or not end:
+        return None
+    entry = after[0][1]
+    risk = entry - stop
+    if risk <= 0:
+        return {"entry": entry, "exit": None, "how": "opened under the stop", "R": None, "R_net": None,
+                "ret_net": None, "model": "real exit"}
+    walk = timemachine().GuardExit(entry, stop, target, exits)
+    n = 0
+    for b in after:
+        if (_ny(b[0]).hour, _ny(b[0]).minute) >= EOD:
+            break
+        walk.bar(*b[1:5])
+        n += 1
+    if not n:
+        return None
+    R, how = walk.result()
+    exit_ = entry + R * risk                  # the average exit price (a half sale included)
+    cost = k * (entry + exit_)
+    return {"entry": round(entry, 4), "exit": round(exit_, 4), "how": "15:50 close" if how == "close" else how,
+            "R": round(R, 3), "R_net": round(R - cost / risk, 3),
+            "ret_net": round(exit_ * (1 - k) / (entry * (1 + k)) - 1, 5), "model": "real exit"}
+
+
+def resolve(sd, day=None, fetch=None, cfg=None):
+    """Fill in the virtual result of every logged signal of `day` (default today, New York) that has none.
+    A v2 row uses the real exit from cfg (trailing_stop, eod_close); a v1 row keeps the fixed 2R target."""
     fetch = fetch or fetch_bars
+    exits = timemachine().exits_from(cfg) if cfg is not None else None
     day = day or _ny(_now()).date().isoformat()
     rows = load(sd, "signals")
     cache, done = {}, 0
@@ -258,7 +325,8 @@ def resolve(sd, day=None, fetch=None):
         try:
             if r["symbol"] not in cache:
                 cache[r["symbol"]] = fetch(r["symbol"])
-            v = virtual_result(cache[r["symbol"]], r["at"], r["entry"], r["stop"], r["target"])
+            v = virtual_result(cache[r["symbol"]], r["at"], r["entry"], r["stop"], r["target"],
+                               exits=exits if rules_of(r) == "v2" else None)
         except Exception as e:
             v = {"error": str(e)[:120]}
         if v is not None:
@@ -476,6 +544,22 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
                         "virtual_win": (100.0 * sum(1 for s in gv if s["virtual"]["R_net"] > 0) / len(gv)) if gv else None,
                         "days": (gdays[0], gdays[-1]) if gdays else None}
     r["by_list"], r["universe_from"] = groups, universe_from(cfg)
+    trade_rules = {}
+    for t in trades:
+        trade_rules[(t.get("day"), t.get("t212_ticker"))] = rules_of(t)
+    by_rules = {}
+    for name in RULES:
+        real = [c for c in closed if trade_rules.get((_ny_dt(c["entry_at"]), c.get("ticker")), "v1") == name]
+        gs = [s for s in sigs if rules_of(s) == name]
+        gv = [s for s in gs if (s.get("virtual") or {}).get("R_net") is not None]
+        gdays = sorted(set(s.get("day") for s in gs) | set(_ny_dt(c["entry_at"]) for c in real))
+        by_rules[name] = {"real": len(real), "real_avg_gbp": _mean([c["pl"] for c in real if c.get("pl") is not None]),
+                          "real_total_gbp": sum(c["pl"] for c in real if c.get("pl") is not None),
+                          "signals": len(gs), "virtual": len(gv),
+                          "virtual_avg_R": _mean([s["virtual"]["R_net"] for s in gv]),
+                          "virtual_win": (100.0 * sum(1 for s in gv if s["virtual"]["R_net"] > 0) / len(gv)) if gv else None,
+                          "days": (gdays[0], gdays[-1]) if gdays else None}
+    r["by_rules"] = by_rules
     k = {}
     for verdict in ("agree", "disagree"):
         vs = [s for s in virt if (s.get("kronos") or {}).get("verdict") == verdict]
@@ -537,6 +621,15 @@ def report_text(r):
             g["real"], _gbp(g["real_avg_gbp"]), _gbp(g["real_total_gbp"]), g["signals"], g["virtual"],
             "no data" if g["virtual_avg_R"] is None else "%+.3fR" % g["virtual_avg_R"],
             "no data" if g["virtual_win"] is None else "%.0f%%" % g["virtual_win"]))
+    for name in RULES:
+        g = (r.get("by_rules") or {}).get(name)
+        if not g or not (g["signals"] or g["real"]):
+            continue
+        lines.append("%s, %s: real %d closed, average %s, total %s; virtual %d logged, %d resolved, average %s, %s won" % (
+            RULES_NAMES[name], ("%s to %s" % g["days"]) if g["days"] else "no days",
+            g["real"], _gbp(g["real_avg_gbp"]), _gbp(g["real_total_gbp"]), g["signals"], g["virtual"],
+            "no data" if g["virtual_avg_R"] is None else "%+.3fR" % g["virtual_avg_R"],
+            "no data" if g["virtual_win"] is None else "%.0f%%" % g["virtual_win"]))
     lines.append("Demo money. Education and tooling, not financial advice.")
     return "\n".join(lines)
 
@@ -568,7 +661,7 @@ def main(argv=None, environ=None):
     rp = sub.add_parser("report", help="build the report now")
     rp.add_argument("--send", action="store_true", help="also send it to the phone")
     sub.add_parser("resolve", help="fill in today's virtual results now")
-    sub.add_parser("tag", help="tag untagged signals and trades as before or after the universe switch")
+    sub.add_parser("tag", help="tag untagged signals and trades: before or after the universe switch, and rules v1")
     a = ap.parse_args(argv)
     environ = os.environ if environ is None else environ
     T = t212()
@@ -578,7 +671,7 @@ def main(argv=None, environ=None):
             print("tagged %d rows" % tag_lists(a.state_dir, cfg))
             return 0
         if a.cmd == "resolve":
-            print("resolved %d signals" % resolve(a.state_dir))
+            print("resolved %d signals" % resolve(a.state_dir, cfg=cfg))
             return 0
         env = T.pick_env(False, environ)
         require_demo(cfg, env)

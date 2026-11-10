@@ -346,9 +346,14 @@ def pct(a, q):
     return a[min(len(a) - 1, int(q * len(a)))]
 
 
-def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy"):
-    """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py."""
+def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy", exits=None):
+    """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py.
+    exits (a Trading 212 config, see exits_from): every replay also walks the exit the guard really
+    runs (the stop, the trailing stop, half at the target if it is on, out at --until), and avg_R and
+    the verdict use that exit. The target-first and stop-first shares stay, for information."""
     long = side == "buy"
+    if exits is not None and not long:
+        raise TMError("the real-exit replay is for buys (long trades) only")
     risk = (entry - stop) if long else (stop - entry)
     r_target = round(((target - entry) if long else (entry - target)) / risk, 4)
 
@@ -357,15 +362,18 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
 
     rng = random.Random(seed)
     choice = rng.choice
-    outcomes, closes, paths = [], [], []
+    outcomes, closes, paths, real = [], [], [], []
     for n in range(replays):
         p = entry
         outcome = None
         keep = n < SAMPLE_PATHS
         path = [entry]
+        walk = GuardExit(entry, stop, target, exits) if exits is not None else None
         for i in range(k + 1, last + 1):
             o, h, l, c = choice(pool[slot(rng, i)])
             hi, lo, cl = p * h, p * l, p * c
+            if walk is not None:
+                walk.bar(p * o, hi, lo, cl)
             if outcome is None:
                 if long:
                     if lo <= stop:
@@ -382,6 +390,8 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
                 path.append(round(p, 2))
         outcomes.append(outcome or "close")
         closes.append(p)
+        if walk is not None:
+            real.append(walk.result())
         if keep:
             paths.append(path)
     cnt = {x: outcomes.count(x) for x in ("target", "stop", "close")}
@@ -389,6 +399,11 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
                 if o == "target" or (o == "close" and (p > entry if long else p < entry)))
     Rs = [r_target if o == "target" else -1.0 if o == "stop" else ((p - entry) if long else (entry - p)) / risk
           for o, p in zip(outcomes, closes)]
+    extra = {}
+    if exits is not None:
+        extra = real_summary(real, replays)
+        extra.update(exit_model="real", exits=exits, fixed_target_avg_R=round(statistics.mean(Rs), 3))
+        Rs = [r for r, _ in real]
     srt = sorted(closes)
     # percentile bands per bar for the fan chart: a second run of 2,000 paths, same seed
     rng = random.Random(seed)
@@ -420,8 +435,103 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
         "median_close": round(pct(srt, 0.5), 2), "p5_close": round(pct(srt, 0.05), 2),
         "p95_close": round(pct(srt, 0.95), 2), "avg_R": round(statistics.mean(Rs), 3),
         "r_at_target": r_target, "band_paths": BAND_PATHS, "bands": bands, "sample_paths": paths,
-        "hist": {"lo": round(lo_, 2), "hi": round(hi_, 2), "bins": bins},
+        "hist": {"lo": round(lo_, 2), "hi": round(hi_, 2), "bins": bins}, **extra,
     }
+
+
+# ---------------------------------------------------------------- the real exit (what t212.py guard does)
+
+def exits_from(cfg):
+    """The exits a Trading 212 trade really has, from the config, or None for any other broker
+    (a bracket order there has a real take-profit, so the fixed target is the real exit).
+    Trading 212 gets no take-profit order: a trade ends at the stop, at the trailing stop
+    ("trailing_stop"), half at the target only with sell_half_at_target (which needs the trail on,
+    as in the guard), or at the end-of-day close ("eod_close", 15:50 New York)."""
+    cfg = cfg or {}
+    if str(cfg.get("broker") or "").lower() not in ("trading212", "t212"):
+        return None
+    t = cfg.get("trailing_stop") or {}
+    trail = None
+    if isinstance(t, dict) and t.get("enabled"):
+        r, pc_ = t.get("distance_r"), t.get("distance_pct")
+        a = t.get("activate_r")
+        trail = {"distance_r": float(r) if r is not None else None,
+                 "distance_pct": float(pc_) if r is None and pc_ is not None else None,
+                 "activate_r": TRAIL_ACTIVATE_R if a is None else float(a)}
+        if trail["distance_r"] is None and trail["distance_pct"] is None:
+            trail = None
+    e = cfg.get("eod_close") or {}
+    eod = str(e.get("at") or "15:50") if isinstance(e, dict) and e.get("enabled") else None
+    return {"trail": trail, "half": bool(trail and t.get("sell_half_at_target")), "eod": eod}
+
+
+class GuardExit:
+    """One long trade, bar by bar, the way t212.py guard runs it on Trading 212.
+
+    In each bar the stop is checked first: a bar whose low reaches the stop sells there (at the
+    open, if the bar opens under it: a gap). Then the guard's 5-minute check at the bar's close:
+    half sold at the close when sell_half_at_target is on and the close is at or over the target;
+    the high-water mark is the highest close; once it is activate_r x risk over the entry the stop
+    is raised to the trail (distance_r x risk, or distance_pct, under it, down to the cent), never
+    lowered, never to within a cent of the price, and only by at least $0.05 or 0.1R. Whatever is
+    left is sold at the last bar's close (the 15:50 close)."""
+
+    def __init__(self, entry, stop, target, exits):
+        self.entry, self.stop0, self.target = entry, stop, target
+        self.risk = entry - stop
+        self.trail, self.half = exits.get("trail"), exits.get("half")
+        self.cur, self.hw, self.pos, self.got, self.half_done = stop, entry, 1.0, 0.0, False
+        self.last, self.how = entry, None
+        self.step = max(0.05, 0.1 * self.risk)
+
+    def bar(self, o, h, l, c):
+        if self.how is not None:
+            return
+        if l <= self.cur:
+            fill = min(self.cur, o)
+            self.got += self.pos * (fill - self.entry)
+            self.pos = 0.0
+            self.how = "stop" if self.cur <= self.stop0 + 1e-9 else "trailed out"
+            return
+        self.last = c
+        if not self.trail:
+            return
+        if c > self.hw:
+            self.hw = c
+        tr = self.trail
+        new = (_cent_down(self.hw - tr["distance_r"] * self.risk) if tr["distance_r"] is not None
+               else _cent_down(self.hw * (1 - tr["distance_pct"] / 100.0)))
+        new = max(new, self.cur)
+        if new >= c - 0.01:
+            new = self.cur
+        armed = self.hw + 1e-9 >= self.entry + tr["activate_r"] * self.risk
+        if not armed:
+            new = self.cur
+        if self.half and not self.half_done and self.target and c >= self.target:
+            self.got += 0.5 * (c - self.entry)
+            self.pos, self.half_done = 0.5, True
+            self.cur = new
+            return
+        if armed and new >= self.cur + self.step - 1e-9:
+            self.cur = new
+
+    def result(self):
+        """(R, how): how is "stop", "trailed out" or "close" (still open at the last bar)."""
+        got = self.got + self.pos * (self.last - self.entry) if self.how is None else self.got
+        return got / self.risk, self.how or "close"
+
+
+def real_summary(real, n):
+    """The real-exit numbers of a list of (R, how)."""
+    wins = [r for r, _ in real if r > 1e-9]
+    losses = [r for r, _ in real if r < -1e-9]
+    hows = [h for _, h in real]
+    return {"p_win": round(len(wins) / float(n), 4), "p_loss": round(len(losses) / float(n), 4),
+            "avg_win_R": round(statistics.mean(wins), 3) if wins else None,
+            "avg_loss_R": round(statistics.mean(losses), 3) if losses else None,
+            "p_out_stop": round(hows.count("stop") / float(n), 4),
+            "p_out_trail": round(hows.count("trailed out") / float(n), 4),
+            "p_out_close": round(hows.count("close") / float(n), 4)}
 
 
 # ---------------------------------------------------------------- stop rules and the history replay
@@ -448,7 +558,7 @@ def rule_stop(rule, oh, ol, entry, long):
     return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long)
 
 
-def history_replay(sessions, rule, last, side="buy"):
+def history_replay(sessions, rule, last, side="buy", exits=None):
     """The plan's rule on every past full session: entry = the first bar after the
     opening range to close beyond it (up to the --until bar), then stop first, then
     target, bar by bar, else the close at --until."""
@@ -477,8 +587,15 @@ def history_replay(sessions, rule, last, side="buy"):
         cl = D[last]["c"]
         R = ((t - e) if long else (e - t)) / risk if oc == "target" else -1.0 if oc == "stop" else \
             ((cl - e) if long else (e - cl)) / risk
-        trades.append({"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "stop": s, "target": t,
-                       "outcome": oc or "close", "R": round(R, 2)})
+        row = {"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "stop": s, "target": t,
+               "outcome": oc or "close", "R": round(R, 2)}
+        if exits is not None and long:
+            walk = GuardExit(e, s, t, exits)
+            for b in D[kk + 1:last + 1]:
+                walk.bar(b["o"], b["h"], b["l"], b["c"])
+            rr, how = walk.result()
+            row.update(fixed_target_R=row["R"], R=round(rr, 2), exit=how)
+        trades.append(row)
     return {
         "sessions": len(sessions), "triggered": len(trades),
         "target": sum(1 for x in trades if x["outcome"] == "target"),
@@ -630,7 +747,21 @@ def _until12(mc):
 
 def lean(mc):
     """(gap, share, break_even): the target's share of the replays that hit one side,
-    minus the share that breaks even at the target's R. None when nothing hit a side."""
+    minus the share that breaks even at the target's R. None when nothing hit a side.
+
+    On the real exit (mc["exit_model"] == "real") the same rule, with the real results: the share
+    of replays that made money among those that made or lost money, minus the share that breaks
+    even at their average win and average loss, avg loss / (avg win + avg loss). With wins of +R
+    and losses of -1R only, that is 1 / (1 + R), the fixed-target rule exactly. It is above zero
+    exactly when the average R (before costs) of those replays is above zero."""
+    if mc.get("exit_model") == "real":
+        pw, pl = mc.get("p_win") or 0, mc.get("p_loss") or 0
+        if pw + pl <= 0:
+            return None
+        aw, al = mc.get("avg_win_R") or 0.0, abs(mc.get("avg_loss_R") or 0.0)
+        share = pw / (pw + pl)
+        even = al / (aw + al) if aw + al > 0 else 0.5
+        return share - even, share, even
     pt, ps = mc["p_target"], mc["p_stop"]
     if pt + ps <= 0:
         return None
@@ -639,8 +770,37 @@ def lean(mc):
     return share - even, share, even
 
 
+def exit_words(mc):
+    """The real exit in a few words, e.g. "stop, 1R trail from 1R profit, out at 15:50"."""
+    ex = mc.get("exits") or {}
+    t = ex.get("trail")
+    parts = ["stop"]
+    if t:
+        parts.append("%s trail from %gR profit" % (("%gR" % t["distance_r"]) if t.get("distance_r") is not None
+                                                   else ("%g %%" % t["distance_pct"]), t["activate_r"]))
+    if ex.get("half"):
+        parts.append("half at the target")
+    parts.append("out at %s" % mc.get("until", "the close"))
+    return ", ".join(parts)
+
+
 def verdict(mc):
     """One line from the numbers, see the docstring for the thresholds."""
+    if mc.get("exit_model") == "real":
+        lv = lean(mc)
+        if lv is None:
+            return "No replay made or lost money on the real exit (%s)." % exit_words(mc)
+        d, share, even = lv
+        if abs(d) < COIN_FLIP:
+            head = "Close to break-even"
+        elif abs(d) < STRONG:
+            head = "Leans toward a profit" if d > 0 else "Leans toward a loss"
+        else:
+            head = "Strongly toward a profit" if d > 0 else "Strongly toward a loss"
+        return ("%s on the real exit (%s): %.0f %% of the replays that made or lost money made it; "
+                "%.0f %% breaks even at their average win %s and loss %s." % (
+                    head, exit_words(mc), 100 * share, 100 * even,
+                    "%+.2fR" % (mc.get("avg_win_R") or 0), "%+.2fR" % (mc.get("avg_loss_R") or 0)))
     pt, ps = mc["p_target"], mc["p_stop"]
     lv = lean(mc)
     if lv is None:
@@ -665,6 +825,11 @@ def verdict(mc):
 def verdict_notes(mc):
     """The lines printed right below the verdict, so nothing reads as one-sided."""
     notes = []
+    if mc.get("exit_model") == "real":
+        return ["Out by: the first stop %s, the trailing stop %s, still open at %s %s. Average R %+.3f "
+                "(%+.3f if a fixed target had been the exit)." % (
+                    pc(mc["p_out_stop"]), pc(mc["p_out_trail"]), mc.get("until", "the close"),
+                    pc(mc["p_out_close"]), mc["avg_R"], mc.get("fixed_target_avg_R") or 0)]
     pn = mc.get("p_neither", 0)
     if pn > MANY_NEITHER and lean(mc) is not None:
         notes.append("%.1f %% of the replays hit neither by %s; the price at %s decides those."
@@ -676,8 +841,10 @@ def verdict_notes(mc):
     return notes
 
 
-def prepare(text, plan, now_utc, until=None):
-    """The data a replay needs: bars, the entry bar k, the last bar, past full sessions, the pool."""
+def prepare(text, plan, now_utc, until=None, exits=None):
+    """The data a replay needs: bars, the entry bar k, the last bar, past full sessions, the pool.
+    With exits that have an end-of-day close (15:50), the replay ends there, never later than
+    --until; on a 1:00 p.m. early close it ends at the close."""
     sym = plan["symbol"]
     result = chart_result(text, sym)
     meta, bars, dropped = parse_bars(result, now_utc)
@@ -693,6 +860,8 @@ def prepare(text, plan, now_utc, until=None):
     early = plan["date"] in NYSE_EARLY_CLOSE
     end_min = EARLY_MIN if early else CLOSE_MIN
     until_min = end_min if until is None else parse_clock(until, "--until")
+    if exits and exits.get("eod"):
+        until_min = min(until_min, parse_clock(exits["eod"], "eod_close.at"), end_min)
     if (until_min - OPEN_MIN) % 5 or until_min > end_min:
         raise TMError("--until must be on the 5-minute grid and no later than %s%s"
                       % (clock12(end_min), " (an early close)" if early else ""))
@@ -722,17 +891,21 @@ def prepare(text, plan, now_utc, until=None):
             "short": short, "pool": pool}
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
-    """Chart JSON text + a normalized plan -> the timemachine.json document."""
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo", exits=None):
+    """Chart JSON text + a normalized plan -> the timemachine.json document.
+    exits: see exits_from (None = the fixed target is the exit)."""
+    if exits is not None and plan["side"] != "buy":
+        exits = None
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
     if not 0 <= window <= 10:
         raise TMError("--window must be between 0 and 10 bars")
-    P = prepare(text, plan, now_utc, until)
+    P = prepare(text, plan, now_utc, until, exits)
     sym, msym, bars, dropped, k, last = P["sym"], P["msym"], P["bars"], P["dropped"], P["k"], P["last"]
     until_min, entry_day, warn, sessions, short, pool = (P["until_min"], P["entry_day"], P["warn"],
                                                          P["sessions"], P["short"], P["pool"])
-    mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"])
+    mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"],
+                  exits)
     mc = dict(mc, until=clock24(until_min), pool_sessions=len(sessions), pool_from=sessions[0][0],
               pool_to=sessions[-1][0],
               band_times=[clock24(OPEN_MIN + 5 * (j + 1)) for j in range(k, last + 1)])
@@ -740,7 +913,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     plan_out = {kk: v for kk, v in plan.items() if v is not None}
     if rule:
         plan_out["stop_rule"] = rule["stop_rule"]
-        history = history_replay(sessions, rule, last, plan["side"])
+        history = history_replay(sessions, rule, last, plan["side"], exits)
     else:
         history = {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [],
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
@@ -756,7 +929,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "plan": plan_out,
         "mc": mc,
         "history": history,
-        "verdict": verdict(mc),
+        "verdict": verdict(dict(mc, until=clock24(until_min))),
         "verdict_notes": verdict_notes(mc),
         "warnings": warn,
         "note": ("A simulation built from %s's own last %d full sessions. It is not a prediction: earnings, "
@@ -1066,8 +1239,10 @@ def report(doc):
         "",
         "  Price at %s: median %.2f, 90 %% of replays between %.2f and %.2f."
         % (until, m["median_close"], m["p5_close"], m["p95_close"]),
-        "  Average R: %+.3f (R = the %.2f risk: %sR at the target, -1R at the stop)."
-        % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]), ),
+        ("  Average R: %+.3f on the real exit (%s; R = the %.2f risk)."
+         % (m["avg_R"], exit_words(m), p["risk_per_share"])) if m.get("exit_model") == "real" else
+        ("  Average R: %+.3f (R = the %.2f risk: %sR at the target, -1R at the stop)."
+         % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]), )),
         "",
     ]
     if h.get("rule"):
@@ -1077,9 +1252,10 @@ def report(doc):
                                                            "%.2f %% from the entry" % ru.get("stop_pct", 0))
         if h["triggered"]:
             lines.append("History: the same rule (%d-min opening range, stop at the %s, %gR target) on each of "
-                         "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R %+.3f."
+                         "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R %+.3f%s."
                          % (ru["or_minutes"], stop_words, ru["target_r"], h["sessions"], h["triggered"],
-                            h["target"], h["stop"], h["close"], h["avg_R"]))
+                            h["target"], h["stop"], h["close"], h["avg_R"],
+                            " on the real exit" if m.get("exit_model") == "real" else ""))
         else:
             lines.append("History: the same rule never fired in those %d sessions." % h["sessions"])
     else:
@@ -1163,13 +1339,14 @@ def read_cfg(path):
 def compute(a):
     now = parse_now(a.now)
     plan = load_plan(a, now)
-    costs = costs_from(read_cfg(getattr(a, "config", None) or "trader/config.json"),
-                       getattr(a, "fee_pct", None), getattr(a, "slip_pct", None))
+    cfg = read_cfg(getattr(a, "config", None) or "trader/config.json")
+    costs = costs_from(cfg, getattr(a, "fee_pct", None), getattr(a, "slip_pct", None))
     if a.offline:
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return apply_costs(time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source), costs)
+    return apply_costs(time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source,
+                                    exits_from(cfg)), costs)
 
 
 def cmd_run(a):

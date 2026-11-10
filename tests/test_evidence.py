@@ -209,7 +209,7 @@ class Pilot(PilotBase):
     def test_friday_after_the_close_resolves_and_sends_the_report(self):
         sent = []
         saved = (ev.resolve, ev.send_report)
-        ev.resolve = lambda sd: 3
+        ev.resolve = lambda sd, **k: 3
         ev.send_report = lambda *a, **k: sent.append(1) or (True, "text", {"status": "ON TRACK"})
         try:
             self.clock[0] = calendar.timegm((2026, 11, 6, 21, 0, 0))           # Friday 16:00 New York

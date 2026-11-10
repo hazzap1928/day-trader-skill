@@ -536,10 +536,34 @@ class Pilot(object):
                 "tm": {"p_target": mc.get("p_target"), "p_stop": mc.get("p_stop"), "verdict": doc.get("verdict") or "",
                        "avg_R": mc.get("avg_R"), "avg_R_net": (doc.get("costs") or {}).get("mc_avg_R_net")}}
 
+    def day_risk(self):
+        """With "daily_loss_count": "open_risk": today's realised losses and open risk at the stops, from
+        Trading 212 (read-only), into trader/state/day-risk.json for trader-risk. On any failure the file
+        is removed, so trader-risk counts the old, stricter way (full risk of every entry today)."""
+        dr = mod("trader-broker", "day_risk")
+        try:
+            if dr.count_of(self.cfg) != "open_risk":
+                return
+        except ValueError:
+            return                               # trader-risk refuses the bad setting with the reason
+        report = mod("trader-broker", "report")
+        report.t212, report.tk = t212, tk
+        try:
+            dr.build(self.client, self.sd, _ny().date().isoformat(), report_mod=report)
+        except Exception as e:
+            self.say("day risk: could not be read from Trading 212 (%s); the daily loss counts the old way"
+                     % t212.scrub(e, self.client._secrets))
+            try:
+                os.remove(dr.path(self.sd))
+            except OSError:
+                pass
+
     def risk(self):
+        self.day_risk()
         self.run(["trader-risk/check.py", "--orders", self.p("orders.json"), "--config", self.p("config.json"),
                   "--portfolio", self.p("portfolio.json"), "--prices", self.p("prices.json"), "--fx", self.p("fx.json"),
-                  "--state", self.p("state", "broker.json"), "--out", self.p("state", "risk.json")], "trader-risk")
+                  "--state", self.p("state", "broker.json"), "--day-risk", self.p("state", "day-risk.json"),
+                  "--out", self.p("state", "risk.json")], "trader-risk")
         doc = t212._read_json(self.p("state", "risk.json"), {}) or {}
         res = [r for r in doc.get("results") or [] if r.get("index") == 1]
         if doc.get("date") != _ny().date().isoformat() or not res:
@@ -943,7 +967,7 @@ class Pilot(object):
     def evidence_close(self, report):
         """After the closing report: today's virtual results, and every Friday the report."""
         try:
-            n = evidence.resolve(self.sd)
+            n = evidence.resolve(self.sd, cfg=self.cfg)
             self.say("evidence: %d virtual results filled in" % n)
             ny = _ny()
             if evidence.due(self.cfg, ny.date().isoformat(), ny.weekday()):

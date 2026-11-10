@@ -1,7 +1,7 @@
 # How the demo trading agent works
 
 A plain-English walk through the Trading 212 demo autopilot, from the market data it reads to the
-order it sends and how that order is closed. Every number here is the setting in use on 10 Nov 2026,
+order it sends and how that order is closed. Every number here is the setting in use from 11 Nov 2026,
 taken from the code and `trader/config.json`. Where a number is a setting, the setting name is given
 in `code` so it can be checked or changed.
 
@@ -33,7 +33,7 @@ universe  ->  scanner  ->  entry check  ->  exit plan  ->  Time Machine  ->  siz
 | Scanner | `trader-scanner/scan.py orb` | Which of them closed a 5-minute bar above their opening range? |
 | Entry check | `trader-entry/entry.py` | Is the breakout real, inside the entry window, and what was the trigger price? |
 | Exit plan | `trader-exit/exit.py` | Where are the stop and the target? |
-| Time Machine | `trader-timemachine/timemachine.py` | On 10,000 simulated sessions, does this plan lean toward the target or the stop? |
+| Time Machine | `trader-timemachine/timemachine.py` | On 10,000 simulated sessions, exited the way real trades are, do the wins outweigh the losses? |
 | Sizing | `trader-budget/size.py` | How many shares, given the budget, cash buffer, position cap and max loss? |
 | Risk gate | `trader-risk/check.py` | Does the order break any rule: daily loss, trade count, lists, reward:risk after costs, time window? |
 | Placing | `trader-broker/autopilot.py`, `t212.py place` | Is the price still close enough to the plan, and does it still pass? Then buy, then set the stop. |
@@ -180,8 +180,9 @@ the order goes in. Step 9's chase check protects against buying too far above it
 The plan is refused if the stop is at or above the entry, or if the risk is under **0.05% of the
 price** (too tight to survive normal noise and the spread).
 
-Important: see section 11. The 2R target is used by the checks and the simulations, but it is **not
-sent to Trading 212 as an order**. Real exits are the stop, the trailing stop, or the 15:50 close.
+Important: see section 11. The 2R target is used by the reward:risk checks, but it is **not sent to
+Trading 212 as an order**. Real exits are the stop, the trailing stop, or the 15:50 close, and since
+11 Nov the simulations (section 9) model exactly that.
 
 ---
 
@@ -198,26 +199,45 @@ sent to Trading 212 as an order**. Real exits are the stop, the trailing stop, o
 3. Run **10,000 replays** (fixed seed 19, so results repeat exactly). Each one starts at the entry and
    walks the rest of the day, picking for each bar a random past bar from roughly the same time of
    day (plus or minus 2 slots) and scaling it to the current price.
-4. In every bar the **stop is checked before the target**, so a bar that touches both counts as a
-   loss (the cautious call). A replay ends at the target (+2R), the stop (-1R), or at 15:55 at
-   whatever price it reached.
-5. Separately, the same rule is re-run on each of those past sessions as a history check.
+4. **Each replay is exited the way the guard exits a real trade** (since 11 Nov), bar by bar:
+   - the stop is checked first in every bar. A bar whose low reaches it sells at the stop, or at
+     the bar's open if it opens below the stop (a gap);
+   - then the guard's 5-minute check at the bar's close. Once the highest close is **1R above the
+     entry**, the stop is raised to **1R under that highest close**. It is never lowered, never put
+     within a cent of the price, and only raised in steps of at least $0.05 or 0.1R;
+   - **half at the target** happens only if `sell_half_at_target` is switched on (it is off), and
+     then, as in the guard, only with the trailing stop on;
+   - whatever is still open is sold at the **15:50 close**.
+   There is no fixed 2R take-profit in the replay, because there is none in real trading. With the
+   half sale off, the target's position makes no difference to the result.
+5. Separately, the same rule and the same real exit are re-run on each of those past sessions as a
+   history check.
 
 **Costs:** each replay's average R is reduced by the Trading 212 costs: **0.15% FX fee plus 0.05%
 slippage on both the buy and the sell** (about 0.4% a round trip), expressed in R. A tight stop makes
 the same 0.4% a bigger share of R.
 
-**The decision rule (`autopilot.min_edge` = 0):**
+**The decision rule (`autopilot.min_edge` = 0), calculated on the real exit:**
 
-- Among replays that hit either the target or the stop, take the share that hit the target first.
-- Compare it with the share needed to break even at the target's R: 1 / (1 + R), which is **33% at
-  2R**.
-- The plan goes on only if the target's share is **above** that break-even share.
-- Labels: within 5 points is "close to break-even", 5 to 15 points "leans", 15 or more "strongly".
+- Take the replays that made money and the ones that lost money (a replay that ended exactly flat
+  is left out).
+- The **winning share** is the winners' share of those.
+- The **break-even share** is the share of winners needed to break even, given how big the average
+  win and the average loss were: average loss / (average win + average loss). For example, with an
+  average win of +0.7R and an average loss of -0.7R it is 50%; with +1.3R and -1.0R it is 43%.
+- The plan goes on only if the winning share is **above** the break-even share. In plain terms: the
+  average replay, before costs, must make money.
+- Labels: within 5 points is "close to break-even", 5 to 15 points "leans toward a profit/loss", 15
+  or more "strongly toward a profit/loss".
 
-**The cost block (`autopilot.min_net_r`):** normally the average R *after costs* must be above 0 or the
-plan stops here. **In evidence mode this block is switched off**: a negative after-costs average is
-logged (`cost_block_ignored`) but does not stop the trade. The before-costs lean above still applies.
+This is the same rule as before. Before 11 Nov the only outcomes were "target" (+2R) and "stop"
+(-1R), and the break-even share was then 1 / (1 + 2) = 33%. The old target-first and stop-first
+odds are still worked out and shown, for information only.
+
+**The cost block (`autopilot.min_net_r`):** normally the average R *after costs*, on the real exit,
+must be above 0 or the plan stops here. **In evidence mode this block is switched off**: a negative
+after-costs average is logged (`cost_block_ignored`) but does not stop the trade. The before-costs
+rule above still applies.
 
 A simulation built from 60 days of the stock's own bars is not a prediction. Earnings, news and halts
 can do things those 60 days never did.
@@ -258,7 +278,7 @@ Each order gets PASS or BLOCK with every reason listed. An entry is blocked by a
 | Max loss | Shares x (entry minus stop) must not exceed 1% of the account. The entry used is the higher of the plan and a fresh quote |
 | Reward:risk | (target minus entry) / (entry minus stop) at least **1.5** |
 | Reward:risk after costs | With the 0.15% + 0.05% each way taken off the reward and added to the risk, at least **1.0** in evidence mode (otherwise the same 1.5) |
-| Daily loss | The **max losses at the stops** of every entry placed today, plus this one, must not exceed 3% of the start-of-day value. Each counts in full, win or lose |
+| Daily loss | Losses **already realised today**, plus the risk **still open at the stops**, plus this trade's max loss, must not exceed 3% of the start-of-day value (see below) |
 | Trades a day | At most **5** entries a day (`max_trades_per_day`) |
 | Orders a day | At most **10** orders a day (`max_orders_per_day`) |
 | Duplicates | The same stock and side already placed today: blocked |
@@ -266,9 +286,27 @@ Each order gets PASS or BLOCK with every reason listed. An entry is blocked by a
 | Cash | The buy would dip into the 10% cash buffer or need margin |
 | Time window | Before 09:45, after 15:30, or the market closed (weekend, holiday, early close) |
 
-A consequence worth knowing: because the daily-loss check counts each trade's full risk (1%) whether
-it won or not, at most about **3 full-size trades** fit in a day, even though the trade limit is 5.
-Smaller trades (sized down by the cash or position cap) leave room for more.
+**How the daily loss is counted** (`daily_loss_count`, `open_risk` since 11 Nov). Before each risk
+check the autopilot reads Trading 212 (positions, pending orders and today's fills; read-only) and
+writes `trader/state/day-risk.json`. For each entry placed today:
+
+- **Closed at a loss:** its realised loss, after the FX fees, counts.
+- **Closed at a profit:** counts nothing. Its risk is freed, but its profit does not add room for
+  extra risk either.
+- **Still open:** shares held x (price paid minus the stop it has now, plus the FX fee each way)
+  counts. The stop it has now is the stop order at Trading 212, else the guard's software stop,
+  else the planned stop. Once the trailing stop is at or above the price paid, it counts 0.
+- **Not showing yet** (not filled, or the history is slow): its full planned max loss counts.
+
+If that file is missing, broken, not today's, or over 15 minutes old, the check falls back to the old
+count (the full max loss of every entry today, win or lose) and says so. The 3% cap is unchanged.
+`"daily_loss_count": "full_risk"` brings the old count back for good.
+
+What this means in practice: each new trade still needs 1% of room (its max loss). The day is shut
+for new trades once the realised losses plus the open risk are over 2%. So the limit now stops new
+trades after about **three full-size losses**, or when about three full-size trades are open with
+their stops still under the price paid. Days with winners or small losses run into the
+**5-trades-a-day limit** instead. Under the old count, any three trades used up the 3%, wins included.
 
 The verdict is saved with a fingerprint of the exact order. Nothing can be placed unless **that exact
 order** passed today.
@@ -323,7 +361,7 @@ to 16:00:
   old stop and places a new one; if the new one is refused, the old one is put back.
 - **Half at target** (`sell_half_at_target`) is **off**. So the 2R target is not an exit by itself.
   A trade that reaches 2R has a stop trailing 1R under its high, and is closed by that stop or by the
-  end-of-day close.
+  end-of-day close. The Time Machine and the virtual results model exactly this (section 9).
 - **End-of-day close at 15:50:** for every intraday (or unlabelled) position, cancel its stop, confirm
   the cancel, then **sell at market**. A drift position is kept until its sell date. A position with
   no buy record at all is **not sold**: it raises a GUARD ALERT for the owner to deal with.
@@ -339,9 +377,13 @@ Stop prices are a plan, not a guarantee: a gap or fast market can fill past them
 - Every triggered signal is logged to `trader/state/evidence/signals.jsonl` with its reason, traded or
   not, and whether it came from the hand list or the universe.
 - After the close each signal gets a **virtual result**: a market buy at the first bar after the
-  signal, then stop first, target first, or out at 15:50, after the same 0.4% round-trip costs. Note
-  this uses the **fixed 2R target**, while real trades use the trailing stop, so virtual and real
-  results measure slightly different exits.
+  signal, then the **same real exit as the Time Machine** (stop, 1R trailing stop from 1R profit,
+  out at 15:50), after the same 0.4% round-trip costs.
+- **Old and new rules are kept apart.** Every signal and trade has a `rules` tag: `v1` for rows up
+  to 10 Nov (fixed 2R target in the simulations, full-risk daily loss count) and `v2` from 11 Nov
+  (real exit, open-risk count). v1 rows keep their old fixed-target virtual results, so the two
+  periods are measured as they were run. The Friday report shows each on its own line, as it does
+  for the hand list and the universe.
 - Real trades are logged with the expected price, so actual slippage can be compared with the 0.05%
   assumed.
 - The Friday report shows ON TRACK only if the **average real trade after costs is positive AND
@@ -374,7 +416,7 @@ the unseen 2024 to 2026 period.
 - **Stops are mandatory** and checked one minute after placing and on every guard pass, with a
   software stop as a backup.
 - **No retries:** a failed or unclear order is never resent automatically; "unclear" raises an alarm.
-- **Limits:** 1% max loss a trade, 3% at risk a day, 5 entries a day, 10 orders a day, 10% cash
+- **Limits:** 1% max loss a trade, 3% a day (losses realised plus risk open at the stops), 5 entries a day, 10 orders a day, 10% cash
   kept, one trade per stock per day, no new entries after 15:30, everything intraday closed at 15:50.
 - **Slow cycles:** a cycle that has used 75% of its 15 minutes stops building new trades (they wait
   for the next cycle); over 80% triggers a phone warning.
@@ -389,9 +431,13 @@ the unseen 2024 to 2026 period.
 - **The rule has no proven edge.** About -0.03R before costs and about -0.65R after costs in the
   research; nothing beat holding an S&P 500 tracker. Evidence mode deliberately relaxes the cost
   checks to collect real data, so it is expected to lose money on the demo.
-- **Simulation and reality differ on exits.** The Time Machine and the virtual results assume a fixed
-  2R take-profit, but no take-profit order is placed: real trades exit by stop, trailing stop or the
-  15:50 close. The simulations also run to 15:55, while the real close is at 15:50.
+- **The simulated exit is an approximation.** Since 11 Nov the Time Machine and the virtual results
+  exit the way the guard does, but on 5-minute bars: the guard really sees the price every 5
+  minutes, and a real stop can fill worse than its price in a fast market. Before 11 Nov (rules v1)
+  they assumed a fixed 2R take-profit and, for the Time Machine, a 15:55 close.
+- **The open-risk daily count depends on Trading 212's history.** If it cannot be read, the check
+  falls back to the stricter old count. A loss realised in the last minute or so may not show yet;
+  until it does, that entry still counts its open risk at the stop.
 - **Costs dominate small stops.** The 0.4% round trip is fixed in price terms, so on a tight
   opening-range stop it can be a large share of 1R.
 - **Free data.** Yahoo and Nasdaq can lag, change or go missing. Missing bars mean a stock is skipped,

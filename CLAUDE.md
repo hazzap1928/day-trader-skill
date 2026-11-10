@@ -23,6 +23,7 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/evidence.py` | evidence mode (forward test): signal log, virtual results, slippage, Friday report |
 | `trader-broker/briefing.py`, `report.py` | 07:30 morning briefing; closing report from Trading 212's own fills |
 | `trader-broker/account_budget.py` | budget and loss limits from the account value, every trading morning |
+| `trader-broker/day_risk.py` | today's realised losses plus risk still open at the stops, for the daily loss limit (`state/day-risk.json`) |
 | `trader-broker/netwait.py` | no internet: check every 2 min for up to 30, then a BACK ONLINE message saying what was missed |
 | `trader-broker/go_live.py` | the user's own switch to live (checklist in `GO_LIVE.md`). **Claude never runs it** |
 | `trader-kronos/` | Kronos-small forecasts, **shadow only**; own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
@@ -79,6 +80,30 @@ The guard's protections:
 - **By hand:** `python3 trader-broker/drift.py scan|resolve|show`.
 - **Tests:** `tests/test_drift_scan.py`.
 
+## Real exit and the daily loss count (from 11 Nov 2026)
+
+- **Simulations use the real exit.** On a Trading 212 config (`broker` trading212) the Time Machine
+  and the evidence virtual results walk each trade the way the guard runs it: `timemachine.GuardExit`
+  (stop checked first in each bar, a gap fills at the open; the trail starts at `activate_r` from the
+  highest 5-minute close, 1R under it, never lowered, raised by at least $0.05 or 0.1R; half at the
+  target only with `sell_half_at_target`, which needs the trail on; out at the 15:50 close). There is
+  no fixed target exit. `timemachine.exits_from(cfg)` reads the exits; any other broker keeps the
+  fixed target. The replay ends at `eod_close.at` (15:50) even when `--until` is later.
+- **The go/no-go rule is the same rule on the real exit:** the share of replays that made money
+  (among those that made or lost money) must beat the break-even share at their average win and
+  loss, avg loss / (avg win + avg loss). That is exactly "average R before costs above 0". The cost
+  block (`min_net_r`) uses the real-exit average too (off in evidence mode). `p_target`/`p_stop`
+  are still reported, for information.
+- **Daily loss count** (`"daily_loss_count"` in the config): `"open_risk"` (on, demo) counts losses
+  realised today (net per entry, after FX fees, from Trading 212's fills; a closed winner counts 0)
+  plus risk still open at each held entry's current stop (stop order, else software stop, else the
+  planned stop; 0 once the stop is at or over the price paid). An entry not seen yet counts its full
+  max loss. `"full_risk"` (the default when the key is missing) is the old count: the full max loss
+  of every entry today. The autopilot writes `trader/state/day-risk.json` before each risk check;
+  trader-risk falls back to the old count (with a warning) if it is missing, broken, not today's,
+  or over 15 minutes old. On a failed read the autopilot deletes it. The 3% cap is unchanged.
+- **Tests:** `tests/test_real_exit.py`.
+
 ## Scheduling (launchd, `~/Library/LaunchAgents/com.daytraderskill.*.plist`)
 
 | Job | When | What |
@@ -100,7 +125,8 @@ The guard's protections:
   trailing stop 1R (from 1R profit), `eod_close` 15:50.
 - **`account_budget` on:**
   - `budget_gbp` = the account value with `cash_buffer_pct` 10, so 90% can be invested
-  - max loss 1% a trade, 3% a day of the start-of-day value
+  - max loss 1% a trade, 3% a day of the start-of-day value; `daily_loss_count` `open_risk`
+    since 11 Nov (losses realised today + risk open at the stops; `full_risk` is the old count)
   - no `max_budget_gbp` cap
 - **Trading rules:** `max_trades_per_day` 5, `min_reward_risk` 1.5, entries 09:45 to 15:30 New York.
 - **Lists:** `allowed_tickers` holds 100 liquid large caps and ETFs (US-listed ETFs are mostly not
@@ -128,6 +154,9 @@ The guard's protections:
   costs added after the close. Real orders go to `trades.jsonl` with the expected price, for slippage.
   Each row has `list_from`: `allowed_tickers` (the hand list, 9 Nov) or `universe` (from 10 Nov);
   `evidence.py tag` tags old rows by day (`evidence.universe_from`, default 2026-11-10).
+  Each row also has `rules`: `v1` (to 10 Nov: fixed 2R target in the simulations, full-risk daily
+  loss count) or `v2` (from 11 Nov: real exit, open-risk count). New rows are logged `v2`; untagged
+  rows are `v1` (`evidence.py tag` writes it). v1 rows keep their fixed-target virtual result.
 - **Kronos** gives a verdict on each signal it has time for, up to 9 min a cycle, traded signals first.
   One verdict takes about 5 min on this Mac, so most signals are "skipped". It never blocks anything.
   Before 10 Nov every verdict was "error": the model loader printed to stdout before the JSON.
@@ -137,6 +166,7 @@ The guard's protections:
   - the return against an S&P 500 tracker
   - Kronos agree against disagree
   - hand list and universe results on separate lines
+  - old rules (v1) and new rules (v2) results on separate lines
 - **Running status, no final PASS/FAIL day:** each Friday shows ON TRACK or NOT ON TRACK for "this
   week" (Monday, or the start, to Friday) and "since the start", each with its closed-trade count.
   ON TRACK = a positive average per real trade after costs AND beating the tracker over the same days.

@@ -535,11 +535,43 @@ def day_trades(state, today):
 
 # ---------------------------------------------------------------- the check
 
-def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None):
+DAY_RISK_MAX_AGE = 15 * 60     # seconds: an older trader/state/day-risk.json is not used
+LOSS_COUNTS = ("full_risk", "open_risk")
+
+
+def loss_count(c):
+    """"full_risk" (the default) or "open_risk", from "daily_loss_count" in the config."""
+    m = str(c.get("daily_loss_count") or "full_risk").strip().lower()
+    if m not in LOSS_COUNTS:
+        raise RiskError("daily_loss_count in trader/config.json must be \"open_risk\" or \"full_risk\"")
+    return m
+
+
+def day_risk_usable(doc, today, now_utc):
+    """(True, "") when trader/state/day-risk.json is for today and fresh, else (False, why)."""
+    if not isinstance(doc, dict) or not doc:
+        return False, "no trader/state/day-risk.json"
+    if doc.get("date") != today:
+        return False, "trader/state/day-risk.json is for %s, not today" % doc.get("date")
+    built = doc.get("built_at")
+    if not isinstance(built, (int, float)):
+        return False, "trader/state/day-risk.json has no build time"
+    now_ts = (now_utc - datetime.datetime(1970, 1, 1)).total_seconds()
+    if not -60 <= now_ts - built <= DAY_RISK_MAX_AGE:
+        return False, "trader/state/day-risk.json is %d minutes old" % ((now_ts - built) // 60)
+    return True, ""
+
+
+def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None,
+          day_risk=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
     now          naive UTC (default: the real clock); its New York date is "today"
-    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
+    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh
+    day_risk     trader/state/day-risk.json (trader-broker/day_risk.py), used by the daily loss limit
+                 with "daily_loss_count": "open_risk": losses realised today + risk still open at
+                 the stops. Missing, stale or for another day: the old count (full risk of every
+                 entry placed today), with a warning."""
     cfg = dict(cfg or {})
     try:
         if not cfg.get("money"):
@@ -567,9 +599,20 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     count_today = len(done_today)
     entries_today = [r for r in done_today if rec_is_entry(r)]
     loss_today = 0.0
+    method = loss_count(c)
+    counted = {}
+    if method == "open_risk":
+        ok, why = day_risk_usable(day_risk, today, now_utc)
+        if ok:
+            counted = {e.get("fingerprint"): _f(e.get("counted_usd")) for e in day_risk.get("entries") or []}
+        else:
+            method = "full_risk"
+            top_warn.append("daily loss counted the old way (the full risk of every entry today): %s" % why)
     for r in entries_today:
         ml = _f(r.get("max_loss"))
-        if ml is None:
+        if method == "open_risk" and counted.get(r.get("fingerprint")) is not None:
+            loss_today += counted[r.get("fingerprint")]
+        elif ml is None:
             top_warn.append("an entry placed today (%s %s) has no max loss in the log; not counted in "
                             "the daily loss" % (r.get("side"), r.get("symbol")))
         else:
@@ -815,8 +858,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if daily and max_loss is not None:
                 used = loss_today + batch_loss
                 if used + max_loss > daily + CENT:
-                    later.append("daily loss: %s already at risk today plus %s for this one = %s, over your %s "
-                                 "daily loss limit" % (money(used), money(max_loss), money(used + max_loss),
+                    later.append("daily loss: %s %s today plus %s for this one = %s, over your %s "
+                                 "daily loss limit" % (money(used), "lost or still at risk at the stops"
+                                                       if method == "open_risk" else "already at risk",
+                                                       money(max_loss), money(used + max_loss),
                                                        gbp_label(c, "max_daily_loss_usd")))
             cap_t = int(c.get("max_trades_per_day") or 0)
             if cap_t and len(entries_today) + batch_entries >= cap_t:
@@ -904,7 +949,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         "warnings": top_warn,
         "cash_after": round(acct["cash"], 2),
         "today": {"orders_placed": count_today, "entries_placed": len(entries_today),
-                  "loss_at_risk": round(loss_today, 2), "day_trades_5d": pdt_n if c.get("pdt_guard") else None},
+                  "loss_at_risk": round(loss_today, 2), "daily_loss_count": method,
+                  "day_trades_5d": pdt_n if c.get("pdt_guard") else None},
     }
 
 
@@ -993,6 +1039,8 @@ def main(argv=None):
     ap.add_argument("--fx", default=FX_PATH, help="GBP/USD rate file for a GBP config (default trader/fx.json)")
     ap.add_argument("--fx-rate", type=float, help="USD per GBP, e.g. 1.31, instead of the rate file")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
+    ap.add_argument("--day-risk", default="trader/state/day-risk.json",
+                    help="today's realised losses and open risk, for \"daily_loss_count\": \"open_risk\"")
     ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
@@ -1017,7 +1065,11 @@ def main(argv=None):
         pdoc = read_json(a.prices, "prices", required=False) or {}
         prices, times = load_prices(pdoc)
         state = read_json(a.state, "broker state", required=False)
-        res = check(orders, cfg, portfolio, prices, state, a.today, now, times)
+        try:
+            day_risk = read_json(a.day_risk, "day risk", required=False) if a.day_risk else None
+        except RiskError:
+            day_risk = None              # broken: the old count, with a warning
+        res = check(orders, cfg, portfolio, prices, state, a.today, now, times, day_risk)
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]
         if not a.no_write:
