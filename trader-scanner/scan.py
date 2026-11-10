@@ -784,7 +784,7 @@ def read_symbols(a, offline_syms=None):
     for s in syms:
         if s not in out:
             out.append(s)
-    cfg = read_config(getattr(a, "config", None))
+    cfg = with_universe(read_config(getattr(a, "config", None)), getattr(a, "config", None))
     blocked = {str(x).strip().upper() for x in (cfg or {}).get("blocked_tickers") or []}
     if blocked:
         out = [s for s in out if s not in blocked]          # blocked always wins, list or no list
@@ -793,7 +793,8 @@ def read_symbols(a, offline_syms=None):
         allow = allow - blocked
         n = len(out)
         out = [s for s in out if s in allow]
-        progress(a, "allowed_tickers: scanning %d of %d symbols (only the %d on your list)" % (len(out), n, len(allow)))
+        progress(a, "%s: scanning %d of %d symbols (only the %d on your list)" % (
+            "universe" if cfg.get("allowed_from") == "universe" else "allowed_tickers", len(out), n, len(allow)))
         if not out:
             raise ScanError("none of the %d symbols are on your allowed_tickers list in trader/config.json" % n)
     if a.limit:
@@ -801,6 +802,18 @@ def read_symbols(a, offline_syms=None):
     if not out:
         raise ScanError("no symbols to scan")
     return out
+
+
+def with_universe(cfg, config_path):
+    """allowed_tickers is the filtered universe (universe.py, next to this file) when it is on: demo only."""
+    if not cfg or not config_path:
+        return cfg
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "universe.py")
+    spec = importlib.util.spec_from_file_location("trader_scanner_universe", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.apply_path(cfg, config_path)[0]
 
 
 def allowed_tickers(cfg):

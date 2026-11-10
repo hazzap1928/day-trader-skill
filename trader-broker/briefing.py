@@ -357,14 +357,24 @@ def build(client, state_dir):
     pos = positions(client, state_dir, close_utc)
     held = {r["symbol"] for r in pos["rows"]}
     fut = futures()
+    cfg = t212._read_json(os.path.join(state_dir, "config.json"), {}) or {}
     b = {"generated": now, "session": session, "next": _next_trading(session), "prev": prev,
          "account": acct, "positions": pos, "futures": fut, "mood": mood_word(fut), "fx": fx(),
          "news": headlines(), "econ": econ(session),
-         "flagged": sorted(flagged(state_dir, t212._read_json(os.path.join(state_dir, "config.json"), {}) or {})),
+         "flagged": sorted(flagged(state_dir, t212.with_universe(cfg, state_dir))),
+         "universe": universe_line(cfg, state_dir),
          "eod": (t212._read_json(os.path.join(state_dir, "state", "t212-guard.json"), {}) or {}).get("eod")}
     b["earnings"] = earnings([session, b["next"]], held, set(b["flagged"]))
     b["todo"] = todo(b)
     return b
+
+
+def universe_line(cfg, state_dir):
+    """How many stocks the autopilot may trade today, and where the list came from."""
+    try:
+        return t212.universe_module().briefing_line(cfg, state_dir)
+    except Exception as e:
+        return "Universe: no data (%s)" % e
 
 
 def _pct(x):
@@ -375,7 +385,7 @@ def full_text(b):
     a, p = b["account"], b["positions"]
     L = ["# Morning briefing, %s" % _local(b["generated"]).strftime("%A %d %B %Y, %H:%M UK"),
          "", "Session: %s (New York). Demo account. Read-only: nothing was placed or cancelled." %
-         b["session"].strftime("%A %d %B"), "", "## 1. Account"]
+         b["session"].strftime("%A %d %B"), b.get("universe") or "Universe: no data", "", "## 1. Account"]
     if a.get("error"):
         L.append("- Trading 212: no data (%s)" % a["error"])
     L.append("- Total value: %s" % _gbp(a.get("total")))
@@ -472,6 +482,8 @@ def short_text(b, path):
         if len(points) >= 3:
             break
         points.append(extra)
+    if b.get("universe"):
+        head += " " + b["universe"].rstrip(".") + "."
     top = ["%d. %s" % (i, t) for i, t in enumerate(points, 1)]
     return "\n".join([head] + top + ["Full briefing: %s" % os.path.relpath(path, ROOT)])
 

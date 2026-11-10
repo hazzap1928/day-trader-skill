@@ -26,7 +26,9 @@ what was bought (or why a passing ticket was not placed). Live has no automatic 
 After the 15:50 end-of-day close it sends the closing report (trader-broker/report.py).
 
 Config (trader/config.json), all optional except allowed_tickers:
-    "allowed_tickers": ["AAPL", ...]      required: the autopilot never scans anything else
+    "allowed_tickers": ["AAPL", ...]      required: the autopilot never scans anything else, unless
+                                          "universe" is on (demo): then the filtered universe from
+                                          trader-scanner/universe.py replaces it, rebuilt weekly here
     "autopilot": {"every_minutes": 15, "expire_minutes": 10, "max_chase_r": 0.5,
                   "min_edge": 0.0, "max_tickets_per_day": 10, "auto_buy": false}
 
@@ -79,8 +81,10 @@ t212 = _load("trader-broker", "t212")
 phone_mod = t212.phone_module()
 net = t212.net_module()
 evidence = _load("trader-broker", "evidence")
-KRONOS_BUDGET = 6 * 60          # seconds of Kronos shadow verdicts a cycle at most (it never blocks a trade)
+KRONOS_BUDGET = 9 * 60          # seconds of Kronos shadow verdicts a cycle at most (it never blocks a trade)
+KRONOS_NEEDS = 300              # one verdict takes about this long on this Mac: none starts with less time left
 tk = t212.ticket_module()
+universe = t212.universe_module()
 _MODS = {}
 
 
@@ -293,10 +297,17 @@ class Pilot(object):
         return os.path.join(self.sd, *parts)
 
     def read_cfg(self):
+        """The config, with allowed_tickers replaced by the filtered universe when it is on (demo only).
+        Never written back: config.json keeps your own allowed_tickers as the fallback."""
         try:
-            return tk.read_config(self.p("config.json"))
+            cfg = tk.read_config(self.p("config.json"))
         except tk.TicketError as e:
             raise PilotError(str(e))
+        try:
+            cfg, self.universe = universe.apply(cfg, self.sd)
+        except universe.UniverseError as e:
+            self.universe = {"active": False, "why": str(e)}
+        return cfg
 
     def _load_state(self):
         st = t212._read_json(self.path, {}) or {}
@@ -351,7 +362,13 @@ class Pilot(object):
             raise PilotError("no allowed_tickers in trader/config.json")
         cfgp, fx = self.p("config.json"), self.p("fx.json")
         self.fx_fresh()
-        code, out, _ = self.run(["trader-scanner/scan.py", "orb", "--symbols", ",".join(sorted(allow)),
+        held = self.held_symbols()
+        # a ticker tried or held today never makes a second ticket today, so it is not scanned again:
+        # with a few hundred stocks this keeps each cycle well inside every_minutes
+        fresh = sorted(s for s in allow if s not in self.state["tried"] and s not in held)
+        if not fresh:
+            return "every ticker on the list was tried or is held today: no scan"
+        code, out, _ = self.run(["trader-scanner/scan.py", "orb", "--symbols", ",".join(fresh),
                                  "--config", cfgp, "--out", self.p("watchlist.json"), "--quiet", "--json"],
                                 "the scanner")
         if code == 1:
@@ -359,7 +376,6 @@ class Pilot(object):
         code, out, _ = self.run(["trader-entry/entry.py", "watchlist", "--watchlist", self.p("watchlist.json"),
                                  "--config", cfgp, "--json"], "trader-entry")
         rows = self.json_of(out, "trader-entry") if out.strip() else []
-        held = self.held_symbols()
         notes = []
         for r in rows:
             sym = str(r.get("symbol") or "").upper()
@@ -371,6 +387,9 @@ class Pilot(object):
                 continue
             if sym in self.state["tried"]:
                 continue
+            if self.out_of_time():
+                notes.append("time: the rest wait for the next cycle (75%% of %d minutes used)" % self.s["every_minutes"])
+                break                              # not marked tried: the next cycle picks them up
             if sym in held:
                 self.state["tried"][sym] = "already held"
                 continue
@@ -396,13 +415,35 @@ class Pilot(object):
         self.kronos_pass()
         return "no ticket: " + ("; ".join(notes) if notes else "nothing triggered that was not tried today")
 
+    def out_of_time(self):
+        """True once a cycle has used 75 % of every_minutes: with a few hundred stocks the first cycle of the
+        day can trigger a hundred signals, and the next cycle must still start on time."""
+        started = getattr(self, "cycle_started", None)
+        return bool(started) and _now() - started > 0.75 * self.s["every_minutes"] * 60
+
+    def slow_cycle(self, took):
+        """Over 80 % of every_minutes: say so on the phone once a day; the next cycle would start late."""
+        limit = 0.8 * self.s["every_minutes"] * 60
+        if took <= limit or self.state.get("slow_warned"):
+            return
+        self.state["slow_warned"] = True
+        self.save()
+        phone_mod.push(self.sd, "SLOW CYCLE (demo): one scan took %dm %02ds, over 80%% of the %d-minute gap. "
+                       "Universe: %d stocks. Consider raising universe.min_avg_traded_usd." % (
+                           took // 60, took % 60, self.s["every_minutes"], len(t212.allowed_tickers(self.cfg) or [])),
+                       phone=self.phone)
+
     def log_signal(self, decision, **extra):
         """Evidence mode: every triggered signal goes in the log, traded or not."""
         if not self.s["evidence_mode"] or not getattr(self, "sig", None):
             return
-        rec = dict(self.sig, decision=decision, **extra)
+        rec = dict(self.sig, decision=decision, list_from=self.list_from(), **extra)
         rec["id"] = evidence.log_signal(self.sd, rec)
         self.cycle_signals = getattr(self, "cycle_signals", []) + [rec]
+
+    def list_from(self):
+        """The ticker list this cycle scanned: "universe" or "allowed_tickers" (the evidence log's before/after tag)."""
+        return "universe" if (self.cfg or {}).get("allowed_from") == "universe" else "allowed_tickers"
 
     def kronos_pass(self):
         """Kronos's verdict on this cycle's signals, in shadow: logged only, within a time budget."""
@@ -410,13 +451,21 @@ class Pilot(object):
         if not todo:
             return
         start = _now()
+        budget = KRONOS_BUDGET
+        if getattr(self, "cycle_started", None):
+            # leave 2 minutes before the next cycle is due, whatever the scan took
+            budget = max(0, min(budget, self.cycle_started + self.s["every_minutes"] * 60 - 120 - start))
+        # real trades first: Kronos's view on those matters most, and only one or two fit in a cycle
+        todo = sorted(todo, key=lambda r: r.get("decision") != "traded")
         for rec in todo:
             if rec.get("entry") is None:
                 continue
-            if _now() - start > KRONOS_BUDGET:
+            left = budget - (_now() - start)
+            if left < min(KRONOS_NEEDS, KRONOS_BUDGET) or left <= 0:
                 evidence.update_signal(self.sd, rec["id"], kronos={"verdict": "skipped", "why": "time budget"})
                 continue
-            evidence.update_signal(self.sd, rec["id"], kronos=evidence.kronos_verdict(rec))
+            evidence.update_signal(self.sd, rec["id"],
+                                   kronos=evidence.kronos_verdict(rec, timeout=int(min(evidence.KRONOS_TIMEOUT, left))))
 
     def fx_fresh(self):
         doc = t212._read_json(self.p("fx.json"), {}) or {}
@@ -550,7 +599,7 @@ class Pilot(object):
             text = self.bought_text(t)
             if self.s["evidence_mode"]:
                 rec = self.placed_record(t)
-                evidence.log_trade(self.sd, {"day": _ny().date().isoformat(), "symbol": t["symbol"],
+                evidence.log_trade(self.sd, {"day": _ny().date().isoformat(), "symbol": t["symbol"], "list_from": self.list_from(),
                                              "fingerprint": t["fingerprint"], "t212_ticker": rec.get("t212_ticker"),
                                              "expected_entry": t.get("quote"), "qty": rec.get("qty"),
                                              "stop": rec.get("stop"), "target": rec.get("target")})
@@ -800,12 +849,19 @@ class Pilot(object):
             placed, len(self.pending()), ", PAUSED" if st.get("paused") else "",
             len(t212.allowed_tickers(self.cfg) or [])) + self.status_extra())
 
+    def universe_line(self):
+        try:
+            return universe.briefing_line(self.cfg, self.sd)
+        except Exception as e:
+            return "Universe: ? (%s)" % e
+
     def status_extra(self):
         alerts = mod("trader-alerts", "alerts")
         m = alerts.market_status(_utc())
         lines = ["", "Market: %s%s" % ("OPEN" if m.get("open") else "closed (%s)" % (m.get("reason") or "closed"),
                                        "" if m.get("open") else "; next open %s New York" % m.get("next_open", "?")),
-                 "Guard: %s" % _guard_state(self.sd)[1], "Keep-awake: %s" % _keep_awake()[1], self.budget_line()]
+                 "Guard: %s" % _guard_state(self.sd)[1], "Keep-awake: %s" % _keep_awake()[1], self.budget_line(),
+                 self.universe_line()]
         if self.s["evidence_mode"]:
             lines.append("EVIDENCE MODE is ON: %s" % self.evidence_day())
         return "\n".join(lines)
@@ -933,6 +989,24 @@ class Pilot(object):
                os.path.join(self.sd, "logs", "briefing.log"))
         self.say("the morning briefing had not reached the phone: started it again")
 
+    def universe_refresh(self):
+        """The weekly universe build (trader-scanner/universe.py), in the background so the phone keeps
+        answering. Due every universe.refresh_day after refresh_at (UK time on this Mac), or at the next
+        chance outside market hours; a failed build is tried again after 6 hours."""
+        alerts = mod("trader-alerts", "alerts")
+        ny = _ny()
+        session = bool(alerts.trading_day(ny.date())[0]) and (9, 0) <= (ny.hour, ny.minute) < (16, 30)
+        try:
+            ok, why = universe.due(self.read_cfg(), self.sd, _local(_now()), _now(), market_hours=session)
+        except PilotError as e:
+            ok, why = False, str(e)
+        if not ok:
+            return
+        universe.mark_started(self.sd, _now())
+        _spawn([sys.executable, os.path.join(ROOT, "trader-scanner", "universe.py"), "--state-dir", self.sd,
+                "build", "--notify"], os.path.join(self.sd, "logs", "universe.log"))
+        self.say("universe: %s, building it in the background" % why)
+
     def apply_budget(self):
         """account_budget: today's budget and loss limits from the account value, once a trading day."""
         ab = t212.budget_module()
@@ -981,6 +1055,7 @@ class Pilot(object):
         if self.s["evidence_mode"]:
             lines.append("EVIDENCE MODE is ON: %s" % self.evidence_day())
         lines.append(self.budget_line())
+        lines.append(self.universe_line())
         lines += self.positions_lines()
         if first and last:
             lines.append("Checks every %d min from %s to %s New York. /pause stops new buys." % (
@@ -1040,6 +1115,7 @@ class Pilot(object):
                 self.roll_day()
                 self.flush_phone()
                 self.catch_up_briefing()
+                self.universe_refresh()
                 st = alerts.market_status(_utc())
                 if st.get("opens") and not self.state.get("summary_sent"):
                     self.day()
@@ -1112,7 +1188,11 @@ class Pilot(object):
                 continue
             if ny >= next_cycle and next_cycle <= last:
                 try:
-                    self.say("cycle: " + self.cycle())
+                    self.cycle_started = _now()
+                    line = self.cycle()
+                    took = _now() - self.cycle_started
+                    self.say("cycle (%dm %02ds): %s" % (took // 60, took % 60, line))
+                    self.slow_cycle(took)
                 except (PilotError, t212.T212Error) as e:
                     self.say("cycle failed: %s" % t212.scrub(e, self.client._secrets))
                     if getattr(e, "network", False) and not net.online():
@@ -1161,7 +1241,7 @@ def main(argv=None, environ=None):
     try:
         client = make_client(a.state_dir, environ)
         phone = phone_mod.open_phone(a.state_dir, environ)
-        cfg = tk.read_config(os.path.join(a.state_dir, "config.json"))
+        cfg = t212.with_universe(tk.read_config(os.path.join(a.state_dir, "config.json")), a.state_dir)
         problems = check_ready(cfg, client.env, phone)
         if problems and a.cmd == "serve" and phone is not None:
             return serve_unready(a.state_dir, client, phone, problems, environ)

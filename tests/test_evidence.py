@@ -110,7 +110,7 @@ class Pilot(PilotBase):
         self.write("config.json", self.cfg)
         self.kronos_calls = []
         self._kv = ev.kronos_verdict
-        ev.kronos_verdict = lambda sig: self.kronos_calls.append(sig["symbol"]) or {"verdict": "agree", "avg_R_net": 0.2}
+        ev.kronos_verdict = lambda sig, **kw: self.kronos_calls.append(sig["symbol"]) or {"verdict": "agree", "avg_R_net": 0.2}
 
     def tearDown(self):
         ev.kronos_verdict = self._kv
@@ -159,9 +159,16 @@ class Pilot(PilotBase):
         self.assertEqual(len(self.router.posts()), 2)          # placed before Kronos was even asked
 
     def test_kronos_disagreeing_blocks_nothing(self):
-        ev.kronos_verdict = lambda sig: {"verdict": "disagree", "avg_R_net": -0.5}
+        ev.kronos_verdict = lambda sig, **kw: {"verdict": "disagree", "avg_R_net": -0.5}
         p, line = self.cycle()
         self.assertEqual(len(self.router.posts()), 2)
+
+    def test_signals_and_trades_say_which_list_they_came_from(self):
+        p, line = self.cycle()
+        self.assertEqual(self.signals()[0]["list_from"], "allowed_tickers")
+        self.assertEqual(ev.load(self.dir, "trades")[0]["list_from"], "allowed_tickers")
+        p.cfg = dict(p.cfg, allowed_from="universe")
+        self.assertEqual(p.list_from(), "universe")
 
     def test_the_expected_entry_is_recorded_for_slippage(self):
         p, line = self.cycle()
@@ -260,6 +267,22 @@ class Kronos(unittest.TestCase):
             raise OSError("no python")
         self.assertEqual(ev.kronos_verdict({}, run=boom)["verdict"], "error")
 
+    def test_library_chatter_on_stdout_does_not_lose_the_verdict(self):
+        # 9 Nov: the model loader printed this before the JSON, and every verdict was "error"
+        out = "Loading weights from local directory\nLoading weights from local directory\n" \
+              '{"model": "Kronos-small", "avg_R_net": -0.768}\n'
+        res = ev.kronos_verdict({}, run=lambda p: out)
+        self.assertEqual((res["verdict"], res["model"]), ("disagree", "Kronos-small"))
+
+    def test_the_shadow_script_writes_only_json_to_stdout(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "trader-kronos", "kronos_shadow.py")) as fh:
+            src = fh.read()
+        main = src[src.index("def main():"):]
+        self.assertIn("redirect_stdout(sys.stderr)", main)
+        self.assertLess(main.index("redirect_stdout(sys.stderr)"), main.index("load_predictor()"))
+        self.assertNotIn("print(", main)
+
     def test_not_set_up_is_unavailable(self):
         saved = ev.KRONOS_PY
         ev.KRONOS_PY = "/nonexistent/python"
@@ -352,6 +375,39 @@ class Report(Base):
                      "assumed 0.05% a fill", "vs S&P 500 tracker +0.90%",
                      "agreed on 1 signals (virtual +0.500R), disagreed on 1 (virtual -1.100R)"):
             self.assertIn(want, text)
+
+    def test_untagged_rows_are_tagged_by_the_switch_day(self):
+        cfg = dict(self.cfg, evidence=dict(EVIDENCE, universe_from="2026-11-05"))
+        for day, sym in (("2026-11-04", "A"), ("2026-11-05", "B")):
+            ev.log_signal(self.dir, {"day": day, "symbol": sym})
+        ev.log_signal(self.dir, {"day": "2026-11-06", "symbol": "C", "list_from": "allowed_tickers"})
+        self.assertEqual(ev.tag_lists(self.dir, cfg), 2)
+        self.assertEqual([r["list_from"] for r in ev.load(self.dir, "signals")],
+                         ["allowed_tickers", "universe", "allowed_tickers"])     # an existing tag is kept
+        self.assertEqual(ev.tag_lists(self.dir, cfg), 0)
+        self.assertEqual(ev.universe_from({}), "2026-11-10")
+
+    def test_the_report_shows_before_and_after_the_universe_separately(self):
+        self.cfg = dict(self.cfg, evidence=dict(EVIDENCE, universe_from="2026-11-05"))
+        ev.log_signal(self.dir, {"day": "2026-11-04", "symbol": "A", "virtual": {"R_net": 0.5, "ret_net": 0.04}})
+        ev.log_signal(self.dir, {"day": "2026-11-05", "symbol": "B", "virtual": {"R_net": -1.0, "ret_net": -0.1}})
+        ev.log_signal(self.dir, {"day": "2026-11-06", "symbol": "C", "virtual": {"R_net": 0.2, "ret_net": 0.01}})
+        ev.log_trade(self.dir, {"day": "2026-11-05", "t212_ticker": "AAPL_US_EQ", "list_from": "allowed_tickers"})
+        late = dict(self.trip(-4.0), ticker="AAPL_US_EQ",
+                    entry_at=datetime.datetime(2026, 11, 5, 16, 0), exit_at=datetime.datetime(2026, 11, 5, 17, 0))
+        later = dict(self.trip(6.0), ticker="MSFT_US_EQ",
+                     entry_at=datetime.datetime(2026, 11, 6, 16, 0), exit_at=datetime.datetime(2026, 11, 6, 17, 0))
+        r = self.report([self.trip(10.0), late, later], "2026-11-06")
+        before, after = r["by_list"]["allowed_tickers"], r["by_list"]["universe"]
+        self.assertEqual((before["real"], before["real_total_gbp"]), (2, 6.0))   # the tagged trade beats its day
+        self.assertEqual((after["real"], after["real_total_gbp"]), (1, 6.0))
+        self.assertEqual((before["signals"], after["signals"]), (1, 2))
+        self.assertAlmostEqual(after["virtual_avg_R"], -0.4)
+        text = ev.report_text(r)
+        self.assertIn("Hand list (allowed_tickers), before 2026-11-05: real 2 closed, average +GBP 3.00, "
+                      "total +GBP 6.00; virtual 1 logged, 1 resolved, average +0.500R, 100% won", text)
+        self.assertIn("Filtered universe, from 2026-11-05: real 1 closed", text)
+        self.assertTrue(text.rstrip().endswith("not financial advice."))
 
 
 class GuardRecordsWhatItSaw(Base):

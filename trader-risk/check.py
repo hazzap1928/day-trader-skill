@@ -971,6 +971,18 @@ def load_prices(pdoc):
     return out, times
 
 
+def with_universe(cfg, config_path):
+    """allowed_tickers is the filtered universe when it is on (demo only, trader-scanner/universe.py)."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-scanner", "universe.py")
+    if not os.path.exists(path):
+        return cfg
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("trader_risk_universe", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.apply_path(cfg, config_path)[0]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Check proposed orders against your limits (trader-risk).")
     ap.add_argument("--orders", default="trader/orders.json")
@@ -996,6 +1008,7 @@ def main(argv=None):
         if not isinstance(orders, list) or not orders:
             raise RiskError("no orders in %s" % a.orders)
         cfg = read_json(a.config, "config", required=False) or {}
+        cfg = with_universe(cfg, a.config)
         try:
             cfg = money_config(cfg, a.fx_rate, a.fx, now)
         except CurrencyError as e:

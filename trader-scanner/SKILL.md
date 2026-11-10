@@ -33,6 +33,9 @@ python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --symbols TSLA,NVDA,AMD  # or --watc
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb                            # after 9:50 AM ET -> trader/watchlist.json
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --at 10:15                 # cut the clock at 10:15 AM ET
 python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --watchlist trader/watchlist.json --json
+python3 "${CLAUDE_SKILL_DIR}/universe.py" build                     # the tradable universe -> trader/universe/
+python3 "${CLAUDE_SKILL_DIR}/universe.py" show                      # its size, age and the most traded
+python3 "${CLAUDE_SKILL_DIR}/universe.py" changes                   # who came in and went out, and why
 ```
 
 Flags: `--min-price 5` and `--min-volume` (daily 1,000,000, orb 0),
@@ -48,7 +51,9 @@ reason is one plain line).
 | --- | --- |
 | `trader/universe.txt` | written by `universe`: one `SYMBOL\|Name` a line, read by `daily` and `orb` |
 | `trader/watchlist.json` | written by `daily` and `orb`: `mode`, `as_of`, `universe`, `scanned`, `failed`, `hits[]`. trader-news and trader-entry read `hits[].symbol` |
-| `trader/config.json` | read by `orb`: `no_entries_after` (default 15:30) |
+| `trader/config.json` | read by `orb`: `no_entries_after` (default 15:30), `allowed_tickers`, `blocked_tickers`, `universe` |
+| `trader/universe/tradable.json` | written by `universe.py build`: the tradable universe, each stock's figures, every dropped stock's reason |
+| `trader/universe/changes.jsonl` | one line per refresh: added and removed, each with its reason (or why the refresh was not saved) |
 
 ## The universe
 
@@ -131,6 +136,53 @@ weekend or holiday, after the close, or after `no_entries_after` (an expired
 setup) it prints one plain line and writes nothing. The 1:00 PM early closes
 are in the calendar.
 
+## The tradable universe (`universe.py`)
+
+`scan.py universe` lists every US common stock (about 5,900). `universe.py`
+builds the much shorter list the autopilot may trade, from rules, in order:
+
+1. Starting pool: the S&P 500 (Wikipedia's constituents table). Or the Russell
+   1000 from an iShares IWB holdings CSV the user downloads in their browser
+   (`"source": "russell1000", "source_file": "trader/IWB_holdings.csv"`), or
+   any ticker list (`"source": "file"`).
+2. Out if it is on `blocked_tickers`.
+3. Out if Trading 212 has no US stock for it (its instrument list, matched by
+   the symbol Trading 212 shows, so META is `FB_US_EQ`).
+4. Out if Yahoo has under 15 of the last 20 daily bars.
+5. Out if the last close is under `min_price` ($5).
+6. Out if the average traded value (close x volume, last `avg_days` 20
+   sessions) is under `min_avg_traded_usd` ($20m).
+
+There is no spread filter. No free source gives bid and ask, and spreads
+estimated from daily bars (Abdi-Ranaldo, Corwin-Schultz) are noise at large-cap
+spreads. On 9 Nov 2026 one estimate put JPM at 0.9 % and another put AAPL at 0 %;
+real spreads are about 0.01 %. The $5 price floor and the $20m a day traded
+floor stand in for a spread check, because spreads shrink as price and traded
+value grow.
+
+A build that looks broken is not saved, and last week's list stays. That
+happens when the pool is short, over 10 % of Yahoo fetches fail, fewer than
+`min_count` (100) pass, or the list shrinks by more than `max_drop_pct` (25 %).
+
+```json
+"universe": {"enabled": false, "source": "sp500", "min_avg_traded_usd": 20000000,
+             "min_price": 5, "avg_days": 20,
+             "refresh_day": "sun", "refresh_at": "18:00", "max_age_days": 14}
+```
+
+With `"enabled": true` and `"paper": true`, the list replaces `allowed_tickers`
+for the scanner, trader-risk, `t212.py place` and the autopilot. The config file
+itself is not changed. `allowed_tickers` stays as the fallback when the list is
+missing, broken or older than `max_age_days`. A live account always uses
+`allowed_tickers`. `blocked_tickers` wins everywhere.
+
+The always-on autopilot rebuilds the list in the background every
+`refresh_day` after `refresh_at` (UK time on the Mac). If the Mac was asleep, it
+rebuilds at its next chance outside market hours. It sends the changes to the
+phone. A build calls Trading 212 once at most (the instrument list, cached 24
+hours, spaced by t212.py's rate limiter), Wikipedia once, and Yahoo once per
+stock with a 0.3 s pause.
+
 ## Data and limits
 
 - Yahoo's chart and spark endpoints are free, unofficial and can lag. Bars are
@@ -142,7 +194,8 @@ are in the calendar.
 
 ## Steps
 
-1. Once a week or so: `scan.py universe`.
+1. Once a week or so: `scan.py universe`. The autopilot's tradable universe
+   (`universe.py`) refreshes itself every Sunday.
 2. Before the open: `scan.py daily`. Tell the user the counts (fetched,
    liquid, scanned, hits) and the top few by setup.
 3. After 9:50 AM ET (10:15 is the classic): `scan.py orb`. Tell the user how

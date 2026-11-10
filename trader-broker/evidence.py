@@ -10,6 +10,8 @@ With "autopilot": {"evidence_mode": true} (demo only; live refuses it):
   - real trades record the price expected when the order went in, so the report can measure
     slippage against the fills Trading 212 reports.
   - Kronos (trader-kronos/, shadow mode) gives a verdict on each signal. It never blocks anything.
+  - Each signal and trade carries list_from: "allowed_tickers" (the hand list, before the 10 Nov switch) or
+    "universe" (the filtered universe). The Friday report shows the two separately.
   - Each Friday after the close, a report goes to the phone.
 
 Pass, after the window in "evidence": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}: a positive
@@ -37,7 +39,10 @@ ROOT = os.path.dirname(HERE)
 KRONOS_DIR = os.path.join(ROOT, "trader-kronos")
 KRONOS_PY = os.path.join(KRONOS_DIR, ".venv", "bin", "python")
 KRONOS_SCRIPT = os.path.join(KRONOS_DIR, "kronos_shadow.py")
-KRONOS_TIMEOUT = 240
+KRONOS_TIMEOUT = 420                 # one verdict took 286 s on this Mac (Kronos-small, 10 paths, 69 steps)
+UNIVERSE_FROM = "2026-11-10"         # the day the filtered universe replaced allowed_tickers (evidence.universe_from)
+LISTS = ("allowed_tickers", "universe")
+LIST_NAMES = {"allowed_tickers": "Hand list (allowed_tickers)", "universe": "Filtered universe"}
 FEE, SLIP = 0.0015, 0.0005           # the GBP account: FX fee and assumed slippage, each fill
 TRACKER = "SPY"                      # stands in for the GBP-listed S&P 500 tracker (no FX fee)
 TRACKER_COST = 0.0005                # slippage on each tracker leg
@@ -136,8 +141,34 @@ def append(sd, name, rec):
         fh.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
+def universe_from(cfg):
+    return ((cfg or {}).get("evidence") or {}).get("universe_from") or UNIVERSE_FROM
+
+
+def list_of(rec, cfg=None):
+    """Which ticker list a signal or trade came from: its own tag, or (untagged rows) its day against the switch."""
+    tag = rec.get("list_from")
+    if tag in LISTS:
+        return tag
+    return "universe" if (rec.get("day") or "") >= universe_from(cfg) else "allowed_tickers"
+
+
+def tag_lists(sd, cfg=None):
+    """Tag every untagged signal and trade with list_from (before or after the universe switch). Returns how many."""
+    n = 0
+    for name in ("signals", "trades"):
+        rows = load(sd, name)
+        todo = [r for r in rows if r.get("list_from") not in LISTS]
+        for r in todo:
+            r["list_from"] = list_of(r, cfg)
+        if todo:
+            _save(sd, name, rows)
+            n += len(todo)
+    return n
+
+
 def log_signal(sd, rec):
-    """One scanner signal, traded or not. Returns its id."""
+    """One scanner signal, traded or not. Returns its id. list_from says which ticker list it came from."""
     rec = dict(rec)
     rec.setdefault("at", _now())
     rec["id"] = rec.get("id") or "%s-%s-%d" % (rec.get("day", ""), rec.get("symbol", ""), int(rec["at"]))
@@ -238,6 +269,15 @@ def kronos_available():
     return os.path.exists(KRONOS_PY) and os.path.exists(KRONOS_SCRIPT)
 
 
+def _last_json(out):
+    """The last line of stdout that is a JSON object: a library printing to stdout first must not lose the verdict."""
+    for line in reversed((out or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    return json.loads(out)
+
+
 def kronos_verdict(sig, run=None, timeout=KRONOS_TIMEOUT):
     """Ask trader-kronos/kronos_shadow.py (its own Python 3.10+ environment) about one signal. Never raises:
     any failure is a verdict of "unavailable" or "error", and nothing ever waits on it to place a trade."""
@@ -259,7 +299,7 @@ def kronos_verdict(sig, run=None, timeout=KRONOS_TIMEOUT):
             if p.returncode != 0:
                 return {"verdict": "error", "why": (p.stderr or p.stdout).strip()[-200:]}
             out = p.stdout
-        res = json.loads(out)
+        res = _last_json(out)
     except subprocess.TimeoutExpired:
         return {"verdict": "error", "why": "timed out after %ds" % timeout}
     except Exception as e:
@@ -345,6 +385,7 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
     r["real_avg_gbp"] = _mean([c["pl"] for c in closed if c.get("pl") is not None])
     r["real_avg_ret"] = _mean([c["pl"] / c["cost_gbp"] for c in closed if c.get("pl") is not None and c.get("cost_gbp")])
     r["real_total_gbp"] = sum(c["pl"] for c in closed if c.get("pl") is not None) if closed else 0.0
+    tag_lists(sd, cfg)
     sigs = [s for s in load(sd, "signals") if start <= s.get("day", "") <= upto]
     virt = [s for s in sigs if (s.get("virtual") or {}).get("R_net") is not None]
     r["signals"] = len(sigs)
@@ -364,6 +405,24 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
         r["tracker_ret"] = tracker_return(start, upto, fetch_daily)
     except Exception as e:
         r["tracker_ret"], r["tracker_error"] = None, str(e)[:120]
+    trade_list = {}
+    for t in trades:
+        trade_list[(t.get("day"), t.get("t212_ticker"))] = list_of(t, cfg)
+    groups = {}
+    for name in LISTS:
+        real = [c for c in closed
+                if trade_list.get((_ny_dt(c["entry_at"]), c.get("ticker")),
+                                  list_of({"day": _ny_dt(c["entry_at"])}, cfg)) == name]
+        gs = [s for s in sigs if list_of(s, cfg) == name]
+        gv = [s for s in gs if (s.get("virtual") or {}).get("R_net") is not None]
+        days = sorted(set(s.get("day") for s in gs) | set(_ny_dt(c["entry_at"]) for c in real))
+        groups[name] = {"real": len(real), "real_avg_gbp": _mean([c["pl"] for c in real if c.get("pl") is not None]),
+                        "real_total_gbp": sum(c["pl"] for c in real if c.get("pl") is not None),
+                        "signals": len(gs), "virtual": len(gv),
+                        "virtual_avg_R": _mean([s["virtual"]["R_net"] for s in gv]),
+                        "virtual_win": (100.0 * sum(1 for s in gv if s["virtual"]["R_net"] > 0) / len(gv)) if gv else None,
+                        "days": (days[0], days[-1]) if days else None}
+    r["by_list"], r["universe_from"] = groups, universe_from(cfg)
     k = {}
     for verdict in ("agree", "disagree"):
         vs = [s for s in virt if (s.get("kronos") or {}).get("verdict") == verdict]
@@ -409,7 +468,18 @@ def report_text(r):
                  k["agree"][0], "no data" if k["agree"][1] is None else "%+.3fR" % k["agree"][1],
                  k["disagree"][0], "no data" if k["disagree"][1] is None else "%+.3fR" % k["disagree"][1],
                  k["other"], r["kronos_real"]["agree"], r["kronos_real"]["disagree"]),
-             "Demo money. Education and tooling, not financial advice."]
+             ]
+    for name in LISTS:
+        g = (r.get("by_list") or {}).get(name)
+        if not g or not (g["signals"] or g["real"]):
+            continue
+        lines.append("%s, %s: real %d closed, average %s, total %s; virtual %d logged, %d resolved, average %s, %s won" % (
+            LIST_NAMES[name],
+            ("before %s" % r["universe_from"]) if name == "allowed_tickers" else ("from %s" % r["universe_from"]),
+            g["real"], _gbp(g["real_avg_gbp"]), _gbp(g["real_total_gbp"]), g["signals"], g["virtual"],
+            "no data" if g["virtual_avg_R"] is None else "%+.3fR" % g["virtual_avg_R"],
+            "no data" if g["virtual_win"] is None else "%.0f%%" % g["virtual_win"]))
+    lines.append("Demo money. Education and tooling, not financial advice.")
     return "\n".join(lines)
 
 
@@ -440,11 +510,15 @@ def main(argv=None, environ=None):
     rp = sub.add_parser("report", help="build the report now")
     rp.add_argument("--send", action="store_true", help="also send it to the phone")
     sub.add_parser("resolve", help="fill in today's virtual results now")
+    sub.add_parser("tag", help="tag untagged signals and trades as before or after the universe switch")
     a = ap.parse_args(argv)
     environ = os.environ if environ is None else environ
     T = t212()
     try:
         cfg = T.ticket_module().read_config(os.path.join(a.state_dir, "config.json"))
+        if a.cmd == "tag":
+            print("tagged %d rows" % tag_lists(a.state_dir, cfg))
+            return 0
         if a.cmd == "resolve":
             print("resolved %d signals" % resolve(a.state_dir))
             return 0

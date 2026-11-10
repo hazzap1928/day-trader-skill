@@ -177,7 +177,9 @@ caches the instrument list for 24 hours in `trader/cache/`.
   terminal**. It has no `--reply` and refuses without a terminal, so Claude
   cannot say yes for them. Tell the user to run it themselves; never run it.
 - only a ticker on `allowed_tickers` (when the config has the list; the
-  scanner only scans those and trader-risk blocks any other entry)
+  scanner only scans those and trader-risk blocks any other entry). On demo,
+  with `universe.enabled`, the filtered universe from
+  `trader-scanner/universe.py` takes the list's place
 - a market entry, then, with `"stop_mode": "broker"` (the default), a separate
   **good-till-cancelled** stop order once the entry fills. With
   `"stop_mode": "market"` no stop order is sent: the guard sells at market when
@@ -351,7 +353,9 @@ While it is on:
 
 **Autopilot and phone approvals (`autopilot.py`, `phone.py`, demo only).** For
 time away from the Mac. On weekdays launchd runs `run-autopilot.sh`. Every 15
-minutes inside the entry window it runs scanner (orb, `allowed_tickers` only),
+minutes inside the entry window it runs scanner (orb, `allowed_tickers` only, or the
+filtered universe when `universe.enabled`; tickers already tried or held today are
+skipped),
 entry, exit plan, Time Machine (it needs a lean toward the target), trader-budget
 and trader-risk. It sends at most one passing ticket to the user's phone through
 their own Telegram bot, with Approve and Reject buttons. Nothing is placed

@@ -2,7 +2,7 @@
 
 Runs in trader-kronos/.venv (Python 3.10+, set up by setup.sh). trader-broker/evidence.py calls it with
 one signal as JSON on stdin:  {"symbol", "at" (unix time of the signal), "entry", "stop", "target"}
-and reads one JSON line back:
+and reads one JSON line back (the only thing on stdout; library chatter goes to stderr):
   {"model", "paths", "pred_len", "p_target", "p_stop", "avg_R", "avg_R_net", "seconds"}
 
 How: the last up-to-400 five-minute bars before the signal (Yahoo, unofficial) go to Kronos, which samples
@@ -13,6 +13,7 @@ first is -1R, the target first is +target R, else out at 15:50. Costs as the GBP
     .venv/bin/python kronos_shadow.py --self-test      # one forecast on a fixed synthetic series
 """
 
+import contextlib
 import json
 import math
 import os
@@ -131,16 +132,19 @@ def self_test(predictor, name):
 
 def main():
     t0 = time.time()
-    name, predictor = load_predictor()
-    if "--self-test" in sys.argv:
-        res = self_test(predictor, name)
-    else:
-        sig = json.loads(sys.stdin.read())
-        bars = [tuple(b) for b in sig["bars"]] if sig.get("bars") else fetch(sig["symbol"])   # evidence.py sends them
-        res = verdict(bars, float(sig["at"]), float(sig["entry"]), float(sig["stop"]),
-                      float(sig["target"]), predictor, name)
+    # stdout carries one JSON line and nothing else: the model loader prints "Loading weights from local
+    # directory" there, which broke every verdict on 9 Nov. Anything a library prints goes to stderr.
+    with contextlib.redirect_stdout(sys.stderr):
+        name, predictor = load_predictor()
+        if "--self-test" in sys.argv:
+            res = self_test(predictor, name)
+        else:
+            sig = json.loads(sys.stdin.read())
+            bars = [tuple(b) for b in sig["bars"]] if sig.get("bars") else fetch(sig["symbol"])   # evidence.py sends them
+            res = verdict(bars, float(sig["at"]), float(sig["entry"]), float(sig["stop"]),
+                          float(sig["target"]), predictor, name)
     res["seconds"] = round(time.time() - t0, 1)
-    print(json.dumps(res))
+    sys.stdout.write(json.dumps(res) + "\n")
 
 
 if __name__ == "__main__":

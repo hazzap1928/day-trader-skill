@@ -1035,7 +1035,7 @@ def cmd_place(client, args, confirm=None):
         raise T212Error("evidence mode is on in trader/config.json; it is a demo forward test and never places on "
                         "a live account. Turn it off first. Nothing was sent.", 2)
     mode = stop_mode(cfg)
-    allow = allowed_tickers(cfg)
+    allow = allowed_tickers(with_universe(cfg, sd))
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
     if not isinstance(orders, list) or not orders:
         raise T212Error("no tickets in %s" % paths["orders"], 2)
@@ -2168,6 +2168,26 @@ def cmd_guard(client, args):
         if eod_at is not None and client.env == "demo" and now_et < eod_at:
             wait = max(1.0, min(every, (eod_at - now_et).total_seconds() + 1))   # wake for the close on time
         _sleep(wait)
+
+
+_UNIVERSE = []
+
+
+def universe_module():
+    """trader-scanner/universe.py: the filtered universe that replaces allowed_tickers on demo when it is on."""
+    if not _UNIVERSE:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-scanner",
+                            "universe.py")
+        spec = importlib.util.spec_from_file_location("trader_scanner_universe", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _UNIVERSE.append(mod)
+    return _UNIVERSE[0]
+
+
+def with_universe(cfg, state_dir):
+    """cfg with allowed_tickers replaced by the universe when it is active (demo, enabled, fresh)."""
+    return universe_module().apply(cfg or {}, state_dir)[0]
 
 
 _BUDGET = []
