@@ -146,10 +146,10 @@ class OpenMessage(Base):
 
     def test_evidence_mode_and_the_day_of_the_test(self):
         self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True, "evidence_mode": True},
-                                       evidence={"start": "2026-11-02", "end": "2026-11-13"}))
+                                       evidence={"start": "2026-11-02"}))
         self.accounts([])
         text = self.pilot().open_message()
-        self.assertIn("EVIDENCE MODE is ON: forward test 2026-11-02 to 2026-11-13, trading day 4 of 10", text)
+        self.assertIn("EVIDENCE MODE is ON: forward test since 2026-11-02, no end date, trading day 4", text)
 
     def test_the_guards_last_check_comes_from_its_log(self):
         os.makedirs(os.path.join(self.dir, "logs"), exist_ok=True)

@@ -23,7 +23,7 @@ ev._T212[:] = [t212]                 # the same module the fakes patch
 check = load("trader-risk", "check")
 go_live = load("trader-broker", "go_live")
 
-EVIDENCE = {"start": "2026-11-02", "end": "2026-11-13"}
+EVIDENCE = {"start": "2026-11-02", "min_trades": 2}
 
 
 def ts(y, mo, d, h, mi):
@@ -46,19 +46,30 @@ class Setting(unittest.TestCase):
             with self.assertRaises(ev.EvidenceError):
                 ev.require_demo(bad_cfg, env)
 
-    def test_the_window_must_be_two_dates_in_order(self):
-        self.assertEqual(ev.window({"evidence": EVIDENCE}), ("2026-11-02", "2026-11-13"))
-        for bad in ({"start": "soon", "end": "2026-11-13"}, {"start": "2026-11-13", "end": "2026-11-02"}):
+    def test_a_start_date_and_a_trade_minimum_and_no_end_date(self):
+        self.assertEqual(ev.settings({"evidence": EVIDENCE}), ("2026-11-02", 2))
+        self.assertEqual(ev.settings({"evidence": {"start": "2026-11-09"}}), ("2026-11-09", ev.MIN_TRADES))
+        self.assertEqual(ev.settings({"evidence": {"start": "2026-11-09", "end": "2026-11-20"}}),
+                         ("2026-11-09", ev.MIN_TRADES))                      # an old end date is ignored
+        for bad in ({"start": "soon"}, {}, {"start": "2026-11-02", "min_trades": 0},
+                    {"start": "2026-11-02", "min_trades": "20"}, {"start": "2026-11-02", "min_trades": True}):
             with self.assertRaises(ev.EvidenceError):
-                ev.window({"evidence": bad})
+                ev.settings({"evidence": bad})
 
-    def test_the_report_is_due_on_fridays_and_the_last_day_inside_the_window(self):
+    def test_the_report_is_due_every_friday_from_the_start_forever(self):
         cfg = {"autopilot": {"evidence_mode": True}, "evidence": EVIDENCE}
         self.assertTrue(ev.due(cfg, "2026-11-06", 4))
         self.assertFalse(ev.due(cfg, "2026-11-05", 3))
         self.assertTrue(ev.due(cfg, "2026-11-13", 4))
-        self.assertFalse(ev.due(cfg, "2026-11-20", 4))
+        self.assertTrue(ev.due(cfg, "2026-11-20", 4))
+        self.assertTrue(ev.due(cfg, "2029-06-01", 4))
+        self.assertFalse(ev.due(cfg, "2026-10-30", 4))                  # before the start
         self.assertFalse(ev.due({"evidence": EVIDENCE}, "2026-11-06", 4))
+
+    def test_the_tracker_history_reaches_back_to_the_start(self):
+        self.assertEqual(ev.tracker_range("2026-11-09", "2026-11-13"), "3mo")
+        self.assertEqual(ev.tracker_range("2026-11-09", "2027-06-01"), "1y")
+        self.assertEqual(ev.tracker_range("2026-11-09", "2032-01-01"), "10y")
 
 
 class Risk(unittest.TestCase):
@@ -184,7 +195,7 @@ class Pilot(PilotBase):
         self.assertEqual(ap.check_ready(self.cfg, "demo", self.phone), [])
         bad = dict(self.cfg, autopilot={"evidence_mode": True})
         self.assertTrue(any("needs autopilot.auto_buy" in x for x in ap.check_ready(bad, "demo", self.phone)))
-        bad = dict(self.cfg, evidence={"start": "x", "end": "y"})
+        bad = dict(self.cfg, evidence={"start": "x"})
         self.assertTrue(any("evidence.start" in x for x in ap.check_ready(bad, "demo", self.phone)))
         self.assertTrue(any("demo only" in x for x in ap.check_ready(self.cfg, "live", self.phone)))
 
@@ -339,8 +350,8 @@ class Report(Base):
         self.write("state/account-days.json", {"days": {"2026-11-02": {"start": 2000.0, "close": 2001.0}}})
         self.client = t212.Client("demo", "k", "s", state_dir=self.dir, log=lambda m: None)
 
-    def trip(self, pl, cost=500.0):
-        at = datetime.datetime(2026, 11, 4, 16, 0)
+    def trip(self, pl, cost=500.0, at=None):
+        at = at or datetime.datetime(2026, 11, 4, 16, 0)
         return {"ticker": "TSLA_US_EQ", "qty": 1, "entry": 100, "exit": 101, "pl": pl, "cost_gbp": cost,
                 "entry_at": at, "exit_at": at, "sell": {}}
 
@@ -355,14 +366,51 @@ class Report(Base):
         self.assertAlmostEqual(r["strategy_ret"], 0.01)
         r = self.report([self.trip(12.0), self.trip(8.0)], "2026-11-06", spy=(100.0, 103.0))
         self.assertEqual(r["status"], "NOT ON TRACK")
-        r = self.report([self.trip(-5.0)], "2026-11-06")
+        r = self.report([self.trip(-5.0), self.trip(1.0)], "2026-11-06")
         self.assertEqual(r["status"], "NOT ON TRACK")
 
-    def test_the_last_day_says_pass_or_fail(self):
-        self.assertEqual(self.report([self.trip(30.0)], "2026-11-13")["status"], "PASS")
-        self.assertEqual(self.report([self.trip(-30.0)], "2026-11-13")["status"], "FAIL")
-        self.assertEqual(self.report([], "2026-11-13")["status"], "FAIL: no real trades in the window")
-        self.assertEqual(self.report([], "2026-11-06")["status"], "NO REAL TRADES YET")
+    def test_there_is_no_final_pass_or_fail_day(self):
+        for today in ("2026-11-13", "2026-11-20", "2027-03-05"):
+            r = self.report([self.trip(30.0), self.trip(1.0)], today)
+            self.assertIn(r["status"], ("ON TRACK", "NOT ON TRACK"))
+            self.assertNotIn("final", r)
+            self.assertNotIn("PASS", ev.report_text(r))
+            self.assertNotIn("FAIL", ev.report_text(r))
+
+    def test_too_few_trades_to_judge_below_the_minimum(self):
+        r = self.report([], "2026-11-06")
+        self.assertEqual((r["status"], r["since_start"]["lean"], r["since_start"]["n"]), ("TOO FEW TRADES TO JUDGE", None, 0))
+        r = self.report([self.trip(30.0)], "2026-11-06")
+        self.assertEqual((r["status"], r["since_start"]["lean"]), ("TOO FEW TRADES TO JUDGE", "ON TRACK"))
+        self.cfg = dict(self.cfg, evidence=dict(EVIDENCE, min_trades=1))
+        self.assertEqual(self.report([self.trip(30.0)], "2026-11-06")["status"], "ON TRACK")
+        self.cfg = dict(self.cfg, evidence={"start": "2026-11-02"})       # the default minimum
+        self.assertEqual(self.report([self.trip(30.0)] * 3, "2026-11-06")["status"], "TOO FEW TRADES TO JUDGE")
+
+    def test_this_week_and_since_the_start_each_get_a_status(self):
+        self.write("state/account-days.json", {"days": {"2026-11-02": {"start": 2000.0},
+                                                        "2026-11-09": {"start": 2040.0}}})
+        week2 = datetime.datetime(2026, 11, 10, 16, 0)
+        daily = lambda s: [(calendar.timegm((2026, 11, 2, 14, 30, 0)), 100.0, 0, 0, 100.5),
+                           (calendar.timegm((2026, 11, 9, 14, 30, 0)), 101.0, 0, 0, 101.0),
+                           (calendar.timegm((2026, 11, 13, 14, 30, 0)), 101.0, 0, 0, 101.2)]
+        trips = [self.trip(30.0), self.trip(20.0), self.trip(-3.0, at=week2), self.trip(-2.0, at=week2)]
+        r = ev.build_report(self.client, self.dir, self.cfg, FakeReport(trips), fetch_daily=daily, today="2026-11-13")
+        w, a = r["week"], r["since_start"]
+        self.assertEqual((w["from"], w["to"], w["n"], w["total_gbp"], w["status"]), ("2026-11-09", "2026-11-13", 2, -5.0, "NOT ON TRACK"))
+        self.assertEqual((a["from"], a["n"], a["total_gbp"], a["status"]), ("2026-11-02", 4, 45.0, "ON TRACK"))
+        self.assertAlmostEqual(w["strategy_ret"], -5.0 / 2040.0)
+        text = ev.report_text(r)
+        self.assertIn("This week (2026-11-09 to 2026-11-13): NOT ON TRACK, based on 2 closed trades.", text)
+        self.assertIn("Since the start (2026-11-02 to 2026-11-13): ON TRACK, based on 4 closed trades.", text)
+        self.assertIn("no end date", text)
+        r = ev.build_report(self.client, self.dir, self.cfg, FakeReport(trips[:2]), fetch_daily=daily, today="2026-11-13")
+        self.assertIn("This week (2026-11-09 to 2026-11-13): too few trades to judge (0 closed trades, minimum 2).",
+                      ev.report_text(r))
+
+    def test_the_week_never_reaches_back_before_the_start(self):
+        self.cfg = dict(self.cfg, evidence=dict(EVIDENCE, start="2026-11-04"))
+        self.assertEqual(self.report([], "2026-11-06")["week"]["from"], "2026-11-04")
 
     def test_the_text_covers_everything_asked_for(self):
         ev.log_signal(self.dir, {"day": "2026-11-04", "symbol": "A", "entry": 1, "stop": 0.9, "target": 1.2,
@@ -370,9 +418,11 @@ class Report(Base):
         ev.log_signal(self.dir, {"day": "2026-11-04", "symbol": "B", "entry": 1, "stop": 0.9, "target": 1.2,
                                  "virtual": {"R_net": -1.1, "ret_net": -0.1}, "kronos": {"verdict": "disagree"}})
         text = ev.report_text(self.report([self.trip(30.0)], "2026-11-06"))
-        for want in ("EVIDENCE MODE REPORT", "Status: ON TRACK", "Real trades: 1 closed, average +GBP 30.00 (+6.00%)",
+        for want in ("EVIDENCE MODE REPORT", "Since the start (2026-11-02 to 2026-11-06): too few trades to judge "
+                     "(1 closed trade, minimum 2); so far it reads ON TRACK",
+                     "Real trades since the start: 1 closed, average +GBP 30.00 (+6.00%)",
                      "Virtual signals: 2 logged, 2 resolved, average -0.300R", "Slippage, adverse:",
-                     "assumed 0.05% a fill", "vs S&P 500 tracker +0.90%",
+                     "assumed 0.05% a fill", "strategy +1.50% (on +GBP 2,000.00) vs S&P 500 tracker +0.90%",
                      "agreed on 1 signals (virtual +0.500R), disagreed on 1 (virtual -1.100R)"):
             self.assertIn(want, text)
 

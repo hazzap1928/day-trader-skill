@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evidence mode: a 2-week demo forward test of the day-trading autopilot.
+"""Evidence mode: an open-ended demo forward test of the day-trading autopilot.
 
 With "autopilot": {"evidence_mode": true} (demo only; live refuses it):
   - the autopilot skips its cost block (min_net_r) and trader-risk uses a 1.0 after-costs
@@ -12,10 +12,13 @@ With "autopilot": {"evidence_mode": true} (demo only; live refuses it):
   - Kronos (trader-kronos/, shadow mode) gives a verdict on each signal. It never blocks anything.
   - Each signal and trade carries list_from: "allowed_tickers" (the hand list, before the 10 Nov switch) or
     "universe" (the filtered universe). The Friday report shows the two separately.
-  - Each Friday after the close, a report goes to the phone.
+  - Each Friday after the close, a report goes to the phone, every Friday with no end date.
 
-Pass, after the window in "evidence": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}: a positive
-average per real trade after costs AND a better return than an S&P 500 tracker over the same days.
+"evidence": {"start": "YYYY-MM-DD", "min_trades": 20}. There is no end date and no final PASS/FAIL day.
+Each report gives a running status, ON TRACK or NOT ON TRACK, for this week and for since the start,
+by the pass rule: a positive average per real trade after costs AND a better return than an S&P 500
+tracker over the same days. Below min_trades closed trades, that status is "too few trades to judge".
+An old "end" key is ignored.
 
     python3 trader-broker/evidence.py report      # build the report now (also sends it with --send)
     python3 trader-broker/evidence.py resolve     # fill in today's virtual results now
@@ -46,6 +49,7 @@ LIST_NAMES = {"allowed_tickers": "Hand list (allowed_tickers)", "universe": "Fil
 FEE, SLIP = 0.0015, 0.0005           # the GBP account: FX fee and assumed slippage, each fill
 TRACKER = "SPY"                      # stands in for the GBP-listed S&P 500 tracker (no FX fee)
 TRACKER_COST = 0.0005                # slippage on each tracker leg
+MIN_TRADES = 20                      # closed real trades before a running status counts (evidence.min_trades)
 EOD = (15, 50)                       # virtual results close at the end-of-day close, New York time
 CHART = "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=%s&interval=%s"
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0)"
@@ -88,17 +92,18 @@ def require_demo(cfg, env):
                             "a live account")
 
 
-def window(cfg):
+def settings(cfg):
+    """(start, min_trades) from "evidence" in the config. No end date: the test runs until it is turned off."""
     w = (cfg or {}).get("evidence") or {}
-    start, end = w.get("start"), w.get("end")
-    for name, v in (("start", start), ("end", end)):
-        try:
-            datetime.date.fromisoformat(str(v))
-        except ValueError:
-            raise EvidenceError("evidence.%s in trader/config.json must be a date like 2026-11-10" % name)
-    if end < start:
-        raise EvidenceError("evidence.end is before evidence.start")
-    return start, end
+    start = w.get("start")
+    try:
+        datetime.date.fromisoformat(str(start))
+    except ValueError:
+        raise EvidenceError("evidence.start in trader/config.json must be a date like 2026-11-10")
+    n = w.get("min_trades", MIN_TRADES)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise EvidenceError("evidence.min_trades in trader/config.json must be a whole number, 1 or more")
+    return start, n
 
 
 # ---------------------------------------------------------------- files
@@ -324,10 +329,20 @@ def _gbp(x):
     return "no data" if x is None else ("+" if x >= 0 else "-") + "GBP {:,.2f}".format(abs(x))
 
 
-def tracker_return(start, end_day, fetch=None):
+def tracker_range(start, today):
+    """A Yahoo daily range long enough to reach back to `start`: the test has no end date."""
+    days = (datetime.date.fromisoformat(today) - datetime.date.fromisoformat(start)).days
+    for rng, n in (("3mo", 85), ("1y", 360), ("2y", 725), ("5y", 1820), ("10y", 3645)):
+        if days < n:
+            return rng
+    return "max"
+
+
+def tracker_return(start, end_day, fetch=None, bars=None):
     """The S&P 500 tracker from the open on `start` to the latest close up to `end_day`, slippage in."""
-    fetch = fetch or (lambda s: fetch_bars(s, "3mo", "1d"))
-    bars = fetch(TRACKER)
+    if bars is None:
+        fetch = fetch or (lambda s: fetch_bars(s, tracker_range(start, end_day), "1d"))
+        bars = fetch(TRACKER)
     days = [(datetime.datetime.utcfromtimestamp(b[0]).date().isoformat(), b) for b in bars]
     inside = [b for d, b in days if start <= d <= end_day]
     if not inside:
@@ -366,11 +381,44 @@ def slippage(trades, fills, guard_state):
     return entries, exits
 
 
+def week_start(today):
+    """Monday of the week `today` is in."""
+    d = datetime.date.fromisoformat(today)
+    return (d - datetime.timedelta(days=d.weekday())).isoformat()
+
+
+def judge(ok_avg, ok_tracker, n, min_trades):
+    """The running status by the pass rule, and below min_trades closed trades, "too few trades to judge"."""
+    lean = "ON TRACK" if ok_avg and ok_tracker else "NOT ON TRACK"
+    if n < min_trades:
+        return "TOO FEW TRADES TO JUDGE", (lean if n else None)
+    return lean, None
+
+
+def period(closed, frm, upto, days, tracker_bars, tracker_error, min_trades):
+    """The pass rule over closed real trades whose entry and exit both fall from `frm` to `upto`."""
+    cs = [c for c in closed if frm <= _ny_dt(c["entry_at"]) and _ny_dt(c["exit_at"]) <= upto]
+    pls = [c["pl"] for c in cs if c.get("pl") is not None]
+    p = {"from": frm, "to": upto, "n": len(cs), "min_trades": min_trades, "avg_gbp": _mean(pls),
+         "avg_ret": _mean([c["pl"] / c["cost_gbp"] for c in cs if c.get("pl") is not None and c.get("cost_gbp")]),
+         "total_gbp": sum(pls) if cs else 0.0}
+    p["start_value"] = next((v.get("start") for d, v in sorted(days.items()) if d >= frm and v.get("start")), None)
+    p["strategy_ret"] = (p["total_gbp"] / p["start_value"]) if p["start_value"] else None
+    p["tracker_ret"] = tracker_return(frm, upto, bars=tracker_bars) if tracker_bars is not None else None
+    if tracker_error:
+        p["tracker_error"] = tracker_error
+    p["ok_avg"] = p["avg_gbp"] is not None and p["avg_gbp"] > 0
+    p["ok_tracker"] = (p["strategy_ret"] is not None and p["tracker_ret"] is not None
+                       and p["strategy_ret"] > p["tracker_ret"])
+    p["status"], p["lean"] = judge(p["ok_avg"], p["ok_tracker"], p["n"], min_trades)
+    return p
+
+
 def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
-    start, end = window(cfg)
+    start, min_trades = settings(cfg)
     today = today or _ny(_now()).date().isoformat()
-    upto = min(today, end)
-    r = {"start": start, "end": end, "today": today, "final": today >= end}
+    upto = today
+    r = {"start": start, "today": today, "min_trades": min_trades}
     since = datetime.datetime.combine(datetime.date.fromisoformat(start), datetime.time(0, 0)) - datetime.timedelta(days=21)
     try:
         fills = report_mod.history(client, since)
@@ -398,13 +446,18 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
     ent, ex = slippage(trades, fills or [], guard)
     r["slip_entry"], r["slip_exit"], r["slip_n"] = _mean(ent), _mean(ex), (len(ent), len(ex))
     days = (t212()._read_json(os.path.join(sd, "state", "account-days.json"), {}) or {}).get("days") or {}
-    start_value = next((v.get("start") for d, v in sorted(days.items()) if d >= start and v.get("start")), None)
-    r["start_value"] = start_value
-    r["strategy_ret"] = (r["real_total_gbp"] / start_value) if start_value else None
+    tracker_bars, tracker_error = None, None
     try:
-        r["tracker_ret"] = tracker_return(start, upto, fetch_daily)
+        tracker_bars = (fetch_daily or (lambda s: fetch_bars(s, tracker_range(start, upto), "1d")))(TRACKER)
     except Exception as e:
-        r["tracker_ret"], r["tracker_error"] = None, str(e)[:120]
+        tracker_error = str(e)[:120]
+    whole = period(closed, start, upto, days, tracker_bars, tracker_error, min_trades)
+    week = period(closed, max(start, week_start(today)), upto, days, tracker_bars, tracker_error, min_trades)
+    r["since_start"], r["week"] = whole, week
+    r["start_value"], r["strategy_ret"], r["tracker_ret"] = whole["start_value"], whole["strategy_ret"], whole["tracker_ret"]
+    if tracker_error:
+        r["tracker_error"] = tracker_error
+    r["ok_avg"], r["ok_tracker"], r["status"] = whole["ok_avg"], whole["ok_tracker"], whole["status"]
     trade_list = {}
     for t in trades:
         trade_list[(t.get("day"), t.get("t212_ticker"))] = list_of(t, cfg)
@@ -415,13 +468,13 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
                                   list_of({"day": _ny_dt(c["entry_at"])}, cfg)) == name]
         gs = [s for s in sigs if list_of(s, cfg) == name]
         gv = [s for s in gs if (s.get("virtual") or {}).get("R_net") is not None]
-        days = sorted(set(s.get("day") for s in gs) | set(_ny_dt(c["entry_at"]) for c in real))
+        gdays = sorted(set(s.get("day") for s in gs) | set(_ny_dt(c["entry_at"]) for c in real))
         groups[name] = {"real": len(real), "real_avg_gbp": _mean([c["pl"] for c in real if c.get("pl") is not None]),
                         "real_total_gbp": sum(c["pl"] for c in real if c.get("pl") is not None),
                         "signals": len(gs), "virtual": len(gv),
                         "virtual_avg_R": _mean([s["virtual"]["R_net"] for s in gv]),
                         "virtual_win": (100.0 * sum(1 for s in gv if s["virtual"]["R_net"] > 0) / len(gv)) if gv else None,
-                        "days": (days[0], days[-1]) if days else None}
+                        "days": (gdays[0], gdays[-1]) if gdays else None}
     r["by_list"], r["universe_from"] = groups, universe_from(cfg)
     k = {}
     for verdict in ("agree", "disagree"):
@@ -432,16 +485,21 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
     traded = {s.get("id"): s for s in sigs if s.get("decision") == "traded"}
     r["kronos_real"] = {v: sum(1 for s in traded.values() if (s.get("kronos") or {}).get("verdict") == v)
                         for v in ("agree", "disagree")}
-    ok_avg = r["real_avg_gbp"] is not None and r["real_avg_gbp"] > 0
-    ok_tracker = r["strategy_ret"] is not None and r["tracker_ret"] is not None and r["strategy_ret"] > r["tracker_ret"]
-    r["ok_avg"], r["ok_tracker"] = ok_avg, ok_tracker
-    if not closed:
-        r["status"] = "NO REAL TRADES YET" if not r["final"] else "FAIL: no real trades in the window"
-    elif r["final"]:
-        r["status"] = "PASS" if ok_avg and ok_tracker else "FAIL"
-    else:
-        r["status"] = "ON TRACK" if ok_avg and ok_tracker else "NOT ON TRACK"
     return r
+
+
+def status_line(label, p):
+    """One running-status line: the status, how many closed trades it rests on, and the two tests."""
+    n = "%d closed trade%s" % (p["n"], "" if p["n"] == 1 else "s")
+    if p["status"] == "TOO FEW TRADES TO JUDGE":
+        head = "too few trades to judge (%s, minimum %d)" % (n, p["min_trades"])
+        if p["lean"]:
+            head += "; so far it reads %s" % p["lean"]
+    else:
+        head = "%s, based on %s" % (p["status"], n)
+    return "%s (%s to %s): %s. Average %s a trade after costs, total %s; strategy %s (on %s) vs S&P 500 tracker %s" % (
+        label, p["from"], p["to"], head, _gbp(p["avg_gbp"]), _gbp(p["total_gbp"]), _pct(p["strategy_ret"]),
+        _gbp(p["start_value"]) if p["start_value"] else "no start value", _pct(p["tracker_ret"]))
 
 
 def _ny_dt(utc_naive):
@@ -450,9 +508,12 @@ def _ny_dt(utc_naive):
 
 def report_text(r):
     k = r["kronos"]
-    lines = ["EVIDENCE MODE REPORT (demo forward test %s to %s), %s" % (r["start"], r["end"], r["today"]),
-             "Status: %s. Pass needs a positive average per real trade after costs AND beating the tracker." % r["status"],
-             "Real trades: %d closed, average %s (%s) a trade after costs, total %s%s" % (
+    lines = ["EVIDENCE MODE REPORT (demo forward test since %s, no end date), %s" % (r["start"], r["today"]),
+             "Running status. ON TRACK needs a positive average per real trade after costs AND beating the "
+             "tracker over the same days; under %d closed trades it is too few trades to judge." % r["min_trades"],
+             status_line("This week", r["week"]),
+             status_line("Since the start", r["since_start"]),
+             "Real trades since the start: %d closed, average %s (%s) a trade after costs, total %s%s" % (
                  len(r["real"]), _gbp(r["real_avg_gbp"]), _pct(r["real_avg_ret"]), _gbp(r["real_total_gbp"]),
                  "" if not r.get("history_error") else " (order history: %s)" % r["history_error"]),
              "Virtual signals: %d logged, %d resolved, average %s after costs (%s a trade), %s won" % (
@@ -460,9 +521,6 @@ def report_text(r):
                  _pct(r["virtual_avg_ret"]), "no data" if r["virtual_win"] is None else "%.0f%%" % r["virtual_win"]),
              "Slippage, adverse: entries %s (%d fills), exits %s (%d fills); assumed %.2f%% a fill" % (
                  _pct(r["slip_entry"]), r["slip_n"][0], _pct(r["slip_exit"]), r["slip_n"][1], 100 * SLIP),
-             "Return: strategy %s (real P&L on %s) vs S&P 500 tracker %s over the same days" % (
-                 _pct(r["strategy_ret"]), _gbp(r["start_value"]) if r["start_value"] else "no start value",
-                 _pct(r["tracker_ret"])),
              "Kronos (shadow): agreed on %d signals (virtual %s), disagreed on %d (virtual %s), no verdict on %d; "
              "real trades it agreed with %d, disagreed with %d" % (
                  k["agree"][0], "no data" if k["agree"][1] is None else "%+.3fR" % k["agree"][1],
@@ -495,11 +553,11 @@ def send_report(client, sd, cfg, report_mod, phone=None, environ=None):
 
 
 def due(cfg, today_iso, weekday):
-    """Friday, or the last day of the window, while the window is open."""
+    """Every Friday from the start date on, with no end date."""
     if not on(cfg):
         return False
-    start, end = window(cfg)
-    return start <= today_iso <= end and (weekday == 4 or today_iso == end)
+    start, _ = settings(cfg)
+    return today_iso >= start and weekday == 4
 
 
 def main(argv=None, environ=None):

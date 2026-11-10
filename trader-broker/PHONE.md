@@ -70,7 +70,7 @@ Why Telegram:
 | GUARD / GUARD ALERT | the guard placed a stop, trailed it or sold; or it cannot protect you |
 | END-OF-DAY CLOSE | 15:50 New York: the guard sold every open position (`eod_close`) and lists them; a failed sale is a loud GUARD ALERT |
 | MORNING BRIEFING | 07:30 UK on weekdays (`briefing.py`) |
-| EVIDENCE MODE REPORT | Fridays after the close, and the last day, during the forward test: real and virtual results after costs, slippage, the tracker, Kronos and the pass status |
+| EVIDENCE MODE REPORT | every Friday after the close while the forward test is on (no end date): a running ON TRACK / NOT ON TRACK status for this week and since the start, with the closed-trade count (too few trades to judge below `evidence.min_trades`), real and virtual results after costs, slippage, the tracker and Kronos |
 | CLOSING REPORT | about 15:55 New York: each trade with entry, exit, reason and P&L after fees; day and week totals; win rate; account; anything open; results against the Time Machine |
 
 The autopilot is **always on**: launchd starts `com.daytraderskill.autopilot` at login and restarts it if

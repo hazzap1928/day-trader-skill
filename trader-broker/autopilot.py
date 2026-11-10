@@ -258,7 +258,7 @@ def check_ready(cfg, client_env, phone):
     try:
         evidence.require_demo(cfg, client_env)
         if evidence.on(cfg):
-            evidence.window(cfg)
+            evidence.settings(cfg)
             if (cfg.get("autopilot") or {}).get("auto_buy") is not True:
                 problems.append("evidence mode needs autopilot.auto_buy true, so passing trades are placed")
     except evidence.EvidenceError as e:
@@ -895,7 +895,7 @@ class Pilot(object):
             self.evidence_close(report)
 
     def evidence_close(self, report):
-        """After the closing report: today's virtual results, and on Fridays (or the last day) the report."""
+        """After the closing report: today's virtual results, and every Friday the report."""
         try:
             n = evidence.resolve(self.sd)
             self.say("evidence: %d virtual results filled in" % n)
@@ -1065,17 +1065,14 @@ class Pilot(object):
     def evidence_day(self):
         alerts = mod("trader-alerts", "alerts")
         try:
-            start, end = evidence.window(self.cfg)
+            start, _ = evidence.settings(self.cfg)
         except evidence.EvidenceError as e:
             return "but %s" % e
-        d0, d1, today = (datetime.date.fromisoformat(x) for x in (start, end, _ny().date().isoformat()))
-        days, n, d = [], 0, d0
-        while d <= d1:
-            if alerts.trading_day(d)[0]:
-                days.append(d)
+        d, today, n = datetime.date.fromisoformat(start), _ny().date(), 0
+        while d <= today:
+            n += 1 if alerts.trading_day(d)[0] else 0
             d += datetime.timedelta(days=1)
-        n = sum(1 for x in days if x <= today)
-        return "forward test %s to %s, trading day %d of %d" % (start, end, n, len(days))
+        return "forward test since %s, no end date, trading day %d" % (start, n)
 
     def positions_lines(self):
         try:

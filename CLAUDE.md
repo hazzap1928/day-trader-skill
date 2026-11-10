@@ -67,8 +67,10 @@ The guard's protections:
   trades only in the primary currency, so a USD balance cannot avoid the fee for API orders.
 - **`autopilot`:** `auto_buy: true`, `evidence_mode: true`.
 
-## Evidence mode: the forward test (9 to 20 Nov 2026)
+## Evidence mode: the forward test (from 9 Nov 2026, no end date)
 
+- **Open-ended:** `"evidence": {"start": "2026-11-09", "min_trades": 20}`. It runs until it is turned
+  off; an old `end` key is ignored. The demo agent runs indefinitely.
 - **Demo only.** Live refuses it in three places:
   - trader-risk, when `paper` is not true
   - `t212.py place --live`
@@ -82,13 +84,16 @@ The guard's protections:
 - **Kronos** gives a verdict on each signal it has time for, up to 9 min a cycle, traded signals first.
   One verdict takes about 5 min on this Mac, so most signals are "skipped". It never blocks anything.
   Before 10 Nov every verdict was "error": the model loader printed to stdout before the JSON.
-- **The Friday Telegram report** covers:
+- **The Friday Telegram report** goes out every Friday, forever, and covers:
   - real and virtual results after costs
   - actual against assumed slippage
   - the return against an S&P 500 tracker
   - Kronos agree against disagree
   - hand list and universe results on separate lines
-- **To pass:** a positive average per real trade after costs AND beating the tracker over the same days.
+- **Running status, no final PASS/FAIL day:** each Friday shows ON TRACK or NOT ON TRACK for "this
+  week" (Monday, or the start, to Friday) and "since the start", each with its closed-trade count.
+  ON TRACK = a positive average per real trade after costs AND beating the tracker over the same days.
+  Below `min_trades` closed trades it says "too few trades to judge" (and how it reads so far).
 - **Prior research** (`research/README.md`): the current ORB rule is about break-even before costs
   (-0.03R) and loses about 0.65R a trade after them. Nothing tested beat holding an S&P 500 tracker.
 

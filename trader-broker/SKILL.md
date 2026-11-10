@@ -323,7 +323,8 @@ Anything that does not load says "no data". It only ever GETs.
 
 **Evidence mode (`evidence.py`, demo forward test).** Turned on with
 `"autopilot": {"evidence_mode": true, "auto_buy": true}` and
-`"evidence": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}`. Live refuses it everywhere:
+`"evidence": {"start": "YYYY-MM-DD", "min_trades": 20}`. It has no end date: it runs, and the
+Friday reports go out, until you turn it off. Live refuses it everywhere:
 - trader-risk refuses it on a config that is not `"paper": true`
 - `t212.py place --live` refuses to send
 - `go_live.py --check` lists it as a STOP
@@ -340,16 +341,19 @@ While it is on:
 - **Slippage:** real trades record the price expected when the order went in, and the guard records
   the price it saw when it sold. The Friday report measures slippage against Trading 212's fills.
 - **Kronos:** `trader-kronos/` gives a shadow verdict on each signal and never blocks anything.
-- **Friday report:** each Friday after the close, and on the last day, the phone gets the evidence
+- **Friday report:** every Friday after the close, with no end date, the phone gets the evidence
   report:
   - real trades and virtual signals, with their averages after costs
   - actual against assumed slippage
   - the return against an S&P 500 tracker over the same days
   - how the signals Kronos agreed with did, against the ones it disagreed with
-  - the pass status
+  - a running status, ON TRACK or NOT ON TRACK, for this week and for since the start, each with
+    the number of closed trades it rests on
 
-  To pass, it needs a positive average per real trade after costs AND a better return than the
-  tracker. BOUGHT messages and `/status` say EVIDENCE MODE.
+  There is no final PASS/FAIL day. ON TRACK needs a positive average per real trade after costs AND
+  a better return than the tracker over the same days. Below `min_trades` closed trades (default 20)
+  the status says "too few trades to judge", with how it reads so far. BOUGHT messages and
+  `/status` say EVIDENCE MODE.
 
 **Autopilot and phone approvals (`autopilot.py`, `phone.py`, demo only).** For
 time away from the Mac. On weekdays launchd runs `run-autopilot.sh`. Every 15
