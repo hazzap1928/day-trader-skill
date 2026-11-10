@@ -42,7 +42,7 @@ class Repo(unittest.TestCase):
     def test_root_matches_the_reel(self):
         # trader/ is the user's own local state (git-ignored), made by running the tools here
         root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d not in ("trader", ".DS_Store"))
-        self.assertEqual(root, sorted([".claude-plugin", "CLAUDE.md", "LICENSE", "README.md", "research", "tests",
+        self.assertEqual(root, sorted([".claude-plugin", "CLAUDE.md", "LICENSE", "METHODOLOGY.md", "README.md", "research", "tests",
                                       "trader-kronos"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
