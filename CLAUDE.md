@@ -55,7 +55,7 @@ The guard's protections:
 - **`account_budget` on:**
   - `budget_gbp` = the account value with `cash_buffer_pct` 10, so 90% can be invested
   - max loss 1% a trade, 3% a day of the start-of-day value
-  - no `max_budget_gbp` cap; on 9 Nov: GBP 5,024.80 account, GBP 50.24 a trade, GBP 150.74 a day
+  - no `max_budget_gbp` cap
 - **Trading rules:** `max_trades_per_day` 5, `min_reward_risk` 1.5, entries 09:45 to 15:30 New York.
 - **Lists:** `allowed_tickers` holds 100 liquid large caps and ETFs (US-listed ETFs are mostly not
   buyable from a UK account); `blocked_tickers` is empty and always wins.
