@@ -464,6 +464,9 @@ class GuardRecordsWhatItSaw(Base):
     def test_the_end_of_day_close_records_the_price_it_saw_and_the_order(self):
         client = t212.Client("demo", CREDS["T212_API_KEY"], CREDS["T212_API_SECRET"], state_dir=self.dir,
                              log=lambda m: None)
+        self.write("state/broker.json", {"orders": [{"side": "buy", "kind": "entry", "broker": "trading212",
+                                                      "env": "demo", "t212_ticker": "TSLA_US_EQ", "qty": "7",
+                                                      "stop": 358.32, "status": "stop_placed"}]})
         self.router.add("GET", "/equity/positions", FakeResp(HELD7))
         self.router.add("GET", "/equity/orders", FakeResp([]))
         self.router.add("POST", "/equity/orders/market", FakeResp({"id": 9300}))

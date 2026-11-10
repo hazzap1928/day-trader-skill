@@ -31,7 +31,23 @@ The guard's protections:
 - stops are good till cancelled, and checked again 1 minute after placing and on every cycle
 - a REJECTED or missing stop becomes a **software stop**: a market sell at the stop, with a loud alert
 - trailing stop: starts once 1R in profit (`activate_r`, default 1), then trails 1R under the high
-- end-of-day close at 15:50 New York: it cancels each stop, then sells at market
+- end-of-day close at 15:50 New York: it cancels each stop, then sells at market. Which positions
+  depends on the buy record in `trader/state/broker.json` (see "Strategy labels" below)
+
+## Strategy labels (post-earnings drift, stage 1 of 4)
+
+- Each buy record has `"strategy"`: `"intraday"` or `"drift"`. `t212.py place` (and so the autopilot)
+  labels every buy `"intraday"`. A record with no label counts as intraday. Nothing buys drift yet:
+  the drift scan, drift buying behind a switch, and switching it on are stages 2 to 4.
+- A drift record also has `"sell_date"`, a New York trading date. `t212.drift_sell_date(entry, n)`
+  works it out as n NYSE trading days after the entry date (the holiday list in
+  `trader-alerts/alerts.py`, 2026 and 2027 only; past that it refuses).
+- The 15:50 close sells intraday and unlabelled positions, and drift positions on or after their
+  `sell_date` (or with no readable one). It keeps a drift position before its sell date, stop untouched.
+  A position with no buy record at all is **not sold**: it gets a GUARD ALERT instead.
+- The 1R trailing stop and half-sell-at-target are intraday only. Drift keeps its fixed stop, the
+  missing-stop check and the software-stop backup.
+- Tests: `tests/test_drift.py`.
 
 ## Scheduling (launchd, `~/Library/LaunchAgents/com.daytraderskill.*.plist`)
 

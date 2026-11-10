@@ -27,6 +27,14 @@ def held(qty=7, ticker=TICKER):
             "currentPrice": 366.0}
 
 
+def record(ticker=TICKER, **extra):
+    """A buy record from t212.py place, as in trader/state/broker.json."""
+    return dict({"date": "2026-11-05", "index": 1, "fingerprint": "fp-" + ticker, "symbol": ticker.split("_")[0],
+                 "side": "buy", "qty": "7", "kind": "entry", "broker": "trading212", "env": "demo",
+                 "t212_ticker": ticker, "stop": 358.32, "entry": 364.18, "target": 370.04,
+                 "status": "stop_placed", "at": "2026-11-05T10:30:00-05:00"}, **extra)
+
+
 def ny(h, m, s=0):
     return float(calendar.timegm((2026, 11, 5, h + 5, m, s)))       # New York is UTC-5 in November
 
@@ -35,6 +43,7 @@ class Close(Base):
     def setUp(self):
         super().setUp()
         self.write("config.json", dict(self.cfg, **EOD_ON))
+        self.write("state/broker.json", {"orders": [record(), record("AAPL_US_EQ")]})   # no label: intraday
         self.client = t212.Client("demo", CREDS["T212_API_KEY"], CREDS["T212_API_SECRET"], state_dir=self.dir,
                                   log=lambda m: None)
 

@@ -1151,7 +1151,8 @@ def cmd_place(client, args, confirm=None):
             "paper": client.env == "demo", "t212_ticker": ticker, "reply": reply,
             "plain": "%s %s %s, market" % (side.upper(), _qty(sz["qty"]), ticker)}
     if side == "buy":
-        base.update(max_loss=sz["max_loss_usd"], max_loss_gbp=sz["max_loss_gbp"], stop=sz["stop_usd"],
+        base.update(strategy="intraday",            # every buy today is intraday; a drift buy (stage 3) adds sell_date
+                    max_loss=sz["max_loss_usd"], max_loss_gbp=sz["max_loss_gbp"], stop=sz["stop_usd"],
                     entry=sz["entry_usd"], cost_gbp=sz["cost_gbp"], fx_rate=fx[0],
                     target=_num(order.get("take_profit_limit_price")) or _num((order.get("plan") or {}).get("target")))
     path, body = bodies[0]
@@ -1338,6 +1339,85 @@ def guard_ticket(state, ticker, env):
                 and r.get("status") in GUARD_STATUSES and _num(r.get("stop")) and _num(r.get("qty"))):
             found = r
     return found
+
+
+STRATEGIES = ("intraday", "drift")
+
+
+def position_strategy(rec):
+    """"intraday" or "drift" for a buy record. No label (records from before labels) is intraday."""
+    s = str((rec or {}).get("strategy") or "intraday").strip().lower()
+    return s if s in STRATEGIES else "intraday"
+
+
+def is_drift(rec):
+    return rec is not None and position_strategy(rec) == "drift"
+
+
+def position_record(state, ticker, env):
+    """The latest buy record this pack wrote for the ticker on this account, stop or not, or None.
+    A buy Trading 212 refused ("failed") bought nothing, so it is not counted."""
+    found = None
+    for r in (state or {}).get("orders", []):
+        if (r.get("broker") == "trading212" and r.get("env") == env and r.get("t212_ticker") == ticker
+                and str(r.get("side", "")).lower() == "buy" and r.get("kind") == "entry"
+                and r.get("status") != "failed"):
+            found = r
+    return found
+
+
+def _iso_date(v):
+    try:
+        return datetime.date.fromisoformat(str(v).strip()[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def drift_due(rec, today):
+    """(due, why) for a drift record on the New York date `today` (a date or "YYYY-MM-DD").
+    Due on its sell_date or later. A drift record with no readable sell_date is due (sold, as intraday is)."""
+    d = _iso_date(rec.get("sell_date"))
+    t = today if isinstance(today, datetime.date) else _iso_date(today)
+    if d is None:
+        return True, "drift record with no readable sell_date, so closed like an intraday position"
+    if t >= d:
+        return True, "drift sell date %s%s" % (d.isoformat(), "" if t == d else ", overdue")
+    return False, "drift, sell date %s" % d.isoformat()
+
+
+_ALERTS = []
+
+
+def alerts_module():
+    """trader-alerts/alerts.py, for the NYSE holiday calendar."""
+    if not _ALERTS:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-alerts", "alerts.py")
+        spec = importlib.util.spec_from_file_location("trader_alerts_calendar", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _ALERTS.append(mod)
+    return _ALERTS[0]
+
+
+def drift_sell_date(entry_date, n):
+    """The New York trading date n trading days after entry_date (a date or "YYYY-MM-DD"), skipping
+    weekends and NYSE holidays. Returns "YYYY-MM-DD". Refuses a date the holiday list does not cover."""
+    al = alerts_module()
+    d = entry_date if isinstance(entry_date, datetime.date) else _iso_date(entry_date)
+    if d is None:
+        raise T212Error("drift_sell_date wants an entry date like 2026-11-10, not %r" % (entry_date,), 2)
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise T212Error("drift_sell_date wants a whole number of trading days, 1 or more, not %r" % (n,), 2)
+    left = n
+    while left:
+        d += datetime.timedelta(days=1)
+        if d.year not in al.CALENDAR_YEARS:
+            raise T212Error("the NYSE holiday list covers %s only, so a sell date in %d cannot be worked out; "
+                            "add that year's holidays to trader-alerts/alerts.py"
+                            % (" and ".join(map(str, al.CALENDAR_YEARS)), d.year), 2)
+        if al.trading_day(d)[0]:
+            left -= 1
+    return d.isoformat()
 
 
 def guard_send_stop(client, ticker, qty, stop):
@@ -1783,7 +1863,7 @@ def guard_pass(client, state_dir):
                 continue
             row["software"] = (sw or {}).get("why") or "fractional_stops software"
             ticket_qty = min(float(_num(rec["qty"])), held - covered)
-            guard_market(g, row, rec, held - covered, ticket_qty, row["price"], trail_settings(cfg), cfg)
+            guard_market(g, row, rec, held - covered, ticket_qty, row["price"], None if is_drift(rec) else trail, cfg)
             if row.get("status") == "watching":
                 row["status"] = "software stop"
                 row["note"] = "the guard sells at market at or under %.2f (%s)" % (row["stop"], row["software"])
@@ -1810,13 +1890,15 @@ def guard_pass(client, state_dir):
                    "then delete %s from \"unclear\" in %s" % (ticker, g.unclear[ticker], ticker, g.path))
             continue
         if mode == "market":
-            guard_market(g, row, rec, held, ticket_qty, price, trail, cfg)
+            guard_market(g, row, rec, held, ticket_qty, price, None if is_drift(rec) else trail, cfg)
             continue
         want = min(held, ticket_qty) - covered          # never more than the ticket bought
         want = _floor(want, 0.01 if (want % 1) > 1e-9 else 1)
         if want <= 0:
             row["status"] = "covered"
-            if trail and price is not None:
+            if is_drift(rec):
+                row["trail"] = "drift position: no trailing or half sale, the stop stays where it is"
+            elif trail and price is not None:
                 guard_trail(g, row, rec, stops[0], held, price, trail, cfg) if len(stops) == 1 else \
                     row.update(trail="not trailed: %d stop orders cover it, the guard trails exactly one" % len(stops))
             continue
@@ -1895,15 +1977,21 @@ def eod_settings(cfg):
 
 
 def eod_close(client, state_dir):
-    """Sell every open position at market, after cancelling its pending sells (the stop holds
+    """Sell the day's positions at market, after cancelling their pending sells (the stop holds
     the shares). Exits only: every write is a cancel or a SELL. Demo only.
-    Returns {"at", "closed": [...], "failed": [...], "nothing": bool}."""
+    Which positions, from their buy record in trader/state/broker.json:
+      intraday (or no strategy label): sold
+      drift: sold on or after its sell_date; before it, kept with its stop untouched
+      no buy record at all: not sold, and a GUARD ALERT says so
+    Returns {"at", "closed": [...], "failed": [...], "kept": [...], "unknown": [...], "nothing": bool}."""
     if client.env != "demo":
         raise T212Error("the end-of-day close runs on the demo account only; nothing was sent", 2)
     tk = ticket_module()
     out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
-           "closed": [], "failed": [], "sold": []}
+           "closed": [], "failed": [], "sold": [], "kept": [], "unknown": []}
     g = _Guard(client, state_dir, out)
+    state = tk.load_state(os.path.join(state_dir, "state", "broker.json"))
+    today = _today_ny(tk)
     positions = client.get(POSITIONS) or []
     pending = client.get(ORDERS) or []
     for p in positions:
@@ -1911,6 +1999,17 @@ def eod_close(client, state_dir):
         held = _num(p.get("quantity")) or 0
         if not ticker or held <= 0:
             continue
+        rec = position_record(state, ticker, client.env)
+        if rec is None:
+            out["unknown"].append("%s: %s held with no buy record from this pack, so the end-of-day close did NOT "
+                                  "sell it. Sell it yourself in the app if it should go" % (ticker, _qty(held)))
+            continue
+        why = ""
+        if is_drift(rec):
+            due, why = drift_due(rec, today)
+            if not due:
+                out["kept"].append("%s: %s held, %s: kept, its stop left in place" % (ticker, _qty(held), why))
+                continue
         stops, others = guard_sell_orders(pending, ticker)
         if g.unclear.get(ticker):
             out["failed"].append("%s: NOT CLOSED, an earlier guard order is unclear (%s); sell it in the app"
@@ -1952,14 +2051,14 @@ def eod_close(client, state_dir):
         out["placed"] += 1
         out["sold"].append({"ticker": ticker, "qty": held, "price_seen": _num(p.get("currentPrice")),
                             "order_id": resp.get("id")})       # for the evidence report's exit slippage
-        out["closed"].append("%s: SELL %s at market, order id %s%s" % (
-            ticker, _qty(held), _ident(resp.get("id")),
+        out["closed"].append("%s: SELL %s at market, order id %s%s%s" % (
+            ticker, _qty(held), _ident(resp.get("id")), " (%s)" % why if why else "",
             "" if not cancelled else ", cancelled %s" % ", ".join(
                 "%s %s" % (o.get("type", "?"), _fmt(o.get("stopPrice"))) for o in cancelled)))
-    g.state["eod"] = {"date": _today_ny(tk), "at": out["at"], "closed": out["closed"], "failed": out["failed"],
-                      "sold": out["sold"]}
+    g.state["eod"] = {"date": today, "at": out["at"], "closed": out["closed"], "failed": out["failed"],
+                      "sold": out["sold"], "kept": out["kept"], "unknown": out["unknown"]}
     g.save()
-    out["nothing"] = not out["closed"] and not out["failed"]
+    out["nothing"] = not out["closed"] and not out["failed"] and not out["kept"] and not out["unknown"]
     return out
 
 
@@ -1968,7 +2067,8 @@ def render_eod(res):
     if res["nothing"]:
         lines.append("  nothing open: nothing sold")
     lines += ["  closed: " + x for x in res["closed"]]
-    lines += ["  !!! " + x for x in res["failed"]]
+    lines += ["  kept: " + x for x in res.get("kept", [])]
+    lines += ["  !!! " + x for x in res["failed"] + res.get("unknown", [])]
     return "\n".join(lines)
 
 
@@ -1985,6 +2085,8 @@ def run_eod(client, state_dir):
     _phone_push(client, text)
     for f in res["failed"]:
         guard_alarm(client, "END-OF-DAY CLOSE FAILED: " + f)
+    for f in res.get("unknown", []):
+        guard_alarm(client, "END-OF-DAY CLOSE: " + f)
     return res
 
 
