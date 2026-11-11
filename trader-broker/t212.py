@@ -135,6 +135,22 @@ class PlaceError(T212Error):
         self.status = status
 
 
+INSUFFICIENT_FUNDS = "insufficient-free-for-stocks-buy"   # Trading 212's error type for a buy with too little cash
+
+
+class NoCash(T212Error):
+    """A buy the free cash does not cover. Raised before anything is sent (the autopilot's cash check)."""
+
+    def __init__(self, msg, info=None):
+        T212Error.__init__(self, msg, 2)
+        self.info = info or {}
+
+
+def is_no_cash(e):
+    """True for the autopilot's own cash check and for Trading 212's insufficient-funds refusal."""
+    return isinstance(e, NoCash) or INSUFFICIENT_FUNDS in str(e)
+
+
 # ---------------------------------------------------------------- environment
 
 def pick_env(live_flag, environ=None):
@@ -766,6 +782,55 @@ def size_entry(entry, stop, ticket_qty, rate, cash_gbp, cfg, fractional=None):
             "limit_gbp": round(limit, 2), "limit_src": limit_src, "cash_gbp": cash_gbp}
 
 
+def pending_buys_gbp(pending, rate, state=None):
+    """GBP cost, with the FX fee, of buy orders at Trading 212 that have not filled yet: cash that is
+    spoken for. A market order has no price of its own, so it is priced at the entry its buy record
+    planned. Returns (gbp, [tickers whose cost is unknown])."""
+    planned = {}
+    for r in (state or {}).get("orders", []):
+        if str(r.get("side", "")).lower() == "buy" and r.get("t212_ticker") and _num(r.get("entry")):
+            planned[r["t212_ticker"]] = _num(r["entry"])
+    total, unknown = 0.0, []
+    for o in pending or []:
+        q = _num(o.get("quantity")) or 0
+        side = str(o.get("side") or "").upper()
+        if side != "BUY" and not (not side and q > 0):
+            continue
+        left = abs(q) - abs(_num(o.get("filledQuantity")) or 0)
+        if left <= 1e-9:
+            continue
+        t = _o_ticker(o)
+        px = _num(o.get("limitPrice")) or _num(o.get("stopPrice")) or planned.get(t)
+        if not px:
+            unknown.append(t or "?")
+            continue
+        total += left * px / rate * (1 + FX_FEE)
+    return round(total, 2), unknown
+
+
+def free_cash(summary, pending, rate, cfg, state=None):
+    """Cash a new buy may use: Trading 212's cash available to trade, minus buys still waiting to
+    fill, minus the cash buffer (cash_buffer_pct of the day's budget_gbp, else of the account value)."""
+    cash = _num(((summary or {}).get("cash") or {}).get("availableToTrade")) or 0.0
+    waiting, unknown = pending_buys_gbp(pending, rate, state)
+    pct = _num((cfg or {}).get("cash_buffer_pct")) or 0.0
+    base = _num((cfg or {}).get("budget_gbp")) or _num((summary or {}).get("totalValue")) or 0.0
+    buffer = round(base * pct / 100.0, 2)
+    return {"cash": round(cash, 2), "waiting": waiting, "unknown": unknown, "buffer": buffer,
+            "available": round(cash - waiting - buffer, 2)}
+
+
+def no_cash_text(fc, need=None):
+    """One plain line on the cash, for the autopilot log (never the phone, never Trading 212's error JSON)."""
+    s = "free cash GBP %.2f, minus GBP %.2f for buys waiting to fill, minus the GBP %.2f buffer = GBP %.2f" % (
+        fc["cash"], fc["waiting"], fc["buffer"], fc["available"])
+    if fc.get("unknown"):
+        s += "; a buy waiting to fill has no known price (%s), so no cash is counted as free" % ", ".join(fc["unknown"])
+    if need is not None:
+        s += "; this buy needs about GBP %.2f with the FX fee" % need
+    return s
+
+
 FRACTIONAL_TYPES = ("STOCK", "ETF")
 
 
@@ -1110,6 +1175,16 @@ def cmd_place(client, args, confirm=None):
     else:
         price, price_src = ticket_price(order, paths["prices"])
 
+    # 4b. the autopilot's cash check: skip (never shrink) a buy the free cash does not cover
+    if side == "buy" and getattr(args, "cash_check", False):
+        fc = free_cash(summary, pending, fx[0], cfg, state)
+        need = round(ticket_qty * price / fx[0] * (1 + FX_FEE), 2)
+        if fc["unknown"] or need > fc["available"] + 0.005:
+            why = "no free cash: %s" % no_cash_text(fc, need)
+            log_event(sd, secrets, "refused", env=client.env, ticket=index, fingerprint=fp, ticker=ticker,
+                      reasons=[why])
+            raise NoCash("NOT PLACED: " + why, dict(fc, need=need))
+
     # 5. size and build the exact bodies
     if side == "buy":
         stop = _num(order.get("stop_loss_stop_price")) or _num((order.get("plan") or {}).get("stop"))
@@ -1328,6 +1403,26 @@ def stop_rejected_alarm(client, ticker, qty, stop, how):
                         "market when the price is at or under %.2f, checking every minute. Keep the Mac awake and "
                         "the guard running, or set a stop yourself in the app."
                 % (how, ticker, _qty(qty), stop, stop))
+
+
+REALERT_EVERY = 3600              # seconds: a position with no stop order is alarmed again at most this often
+
+
+def stop_still_missing(g, ticker, qty, sw):
+    """A position whose stop order was refused or is gone, held under a software stop: the urgent alert
+    again, at most once an hour per position (the first one went out when it happened)."""
+    realert = g.state.setdefault("realert", {})
+    last = _num(realert.get(ticker)) or _num(sw.get("alerted"))
+    if last is None:
+        realert[ticker] = _now()
+        g.save()
+        return
+    if _now() - last < REALERT_EVERY:
+        return
+    realert[ticker] = _now()
+    g.save()
+    stop_rejected_alarm(g.client, ticker, qty, float(sw["stop"]),
+                        "STILL NOT PLACED (%s)" % (sw.get("why") or "no stop order"))
 
 
 def guard_ticket(state, ticker, env):
@@ -1845,7 +1940,7 @@ def guard_pass(client, state_dir):
                         stop_now = max(float(rec["stop"]), _num((g.trail.get(ticker) or {}).get("stop")) or 0)
                         software[ticker] = {"fingerprint": rec.get("fingerprint"), "stop": stop_now,
                                             "why": "stop order %s was %s (%s)" % (_ident(v["id"]), how, raw),
-                                            "since": out["at"]}
+                                            "since": out["at"], "alerted": _now()}
                         g.save()
                         stop_rejected_alarm(client, ticker, held, stop_now,
                                             "REJECTED by Trading 212" if how == "rejected" else
@@ -1862,6 +1957,8 @@ def guard_pass(client, state_dir):
                        % (ticker, g.unclear[ticker]))
                 continue
             row["software"] = (sw or {}).get("why") or "fractional_stops software"
+            if sw and sw.get("fingerprint") == rec.get("fingerprint"):
+                stop_still_missing(g, ticker, held - covered, sw)
             ticket_qty = min(float(_num(rec["qty"])), held - covered)
             guard_market(g, row, rec, held - covered, ticket_qty, row["price"], None if is_drift(rec) else trail, cfg)
             if row.get("status") == "watching":
@@ -1915,13 +2012,17 @@ def guard_pass(client, state_dir):
                    % (ticker, _qty(want), stop, "was refused" if o == "rejected" else "is UNCLEAR", err))
             if o == "rejected":           # refused outright: protect it in software from now on
                 software[ticker] = {"fingerprint": rec.get("fingerprint"), "stop": stop,
-                                    "why": "the guard's stop was refused (%s)" % err, "since": out["at"]}
+                                    "why": "the guard's stop was refused (%s)" % err, "since": out["at"],
+                                    "alerted": _now()}
                 g.save()
                 stop_rejected_alarm(client, ticker, want, stop, "REFUSED by Trading 212")
             continue
         oid = err.get("id") if isinstance(err, dict) else None
         row.update(status="stop placed", placed_qty=want, order_id=oid)
         out["placed"] += 1
+    for t in [t for t in g.state.get("realert") or {} if t not in held_tickers]:
+        g.state["realert"].pop(t, None)           # sold: no more reminders for it
+        g.save()
     for o in pending:
         t = _o_ticker(o)
         if t and t not in held_tickers and o in guard_sell_orders(pending, t)[0]:

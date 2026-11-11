@@ -64,6 +64,8 @@ REPORT_AFTER = 5                 # minutes after the end-of-day close (15:50 New
 EOD_DEFAULT = "15:50"
 DRIFT_SCAN_AT = "15:35"          # New York: the drift shadow scan, after the last entry cycle, before the report
 STEP_TIMEOUT = 900
+NOT_COUNTED = ("refused", "no cash")   # tickets that never became a buy do not count toward max_tickets_per_day
+MIN_FREE_GBP = 1.0               # after a cash skip today, a scan builds nothing while less than this is free
 
 
 class PilotError(Exception):
@@ -356,8 +358,8 @@ class Pilot(object):
             return "paused from your phone: no scan"
         if self.pending():
             return "a ticket is waiting for your answer: no new scan"
-        if len(self.state["tickets"]) >= self.s["max_tickets_per_day"]:
-            return "%d tickets sent today, the most autopilot.max_tickets_per_day allows" % len(self.state["tickets"])
+        if self.cap_reached():
+            return "%d tickets today, the most autopilot.max_tickets_per_day allows" % len(self.counted())
         allow = t212.allowed_tickers(self.cfg)
         if not allow:
             raise PilotError("no allowed_tickers in trader/config.json")
@@ -377,7 +379,7 @@ class Pilot(object):
         code, out, _ = self.run(["trader-entry/entry.py", "watchlist", "--watchlist", self.p("watchlist.json"),
                                  "--config", cfgp, "--json"], "trader-entry")
         rows = self.json_of(out, "trader-entry") if out.strip() else []
-        notes = []
+        notes, no_cash = [], []
         for r in rows:
             sym = str(r.get("symbol") or "").upper()
             res = r.get("result") or {}
@@ -394,6 +396,15 @@ class Pilot(object):
             if sym in held:
                 self.state["tried"][sym] = "already held"
                 continue
+            if no_cash:                          # cash ran out in this scan: the rest are not built (nor marked tried)
+                no_cash.append(sym)
+                continue
+            if self.cap_reached():
+                notes.append("ticket limit: %d today, the most autopilot.max_tickets_per_day allows" % len(self.counted()))
+                break                              # not marked tried
+            if self.state.get("cash_short") and not self.cash_free():
+                no_cash.append(sym)
+                continue
             self.sig = None
             got = self.build(sym, cfgp, fx)
             self.state["tried"][sym] = got if isinstance(got, str) else "passed every check"
@@ -404,6 +415,13 @@ class Pilot(object):
                 continue
             if self.s["auto_buy"]:
                 t = self.auto_buy(got)
+                if t["status"] == "no cash":
+                    self.state["tried"][sym] = "skipped: no free cash"
+                    self.state["cash_short"] = True
+                    self.save()
+                    self.log_signal("skipped: no free cash", ticket=t["id"])
+                    no_cash.append(sym)
+                    continue
                 self.log_signal("traded" if t["status"] == "placed" else "not placed: %s" % t.get("note", t["status"]),
                                 ticket=t["id"])
                 if self.s["evidence_mode"]:
@@ -413,8 +431,49 @@ class Pilot(object):
             self.log_signal("ticket sent to the phone")
             self.send_ticket(got)
             return "%s: ticket sent to your phone" % sym
+        if no_cash:
+            notes.append(self.cash_summary(no_cash))
         self.kronos_pass()
         return "no ticket: " + ("; ".join(notes) if notes else "nothing triggered that was not tried today")
+
+    def counted(self):
+        """Tickets that count toward max_tickets_per_day: not the ones refused or skipped for cash."""
+        return [t for t in self.state["tickets"] if t.get("status") not in NOT_COUNTED]
+
+    def cap_reached(self):
+        return len(self.counted()) >= self.s["max_tickets_per_day"]
+
+    def cash_free(self):
+        """After a cash skip today: is there cash for a buy again (a stop-out frees it)? A failed read
+        says yes, and the check at placing time decides."""
+        try:
+            summary = self.client.get(t212.SUMMARY) or {}
+            pending = self.client.get(t212.ORDERS) or []
+        except t212.T212Error as e:
+            self.say("cash check failed (%s): the check at placing time decides" % t212.scrub(e, self.client._secrets))
+            return True
+        state = t212._read_json(self.p("state", "broker.json"), {}) or {}
+        fc = t212.free_cash(summary, pending, self.rate() or 1.0, self.cfg, state)
+        if fc["unknown"] or fc["available"] < MIN_FREE_GBP:
+            self.say("still no free cash: %s" % t212.no_cash_text(fc))
+            return False
+        self.state["cash_short"] = False
+        self.save()
+        return True
+
+    def cash_summary(self, syms):
+        """One line per scan for the candidates skipped for cash; to the phone only when it names one not
+        reported today (a scan every 15 minutes would otherwise repeat it all day)."""
+        line = "%d candidate%s skipped, no free cash (demo): %s" % (len(syms), "" if len(syms) == 1 else "s",
+                                                                   ", ".join(syms))
+        told = self.state.setdefault("cash_reported", [])
+        new = [x for x in syms if x not in told]
+        if new:
+            told.extend(new)
+            self.event(line)
+        else:
+            self.say(line + " (already on your phone today)")
+        return line
 
     def out_of_time(self):
         """True once a cycle has used 75 % of every_minutes: with a few hundred stocks the first cycle of the
@@ -631,12 +690,21 @@ class Pilot(object):
         except (PilotError, t212.T212Error) as e:
             text = self.not_placed(t, e)
         self.save()
+        if text is None:                        # no cash: logged here, summed up once per scan, no message of its own
+            self.say("%s skipped, no free cash: %s" % (t["symbol"], t["note"]))
+            return t
         self.event(text)
         return t
 
     def not_placed(self, t, e):
+        """The phone text for a ticket that was not placed, or None for no cash (no message of its own)."""
         msg = t212.scrub(e, self.client._secrets)
         t["note"] = msg
+        if t212.is_no_cash(e):
+            t["status"] = "no cash"
+            if not isinstance(e, t212.NoCash):
+                t["note"] = "Trading 212 refused it: insufficient funds"
+            return None
         if isinstance(e, t212.T212Error) and e.code == 3:
             t["status"] = "entry placed, stop not placed"
             return "!!! %s BOUGHT BUT STOP NOT PLACED (demo) !!! %s" % (t["symbol"], msg)
@@ -822,7 +890,7 @@ class Pilot(object):
             return True, "%s %s at %s" % (by, t["id"], t212._utc_now().strftime("%H:%M:%SZ")), ""
 
         args = argparse.Namespace(ticket_id=t["fingerprint"], resend=False, fx_rate=None, state_dir=self.sd,
-                                  json=False, live=False)
+                                  json=False, live=False, cash_check=True)
         buf = io.StringIO()
         with redirect_stdout(buf):
             res = t212.cmd_place(self.client, args, confirm=confirm)

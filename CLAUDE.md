@@ -104,6 +104,21 @@ The guard's protections:
   or over 15 minutes old. On a failed read the autopilot deletes it. The 3% cap is unchanged.
 - **Tests:** `tests/test_real_exit.py`.
 
+## Cash check and late fills (from 12 Nov 2026)
+
+- **Cash check before every autopilot buy** (`t212.free_cash`, in `cmd_place` when `args.cash_check`):
+  `availableToTrade` minus buys still waiting to fill (priced at their record's planned entry, with the
+  FX fee) minus the cash buffer (`cash_buffer_pct` of `budget_gbp`). A buy it does not cover is skipped
+  (`NoCash`), never shrunk. Trading 212's `insufficient-free-for-stocks-buy` refusal is treated the same.
+- **In the autopilot:** a cash skip sends no message of its own; the rest of that scan is not built (nor
+  marked tried); one summary per scan ("N candidates skipped, no free cash (demo): ..."), to the phone
+  only when it names a stock not reported today. After a skip, later scans build nothing until cash is free.
+- **`max_tickets_per_day`** counts only tickets that became a buy (not `refused` or `no cash`), and is
+  checked between buys inside a scan too.
+- **The guard** already places a missing stop when a late fill shows up (every 5 min) and pushes
+  "stop placed". A position whose stop order was refused or is gone is alarmed again at most once an hour.
+- Tests: `tests/test_cash_and_late_fill.py`.
+
 ## Scheduling (launchd, `~/Library/LaunchAgents/com.daytraderskill.*.plist`)
 
 | Job | When | What |
