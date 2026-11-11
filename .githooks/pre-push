@@ -1,0 +1,91 @@
+#!/usr/bin/python3
+"""Pre-push secrets check: stops a push whose new commits add a secret.
+
+Git runs this before every push (core.hooksPath .githooks). It looks at every commit being pushed
+that the remote does not have yet, and refuses the push if one of them:
+  - adds a file that must stay local: .env or .env.*, config.json (or a backup of it), phone.json,
+    anything under trader/ (state, logs, the real config)
+  - adds a line that looks like a secret: a Telegram bot token, a private key block, a
+    T212_API_KEY / T212_API_SECRET / TELEGRAM_BOT_TOKEN set to a value, or a long quoted
+    api_key / secret / token value
+  - adds the exact value of T212_API_KEY, T212_API_SECRET or TELEGRAM_BOT_TOKEN, when those are set
+    in the shell that runs the push
+
+It prints only the commit and file names, never a value. To check without pushing:
+    printf 'x HEAD x 0000000000000000000000000000000000000000\n' | .githooks/pre-push origin url
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+ZERO = "0" * 40
+BAD_PATH = re.compile(r"(^|/)\.env(\..*)?$|(^|/)config\.json(\.bak.*)?$|(^|/)phone\.json$|^trader/")
+BAD_LINE = [
+    ("a Telegram bot token", re.compile(r"\b[0-9]{8,10}:[A-Za-z0-9_-]{35}\b")),
+    ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("a key variable set to a value",
+     re.compile(r"(T212_API_KEY|T212_API_SECRET|TELEGRAM_BOT_TOKEN)\s*[=:]\s*[\"']?[A-Za-z0-9._+/-]{16,}")),
+    ("a long quoted key, secret or token",
+     re.compile(r"(?i)(api[_-]?key|secret|token)[\"']?\s*[=:]\s*[\"'][A-Za-z0-9+/_.-]{24,}[\"']")),
+]
+ENV_NAMES = ("T212_API_KEY", "T212_API_SECRET", "TELEGRAM_BOT_TOKEN")
+
+
+def git(*args):
+    return subprocess.run(["git"] + list(args), capture_output=True, text=True, check=True).stdout
+
+
+def commits(local, remote_sha):
+    if remote_sha != ZERO:
+        rng = ["%s..%s" % (remote_sha, local)]
+    else:
+        rng = [local, "--not", "--remotes"]
+    return [c for c in git("rev-list", *rng).split() if c]
+
+
+def check(sha, exact):
+    found = []
+    for line in git("diff-tree", "-r", "--no-commit-id", "--name-status", "--root", sha).splitlines():
+        parts = line.split("\t")
+        if parts[0][:1] in ("A", "M", "C", "R") and BAD_PATH.search(parts[-1]):
+            found.append((parts[-1], "a file that must stay local"))
+    path = None
+    for line in git("diff-tree", "-r", "-p", "--no-commit-id", "--root", "--no-color", sha).splitlines():
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else line[4:]
+            continue
+        if not line.startswith("+"):
+            continue
+        for what, rx in BAD_LINE:
+            if rx.search(line):
+                found.append((path, what))
+        for name, value in exact:
+            if value in line:
+                found.append((path, "the value of %s" % name))
+    return found
+
+
+def main():
+    exact = [(n, os.environ[n]) for n in ENV_NAMES if len(os.environ.get(n) or "") >= 8]
+    problems = []
+    for line in sys.stdin:
+        parts = line.split()
+        if len(parts) != 4 or parts[1] == ZERO:
+            continue                       # a branch deletion pushes nothing
+        for sha in commits(parts[1], parts[3]):
+            for path, what in check(sha, exact):
+                problems.append("  %s %s: %s" % (sha[:12], path, what))
+    if problems:
+        sys.stderr.write("PUSH STOPPED: the secrets check found something in the commits being pushed:\n%s\n"
+                         "Nothing was pushed. Remove it from those commits before pushing again.\n"
+                         % "\n".join(sorted(set(problems))))
+        return 1
+    sys.stderr.write("secrets check: clean (%s)\n" % ("exact key values checked too" if exact else
+                                                      "patterns only: no key variables in this shell"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

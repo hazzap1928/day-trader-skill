@@ -7,3 +7,7 @@ __pycache__/
 trader-kronos/.venv/
 trader-kronos/vendor/
 trader-kronos/models/
+
+# secrets: environment files are never committed
+.env
+.env.*
