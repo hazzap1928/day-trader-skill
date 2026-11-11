@@ -816,18 +816,73 @@ def pending_buys_gbp(pending, rate, state=None):
     return round(total, 2), unknown
 
 
+def waiting_not_held_back(summary, waiting):
+    """The part of `waiting` (GBP of buys still waiting to fill) that Trading 212 has not already taken out
+    of availableToTrade. Trading 212 holds cash back for pending orders in reservedForOrders; counting the
+    same order again would make the free cash look smaller than it is. With nothing held back, all of it."""
+    held_back = _num(((summary or {}).get("cash") or {}).get("reservedForOrders")) or 0.0
+    return round(max(waiting - max(held_back, 0.0), 0.0), 2)
+
+
 def free_cash(summary, pending, rate, cfg, state=None, reserved=0.0):
     """Cash a new buy may use: Trading 212's cash available to trade, minus buys still waiting to
-    fill, minus the cash buffer (cash_buffer_pct of the day's budget_gbp, else of the account value),
-    minus `reserved`: the demo autopilot's active reservations for OTHER stocks (trader-broker/allocation.py)."""
+    fill (the part Trading 212 has not already held back in reservedForOrders), minus the cash buffer
+    (cash_buffer_pct of the day's budget_gbp, else of the account value), minus `reserved`: the demo
+    autopilot's active reservations for OTHER stocks (trader-broker/allocation.py)."""
     cash = _num(((summary or {}).get("cash") or {}).get("availableToTrade")) or 0.0
     waiting, unknown = pending_buys_gbp(pending, rate, state)
+    waiting = waiting_not_held_back(summary, waiting)
     pct = _num((cfg or {}).get("cash_buffer_pct")) or 0.0
     base = _num((cfg or {}).get("budget_gbp")) or _num((summary or {}).get("totalValue")) or 0.0
     buffer = round(base * pct / 100.0, 2)
     reserved = round(max(_num(reserved) or 0.0, 0.0), 2)
     return {"cash": round(cash, 2), "waiting": waiting, "unknown": unknown, "buffer": buffer,
             "reserved": reserved, "available": round(cash - waiting - buffer - reserved, 2)}
+
+
+def portfolio_snapshot(summary, pending, positions, rate, state=None, reserved=0.0, now=None):
+    """The account as trader-budget and trader-risk read it (their --portfolio file), in US dollars, from
+    Trading 212: `cash` is the cash a new buy may use BEFORE the cash buffer (they take the buffer off
+    themselves): availableToTrade, minus buys waiting to fill that Trading 212 has not held back yet, minus
+    `reserved` GBP for other stocks. Each held position, and each buy waiting to fill, is a position
+    valued now (held: Trading 212's current price; waiting: the planned entry), so the position cap and
+    the buffer are worked out on the whole account. Without it they assume an empty account."""
+    if not rate or rate <= 0:
+        raise T212Error("need a GBP/USD rate for the portfolio snapshot", 2)
+    cash_gbp = _num(((summary or {}).get("cash") or {}).get("availableToTrade")) or 0.0
+    waiting, unknown = pending_buys_gbp(pending, rate, state)
+    if unknown:
+        raise T212Error("a buy waiting to fill has no known price (%s)" % ", ".join(unknown), 2)
+    reserved = round(max(_num(reserved) or 0.0, 0.0), 2)
+    free_gbp = cash_gbp - waiting_not_held_back(summary, waiting) - reserved
+    rows = {}
+
+    def add(t, qty, px):
+        sym = str(t or "").split("_")[0].upper()
+        if not sym or qty <= 1e-9 or not px:
+            return
+        r = rows.setdefault(sym, {"ticker": sym, "shares": 0.0, "lots": [{"shares": 0.0, "cost": 0.0}]})
+        r["shares"] = round(r["shares"] + qty, 6)
+        r["lots"][0]["shares"] = r["shares"]
+        r["lots"][0]["cost"] = round(r["lots"][0]["cost"] + qty * px, 2)
+
+    for p in positions or []:
+        q = _num(p.get("quantity")) or 0.0
+        add(_o_ticker(p), q, _num(p.get("currentPrice")) or _num(p.get("averagePricePaid")) or _num(p.get("averagePrice")))
+    planned = {r["t212_ticker"]: _num(r.get("entry")) for r in (state or {}).get("orders", [])
+               if str(r.get("side", "")).lower() == "buy" and r.get("t212_ticker") and _num(r.get("entry"))}
+    for o in pending or []:
+        q = _num(o.get("quantity")) or 0
+        side = str(o.get("side") or "").upper()
+        if side != "BUY" and not (not side and q > 0):
+            continue
+        left = abs(q) - abs(_num(o.get("filledQuantity")) or 0)
+        t = _o_ticker(o)
+        add(t, left, _num(o.get("limitPrice")) or _num(o.get("stopPrice")) or planned.get(t))
+    return {"as_of": (now or datetime.datetime.utcnow()).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": "Trading 212 (demo autopilot snapshot)", "currency": "USD", "usd_per_gbp": rate,
+            "cash": math.floor(max(free_gbp, 0.0) * rate * 100) / 100.0, "cash_gbp": round(free_gbp, 2),
+            "reserved_gbp": reserved, "positions": sorted(rows.values(), key=lambda r: r["ticker"])}
 
 
 def no_cash_text(fc, need=None):

@@ -79,6 +79,8 @@ The guard's protections:
   briefing, both marked SHADOW. A missing, out-of-date or broken shortlist says "no drift scan yet";
   with the scan off there is no line.
 - **By hand:** `python3 trader-broker/drift.py scan|resolve|show`.
+- **Why not:** `shortlist.json` also has `filled` (rows with EPS, forecast, both, all three), `in_list`
+  and `why_not` (a count per failed rule), and the "none" line says how many had the figures and were in the list.
 - **Tests:** `tests/test_drift_scan.py`.
 
 ## Real exit and the daily loss count (from 11 Nov 2026)
@@ -103,6 +105,10 @@ The guard's protections:
   of every entry today. The autopilot writes `trader/state/day-risk.json` before each risk check;
   trader-risk falls back to the old count (with a warning) if it is missing, broken, not today's,
   or over 15 minutes old. On a failed read the autopilot deletes it. The 3% cap is unchanged.
+- **Reports say the same rule:** the closing report and the BOUGHT message give the Time Machine's average R
+  before costs (and after), the winning share and the break-even share, and compare the day's trades by
+  average R before and after costs. "Target first" odds appear only for old tickets, labelled the old
+  fixed-2R measure (`report.tm_words`, `report.tm_line`).
 - **Tests:** `tests/test_real_exit.py`.
 
 ## Cash check and late fills (from 12 Nov 2026)
@@ -119,6 +125,14 @@ The guard's protections:
 - **The guard** already places a missing stop when a late fill shows up (every 5 min) and pushes
   "stop placed". A position whose stop order was refused or is gone is alarmed again at most once an hour.
 - Tests: `tests/test_cash_and_late_fill.py`.
+- **The account snapshot** (`t212.portfolio_snapshot`, `Pilot.write_portfolio`): before trader-budget, the
+  autopilot writes `trader/state/portfolio.json` (USD, read-only from Trading 212): cash = availableToTrade
+  minus waiting buys not already in `reservedForOrders` minus reservations for other stocks (the buffer is
+  taken off by trader-budget/trader-risk), plus every held or waiting position. Both are passed it with
+  `--portfolio`. Before this, no file existed and both saw an empty account funded with the whole budget
+  (the 11 Nov insufficient-funds refusals). A failed read removes the file (budget fallback; the
+  placing-time check still decides). `free_cash` also no longer counts a waiting buy that Trading 212
+  already holds back in `reservedForOrders`. Tests: `tests/test_cash_view.py`.
 
 ## Cash allocation and confidence (from 12 Nov 2026): `trader-broker/allocation.py`
 

@@ -92,6 +92,13 @@ universe = t212.universe_module()
 _MODS = {}
 
 
+def report_mod():
+    """trader-broker/report.py, wired to the modules this process already loaded."""
+    r = mod("trader-broker", "report")
+    r.t212, r.tk = t212, tk
+    return r
+
+
 def mod(folder, name):
     if name not in _MODS:
         _MODS[name] = _load(folder, name)
@@ -642,9 +649,10 @@ class Pilot(object):
                     "above autopilot.min_net_r %g" % (net, doc["costs"].get("mc_avg_R", 0), doc["costs"].get("mc_cost_R", 0),
                                                       doc["costs"].get("stop_pct", 0), self.s["min_net_r"]))
         self.run(["trader-alerts/alerts.py", "quote", sym, "--write", self.p("prices.json")], "a quote")
+        self.write_portfolio(sym)
         code, out, err = self.run(["trader-budget/size.py", "--plan", self.p("plan.json"), "--config", cfgp,
                                    "--fx", fx, "--prices", self.p("prices.json"),
-                                   "--portfolio", self.p("portfolio.json"), "--write", self.p("orders.json")],
+                                   "--portfolio", self.portfolio_path(), "--write", self.p("orders.json")],
                                   "trader-budget")
         if code != 0:
             return "trader-budget made no order (%s)" % (err or out).strip()[-160:]
@@ -657,7 +665,40 @@ class Pilot(object):
         return {"symbol": sym, "fingerprint": verdict["fingerprint"], "order": order, "risk": verdict,
                 "verdict": doc.get("verdict") or "", "confidence": sig.get("confidence"),
                 "tm": {"p_target": mc.get("p_target"), "p_stop": mc.get("p_stop"), "verdict": doc.get("verdict") or "",
-                       "avg_R": mc.get("avg_R"), "avg_R_net": (doc.get("costs") or {}).get("mc_avg_R_net")}}
+                       "avg_R": mc.get("avg_R"), "avg_R_net": (doc.get("costs") or {}).get("mc_avg_R_net"),
+                       "exit_model": mc.get("exit_model"), "win_share": round(lean[1], 4),
+                       "break_even": round(lean[2], 4)}}
+
+    def portfolio_path(self):
+        return self.p("state", "portfolio.json")
+
+    def write_portfolio(self, sym):
+        """The real account for trader-budget and trader-risk (read-only, from Trading 212): the cash a buy of
+        `sym` may use (after buys waiting to fill and reservations for other stocks; they take the cash buffer
+        off themselves) and what is held, in dollars. Without it they see an empty account funded with the
+        whole budget, so their cash and position checks would pass a buy the account cannot pay for. On a
+        failed read the file is removed: they fall back to the budget, and the cash check at placing time
+        (from Trading 212 again) still decides."""
+        path = self.portfolio_path()
+        try:
+            rate = self.rate()
+            summary = self.client.get(t212.SUMMARY) or {}
+            pending = self.client.get(t212.ORDERS) or []
+            positions = self.client.get(t212.POSITIONS) or []
+            state = t212._read_json(self.p("state", "broker.json"), {}) or {}
+            doc = t212.portfolio_snapshot(summary, pending, positions, rate, state,
+                                          reserved=self.reserved_others(sym),
+                                          now=datetime.datetime.utcfromtimestamp(_now()))
+            t212._write_json(path, doc)
+            return doc
+        except Exception as e:                   # read-only and never fatal: the placing-time check still decides
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            self.say("account snapshot for %s failed (%s): sizing and trader-risk use the budget; the cash check "
+                     "at placing time decides" % (sym, t212.scrub(e, self.client._secrets)))
+            return None
 
     def day_risk(self):
         """With "daily_loss_count": "open_risk": today's realised losses and open risk at the stops, from
@@ -684,7 +725,7 @@ class Pilot(object):
     def risk(self):
         self.day_risk()
         self.run(["trader-risk/check.py", "--orders", self.p("orders.json"), "--config", self.p("config.json"),
-                  "--portfolio", self.p("portfolio.json"), "--prices", self.p("prices.json"), "--fx", self.p("fx.json"),
+                  "--portfolio", self.portfolio_path(), "--prices", self.p("prices.json"), "--fx", self.p("fx.json"),
                   "--state", self.p("state", "broker.json"), "--day-risk", self.p("state", "day-risk.json"),
                   "--out", self.p("state", "risk.json")], "trader-risk")
         doc = t212._read_json(self.p("state", "risk.json"), {}) or {}
@@ -802,11 +843,7 @@ class Pilot(object):
                     fill = t212._num(p.get("averagePricePaid"))
         except t212.T212Error:
             pass
-        tm = t.get("tm") or {}
-        odds = ("target first %.1f %%, stop first %.1f %%" % (100 * tm["p_target"], 100 * tm["p_stop"])
-                if tm.get("p_target") is not None and tm.get("p_stop") is not None else "no data")
-        if tm.get("avg_R_net") is not None:
-            odds += "; average %+.2fR after costs (%+.2fR before)" % (tm["avg_R_net"], tm.get("avg_R") or 0)
+        odds = report_mod().tm_words(t.get("tm") or {})
         stop_how = ("a stop order at Trading 212, good till cancelled" if rec.get("status") == "stop_placed"
                     else "enforced by the guard in software: a market sell at the stop")
         lines = ["BOUGHT (demo, automatic%s): %s %s" % (", EVIDENCE MODE" if self.s["evidence_mode"] else "",

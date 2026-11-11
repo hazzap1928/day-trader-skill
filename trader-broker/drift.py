@@ -298,6 +298,24 @@ def check(row, s, allowed, blocked):
     return True, ""
 
 
+def reason_kind(why):
+    """check()'s reason without its numbers, for counting: "surprise 3.9% under 10%" -> "surprise under the minimum"."""
+    if why.startswith("surprise"):
+        return "surprise under the minimum"
+    if why.startswith("forecast"):
+        return "forecast under the minimum"
+    return why
+
+
+def filled_counts(rows):
+    """How many calendar rows have each figure filled in (Nasdaq leaves them blank until the report, and for
+    some stocks altogether). The rule needs all three."""
+    has = lambda r, *ks: all(r.get(k) is not None for k in ks)
+    return {"eps": sum(1 for r in rows if has(r, "eps")), "forecast": sum(1 for r in rows if has(r, "forecast")),
+            "eps_and_forecast": sum(1 for r in rows if has(r, "eps", "forecast")),
+            "all_three": sum(1 for r in rows if has(r, "eps", "forecast", "surprise_pct"))}
+
+
 def score(row, price):
     """Ranking B: the surprise relative to the share price, (EPS - forecast) / price."""
     if not price or price <= 0:
@@ -400,11 +418,16 @@ def scan(sd, cfg, today=None, force=False, budget_s=None):
         return doc
     allowed, blocked, list_src = universe(cfg, sd)
     doc["rows"], doc["list_from"] = len(rows), list_src
+    doc["filled"], doc["why_not"] = filled_counts(rows), {}
+    doc["in_list"] = sum(1 for r in rows if allowed is not None and key(r["symbol"]) in allowed)
     signals = load_signals(sd)
     seen = {(r.get("report_day"), key(r.get("symbol"))) for r in signals}
     fresh = []
     for row in rows:
         ok, why = check(row, s, allowed, blocked)
+        if not ok:
+            w = reason_kind(why)
+            doc["why_not"][w] = doc["why_not"].get(w, 0) + 1
         if not ok or (rday.isoformat(), key(row["symbol"])) in seen:
             continue
         sig = {"id": "%s-%s" % (rday.isoformat(), key(row["symbol"])), "symbol": row["symbol"], "name": row["name"],
@@ -614,8 +637,12 @@ def _line_for(sd, cfg, want_buy_day, head):
     if doc.get("error"):
         return "%s (%s): %s." % (head, SHADOW, NO_SCAN + ", " + doc["error"])
     if not doc.get("shortlist"):
-        return "%s (%s): none. %d report%s on %s, %d qualified%s." % (
-            head, SHADOW, doc.get("rows", 0), "" if doc.get("rows") == 1 else "s", _day(doc["report_day"]),
+        f = doc.get("filled") or {}
+        detail = (" (%d with EPS, forecast and surprise; %d in the %s)" % (
+            f["all_three"], doc["in_list"], "universe" if doc.get("list_from") == "universe" else "allowed list")
+            if "all_three" in f and doc.get("in_list") is not None else "")
+        return "%s (%s): none. %d report%s on %s%s, %d qualified%s." % (
+            head, SHADOW, doc.get("rows", 0), "" if doc.get("rows") == 1 else "s", _day(doc["report_day"]), detail,
             doc.get("qualified", 0), "" if not doc.get("qualified") else ", no free virtual slot" if
             any("slot" in (x.get("why") or "") for x in doc.get("not_shortlisted") or []) else "")
     return "%s (%s): %s. From %s's reports, %d qualified; virtual sell at the close on %s." % (

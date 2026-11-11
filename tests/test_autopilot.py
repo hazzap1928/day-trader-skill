@@ -107,6 +107,11 @@ class PilotBase(Base):
         self.write("config.json", self.cfg)
         self.write("fx.json", {"usd_per_gbp": 1.25, "fetched_at": iso(NOW)})
         self._ap = (ap._now, ap._sleep, ap._run, ap._keep_awake, ap._launchd, ap._spawn)
+        # the account snapshot for trader-budget and trader-risk reads Trading 212 three more times per build;
+        # these tests queue their fake replies for the placing steps, so it is off here and tested on its own
+        # (tests/test_cash_view.py)
+        self._wp = ap.Pilot.write_portfolio
+        ap.Pilot.write_portfolio = lambda pilot, sym: None
         ap._keep_awake = lambda: (True, "caffeinate -s is running (test)")
         self.jobs = {"com.daytraderskill.t212-guard": {"loaded": True, "running": True, "pid": "4242", "out": ""},
                      "com.daytraderskill.autopilot": {"loaded": True, "running": True, "pid": "4343", "out": ""}}
@@ -124,6 +129,7 @@ class PilotBase(Base):
 
     def tearDown(self):
         ap._now, ap._sleep, ap._run, ap._keep_awake, ap._launchd, ap._spawn = self._ap
+        ap.Pilot.write_portfolio = self._wp
         super().tearDown()
 
     def pilot(self):
@@ -345,7 +351,8 @@ class AutoBuy(PilotBase):
         text = self.phone.sent[-1][0]
         self.assertRegex(text, r"^BOUGHT \(demo, automatic\): \d+ TSLA\n")
         for want in ("Entry: $", "Cost: about £", "Stop: $358.32",
-                     "Target: $370.04", "Max loss at the stop: about £", "Time Machine: target first 60.0 %, stop first 40.0 %"):
+                     "Target: $370.04", "Max loss at the stop: about £", "Time Machine: average +0.30R a trade before costs (+0.12R after); 60 % of the replays that made "
+                     "or lost money made money, 50 % breaks even"):
             self.assertIn(want, text)
         self.assertIsNone(self.phone.sent[-1][1])                  # no buttons
         rec = [r for r in self.broker_log() if r.get("status") == "placed"][0]

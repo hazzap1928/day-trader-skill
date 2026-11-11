@@ -107,9 +107,33 @@ class Trades(ReportBase):
                       fill("SELL", 7, 358.10, "2026-11-05T17:00:00.000Z", typ="STOP")])
         r = self.build()
         text = rp.full_text(r)
-        self.assertIn("Time Machine: target first 60.0 %, stop first 40.0 %; it hit the stop", text)
-        self.assertIn("gave the target first 60 % on average over 1 trade; 0 of 1 reached the target first", text)
+        self.assertIn("Time Machine: target first 60.0 %, stop first 40.0 % (the old fixed-2R measure); it hit the stop",
+                      text)
+        self.assertIn("only the old fixed-2R odds recorded", text)
+        self.assertNotIn("gave the target first", text)
         self.assertIn("-1.04R", text)
+
+    def test_against_the_time_machine_on_the_real_exit(self):
+        """11 Nov: the Time Machine's go/no-go rule is its average R before costs on the real exit (stop, 1R
+        trail, 15:50 close), so the report compares averages, not the old target-first odds."""
+        self.write("state/broker.json", {"orders": [{"symbol": "TSLA", "kind": "entry", "status": "stop_placed",
+                                                     "date": TODAY, "stop": 358.32, "target": 370.04}]})
+        self.write("state/autopilot.json", {"tickets": [{"symbol": "TSLA", "tm": {
+            "p_target": 0.072, "p_stop": 0.299, "avg_R": 0.09, "avg_R_net": -0.17, "exit_model": "real",
+            "win_share": 0.45, "break_even": 0.42}}]})
+        self.account([fill("BUY", 7, 364.18, "2026-11-05T15:20:00.000Z"),
+                      fill("SELL", 7, 358.10, "2026-11-05T17:00:00.000Z", typ="STOP")])
+        r = self.build()
+        text = rp.full_text(r)
+        self.assertIn("Time Machine: average +0.09R a trade before costs (-0.17R after); 45 % of the replays that made "
+                      "or lost money made money, 42 % breaks even; it hit the stop", text)
+        net = (358.10 * (1 - 0.0015) - 364.18 * (1 + 0.0015)) / (364.18 - 358.32)
+        self.assertIn("The Time Machine expected an average of +0.09R a trade before costs (-0.17R after) over 1 trade; "
+                      "they made -1.04R before costs (%+.2fR after): 1 hit the stop. Its go/no-go rule is that average "
+                      "before costs, above 0." % net, text)
+        self.assertNotIn("target first", text)
+        short = rp.short_text(r, os.path.join(self.dir, "x.md"))
+        self.assertIn("The Time Machine expected an average of +0.09R", short)
 
     def test_still_open_alerts_and_a_buy_today_still_held(self):
         os.makedirs(os.path.join(self.dir, "logs"), exist_ok=True)

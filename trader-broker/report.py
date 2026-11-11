@@ -263,25 +263,66 @@ def totals(trades):
             "unknown": len(trades) - len(known)}
 
 
+def tm_words(tm):
+    """The Time Machine's go/no-go numbers for one trade, in words. Since 11 Nov the replays exit the way the
+    guard does (stop, 1R trail, 15:50 close), so the rule is: the average replay must make money before
+    costs, i.e. the share of replays that made money beats the share that breaks even at their average win
+    and loss. Older tickets have only the fixed-2R odds (target first / stop first), labelled as such."""
+    tm = tm or {}
+    if tm.get("avg_R") is not None:
+        s = "average %+.2fR a trade before costs" % tm["avg_R"]
+        if tm.get("avg_R_net") is not None:
+            s += " (%+.2fR after)" % tm["avg_R_net"]
+        if tm.get("win_share") is not None and tm.get("break_even") is not None:
+            s += "; %.0f %% of the replays that made or lost money made money, %.0f %% breaks even" % (
+                100 * tm["win_share"], 100 * tm["break_even"])
+        return s
+    if tm.get("p_target") is not None and tm.get("p_stop") is not None:
+        return "target first %.1f %%, stop first %.1f %% (the old fixed-2R measure)" % (
+            100 * tm["p_target"], 100 * tm["p_stop"])
+    return "no data"
+
+
+def net_r(t):
+    """A closed trade's result in R after the FX fee each way (slippage is already in the fill prices)."""
+    e, x, st = t.get("entry"), t.get("exit"), t.get("stop")
+    if not (e and x and st) or e - st <= 0:
+        return None
+    return (x * (1 - t212.FX_FEE) - e * (1 + t212.FX_FEE)) / (e - st)
+
+
+OUTCOME_WORDS = {"target": "reached the target", "stop": "hit the stop", "close": "closed at the end of the day"}
+
+
 def tm_line(trades):
-    """Today's results against the Time Machine's odds."""
-    with_tm = [t for t in trades if t.get("tm") and t["tm"].get("p_target") is not None]
+    """Today's results against what the Time Machine expected: its average R before costs (the number
+    its go/no-go rule is about) and after costs, against the trades' own R before and after costs."""
     if not trades:
         return "No closed trades today, so nothing to compare."
+    with_tm = [t for t in trades if t.get("tm") and t["tm"].get("avg_R") is not None]
     if not with_tm:
-        return "No Time Machine odds were recorded for today's trades (placed by hand, or before the autopilot kept them)."
-    pred = 100.0 * sum(t["tm"]["p_target"] for t in with_tm) / len(with_tm)
-    sides = [t for t in with_tm if t["outcome"] in ("target", "stop")]
-    hit = sum(1 for t in sides if t["outcome"] == "target")
-    closes = len(with_tm) - len(sides)
-    actual = ("%d of %d reached the target first (%.0f %%)" % (hit, len(sides), 100.0 * hit / len(sides))
-              if sides else "none reached the target or the stop")
-    rs = [t["r"] for t in with_tm if t.get("r") is not None]
-    return ("The Time Machine gave the target first %.0f %% on average over %d trade%s; %s%s. Average result %s. "
+        if any(t.get("tm") for t in trades):
+            return ("Today's trades have only the old fixed-2R odds recorded, not the average R the Time Machine's "
+                    "rule now uses, so there is nothing to compare.")
+        return "No Time Machine figures were recorded for today's trades (placed by hand, or before the autopilot kept them)."
+    n = len(with_tm)
+
+    def avg(xs):
+        xs = [x for x in xs if x is not None]
+        return (sum(xs) / len(xs)) if xs else None
+
+    def r(x):
+        return "no data" if x is None else "%+.2fR" % x
+    exp, exp_net = avg(t["tm"].get("avg_R") for t in with_tm), avg(t["tm"].get("avg_R_net") for t in with_tm)
+    got, got_net = avg(t.get("r") for t in with_tm), avg(net_r(t) for t in with_tm)
+    how = {}
+    for t in with_tm:
+        how[t["outcome"]] = how.get(t["outcome"], 0) + 1
+    ways = ", ".join("%d %s" % (how[k], OUTCOME_WORDS[k]) for k in ("stop", "close", "target") if how.get(k))
+    return ("The Time Machine expected an average of %s a trade before costs (%s after) over %d trade%s; they made "
+            "%s before costs (%s after): %s. Its go/no-go rule is that average before costs, above 0. "
             "One day is far too few trades to judge the model." % (
-                pred, len(with_tm), "" if len(with_tm) == 1 else "s", actual,
-                "" if not closes else ", %d closed at the end of the day" % closes,
-                ("%+.2fR" % (sum(rs) / len(rs))) if rs else "no data"))
+                r(exp), r(exp_net), n, "" if n == 1 else "s", r(got), r(got_net), ways))
 
 
 def drift_line(state_dir, day, which):
@@ -312,9 +353,7 @@ def full_text(r):
             t["symbol"], t212._qty(t["qty"]), t212._fmt(t["entry"]), t212._fmt(t["exit"]), t["reason"],
             _signed(t["pl"]), "" if t.get("r") is None else " (%+.2fR)" % t["r"]))
         if t.get("tm"):
-            L.append("  - Time Machine: target first %.1f %%, stop first %.1f %%; it %s" % (
-                100 * t["tm"]["p_target"], 100 * t["tm"]["p_stop"],
-                {"target": "reached the target", "stop": "hit the stop", "close": "closed at the end of the day"}[t["outcome"]]))
+            L.append("  - Time Machine: %s; it %s" % (tm_words(t["tm"]), OUTCOME_WORDS[t["outcome"]]))
     for f in r["bought_today"]:
         if not any(t["ticker"] == f["ticker"] and t["entry_at"] == f["at"] for t in r["today"]):
             L.append("- Bought today, still open: %s %s at $%s" % (

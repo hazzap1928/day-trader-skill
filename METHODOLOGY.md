@@ -253,8 +253,8 @@ The share count is the **smallest** of these limits, in 0.01-share steps (fracti
 | Limit | Calculation |
 |---|---|
 | Max loss | max loss per trade (1% of the account) / risk per share |
-| Position cap | 75% of the budget / entry price (`max_position_pct`) |
-| Cash | (budget minus the 10% cash buffer) / entry price, and no more than the cash actually there |
+| Position cap | 22% of the budget / entry price (`max_position_pct`, 75% before 12 Nov) |
+| Cash | (the cash free now at Trading 212 minus the 10% cash buffer) / entry price (see "The account snapshot" below) |
 | Max order | Not set for this GBP account, so no limit |
 
 The price it sizes at is the plan's entry, or a fresh quote (under 15 minutes old) if that is
@@ -265,6 +265,18 @@ when:
 - the reward:risk at that price is under **1.5** (`min_reward_risk`): the price has already run
   toward the target, or
 - the order is under £5 (`min_order_gbp`).
+
+### The account snapshot (from 12 Nov)
+
+Before sizing each candidate, the autopilot reads Trading 212 (account, pending orders, positions;
+read-only) and writes `trader/state/portfolio.json` in dollars: the cash a new buy may use (cash
+available to trade, minus buys still waiting to fill that Trading 212 has not already held back,
+minus morning reservations for other stocks) and every position held or waiting to fill. Sizing and
+the risk gate read it, so their cash and position checks see the real account. Until 11 Nov there was
+no such file, and both checked each buy against an empty account funded with the whole budget: on
+11 Nov, after one buy took about half the account, a dozen more passed both checks and were refused
+by Trading 212 for insufficient funds. If the snapshot cannot be read, the file is removed, both fall
+back to the budget, and the cash check at placing time (step 9, also from Trading 212) still decides.
 
 ### The risk gate (`trader-risk/check.py`): the last check before an order
 
@@ -282,8 +294,8 @@ Each order gets PASS or BLOCK with every reason listed. An entry is blocked by a
 | Trades a day | At most **5** entries a day (`max_trades_per_day`) |
 | Orders a day | At most **10** orders a day (`max_orders_per_day`) |
 | Duplicates | The same stock and side already placed today: blocked |
-| Position size | The stock would be over 75% of the account |
-| Cash | The buy would dip into the 10% cash buffer or need margin |
+| Position size | The stock would be over 22% of the whole account (held positions, buys waiting to fill and cash) |
+| Cash | The buy would dip into the 10% cash buffer or need margin, measured on the real free cash |
 | Time window | Before 09:45, after 15:30, or the market closed (weekend, holiday, early close) |
 
 **How the daily loss is counted** (`daily_loss_count`, `open_risk` since 11 Nov). Before each risk

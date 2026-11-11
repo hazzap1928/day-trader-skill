@@ -392,7 +392,22 @@ class Phone(Base):
     def test_nothing_qualified(self):
         self.web.nasdaq["2026-11-09"] = [ROWS[4]]
         drift.scan(self.dir, CFG)
-        self.assertIn("none. 1 report on Mon 09 Nov, 0 qualified", drift.closing_line(self.dir, CFG, D(2026, 11, 10)))
+        self.assertIn("none. 1 report on Mon 09 Nov (1 with EPS, forecast and surprise; 1 in the allowed list), "
+                      "0 qualified", drift.closing_line(self.dir, CFG, D(2026, 11, 10)))
+
+    def test_the_shortlist_says_why_reports_did_not_qualify(self):
+        """11 Nov: "0 of 225 qualified" could not be checked without fetching Nasdaq again. The shortlist now
+        counts the figures filled in and each reason a report failed the rule."""
+        self.standard()
+        doc = drift.scan(self.dir, CFG)
+        self.assertEqual(doc["filled"], {"eps": 10, "forecast": 10, "eps_and_forecast": 10, "all_three": 10})
+        self.assertEqual(doc["why_not"], {"not a beat": 1, "surprise under the minimum": 1,
+                                          "forecast under the minimum": 1, "not in the universe": 1,
+                                          "on blocked_tickers": 1})
+        self.assertEqual(doc["qualified"] + sum(doc["why_not"].values()), doc["rows"])
+        self.assertEqual(drift.filled_counts([{"eps": 1.0, "forecast": None, "surprise_pct": None},
+                                              {"eps": None, "forecast": None, "surprise_pct": None}]),
+                         {"eps": 1, "forecast": 0, "eps_and_forecast": 0, "all_three": 0})
 
     def test_off_shows_nothing(self):
         self.assertIsNone(drift.closing_line(self.dir, {"paper": True}, D(2026, 11, 10)))
