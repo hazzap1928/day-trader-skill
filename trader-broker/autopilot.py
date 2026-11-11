@@ -84,6 +84,7 @@ t212 = _load("trader-broker", "t212")
 phone_mod = t212.phone_module()
 net = t212.net_module()
 evidence = _load("trader-broker", "evidence")
+allocation = _load("trader-broker", "allocation")
 KRONOS_BUDGET = 9 * 60          # seconds of Kronos shadow verdicts a cycle at most (it never blocks a trade)
 KRONOS_NEEDS = 300              # one verdict takes about this long on this Mac: none starts with less time left
 tk = t212.ticket_module()
@@ -402,7 +403,7 @@ class Pilot(object):
             if self.cap_reached():
                 notes.append("ticket limit: %d today, the most autopilot.max_tickets_per_day allows" % len(self.counted()))
                 break                              # not marked tried
-            if self.state.get("cash_short") and not self.cash_free():
+            if self.state.get("cash_short") and not self.cash_free(sym):
                 no_cash.append(sym)
                 continue
             self.sig = None
@@ -412,6 +413,15 @@ class Pilot(object):
             if isinstance(got, str):
                 notes.append("%s: %s" % (sym, got))
                 self.log_signal(got)
+                self.release(sym, "did not pass the checks: %s" % got)
+                continue
+            full = self.positions_full(sym)
+            if full:
+                self.state["tried"][sym] = "skipped: %s" % full
+                self.save()
+                notes.append("%s: skipped, %s" % (sym, full))
+                self.log_signal("skipped: %s" % full)
+                self.release(sym, "skipped: %s" % full)
                 continue
             if self.s["auto_buy"]:
                 t = self.auto_buy(got)
@@ -420,10 +430,14 @@ class Pilot(object):
                     self.state["cash_short"] = True
                     self.save()
                     self.log_signal("skipped: no free cash", ticket=t["id"])
+                    self.alloc_log("skipped", symbol=sym, why="no free cash: %s" % t.get("note", ""))
+                    self.release(sym, "skipped: no free cash")
                     no_cash.append(sym)
                     continue
                 self.log_signal("traded" if t["status"] == "placed" else "not placed: %s" % t.get("note", t["status"]),
-                                ticket=t["id"])
+                                ticket=t["id"], **({"pool": t["pool"]} if t.get("pool") else {}))
+                if t["status"] not in ("placed", "entry placed, stop not placed", "unclear"):
+                    self.release(sym, "not placed: %s" % t.get("note", t["status"]))
                 if self.s["evidence_mode"]:
                     notes.append("%s: %s" % (sym, t["status"]))
                     continue                     # evidence mode: every passing signal is placed (limits permitting)
@@ -436,6 +450,55 @@ class Pilot(object):
         self.kronos_pass()
         return "no ticket: " + ("; ".join(notes) if notes else "nothing triggered that was not tried today")
 
+    # ------------------------------------------------------------ cash allocation (trader-broker/allocation.py)
+
+    def alloc_on(self):
+        return self.client.env == AUTOPILOT_ENV and allocation.active(self.cfg)
+
+    def alloc_log(self, event, **fields):
+        if self.alloc_on():
+            allocation.log(self.sd, _ny().date().isoformat(), event, **fields)
+
+    def reserved_others(self, sym):
+        """GBP reserved today for stocks other than `sym` (0 with allocation off or no plan)."""
+        if not self.alloc_on():
+            return 0.0
+        ny = _ny()
+        return allocation.reserved_for_others(self.sd, ny.date().isoformat(), sym, ny.strftime("%H:%M"))
+
+    def pool_of(self, sym):
+        """"reserved:SYM" when `sym` has an active reservation now, else "free" (None with allocation off)."""
+        if not self.alloc_on():
+            return None
+        ny = _ny()
+        return allocation.pool_of(allocation.refresh(self.sd, ny.date().isoformat(), ny.strftime("%H:%M")), sym)
+
+    def release(self, sym, why):
+        if self.alloc_on():
+            allocation.settle(self.sd, _ny().date().isoformat(), sym, "released", why)
+
+    def positions_full(self, sym):
+        """Why a buy of `sym` must wait (max_open_positions held or waiting to fill), or None."""
+        if not self.alloc_on():
+            return None
+        cap = allocation.settings(self.cfg)["max_open_positions"]
+        try:
+            held = self.held_symbols()
+            for o in self.client.get(t212.ORDERS) or []:
+                side = str(o.get("side") or "").upper()
+                if side == "BUY" or (not side and (t212._num(o.get("quantity")) or 0) > 0):
+                    held.add(str(t212._o_ticker(o) or "").split("_")[0].upper())
+        except t212.T212Error as e:
+            self.say("positions count failed (%s): the cash check at placing time decides"
+                     % t212.scrub(e, self.client._secrets))
+            return None
+        held.discard("")
+        if sym in held or len(held) < cap:
+            return None
+        why = "%d positions open or waiting to fill, the most allocation.max_open_positions allows" % len(held)
+        self.alloc_log("skipped", symbol=sym, why=why)
+        return why
+
     def counted(self):
         """Tickets that count toward max_tickets_per_day: not the ones refused or skipped for cash."""
         return [t for t in self.state["tickets"] if t.get("status") not in NOT_COUNTED]
@@ -443,9 +506,9 @@ class Pilot(object):
     def cap_reached(self):
         return len(self.counted()) >= self.s["max_tickets_per_day"]
 
-    def cash_free(self):
+    def cash_free(self, sym=None):
         """After a cash skip today: is there cash for a buy again (a stop-out frees it)? A failed read
-        says yes, and the check at placing time decides."""
+        says yes, and the check at placing time decides. Reservations for other stocks are not free."""
         try:
             summary = self.client.get(t212.SUMMARY) or {}
             pending = self.client.get(t212.ORDERS) or []
@@ -453,7 +516,7 @@ class Pilot(object):
             self.say("cash check failed (%s): the check at placing time decides" % t212.scrub(e, self.client._secrets))
             return True
         state = t212._read_json(self.p("state", "broker.json"), {}) or {}
-        fc = t212.free_cash(summary, pending, self.rate() or 1.0, self.cfg, state)
+        fc = t212.free_cash(summary, pending, self.rate() or 1.0, self.cfg, state, reserved=self.reserved_others(sym))
         if fc["unknown"] or fc["available"] < MIN_FREE_GBP:
             self.say("still no free cash: %s" % t212.no_cash_text(fc))
             return False
@@ -564,7 +627,8 @@ class Pilot(object):
         doc = t212._read_json(self.p("timemachine.json"), {}) or {}
         mc0, c0 = doc.get("mc") or {}, doc.get("costs") or {}
         sig.update(tm_p_target=mc0.get("p_target"), tm_p_stop=mc0.get("p_stop"), tm_avg_R=mc0.get("avg_R"),
-                   tm_avg_R_net=c0.get("mc_avg_R_net"), tm_cost_R=c0.get("mc_cost_R"), stop_pct=c0.get("stop_pct"))
+                   tm_avg_R_net=c0.get("mc_avg_R_net"), tm_cost_R=c0.get("mc_cost_R"), stop_pct=c0.get("stop_pct"),
+                   confidence=evidence.confidence(mc0.get("avg_R"), self.cfg))   # logged only: never sizes or blocks
         lean = mod("trader-timemachine", "timemachine").lean(doc.get("mc") or {}) if doc.get("mc") else None
         if lean is None or lean[0] <= self.s["min_edge"]:
             return "Time Machine: %s" % (doc.get("verdict") or "no edge")
@@ -591,7 +655,7 @@ class Pilot(object):
         order = self.order()
         mc = doc.get("mc") or {}
         return {"symbol": sym, "fingerprint": verdict["fingerprint"], "order": order, "risk": verdict,
-                "verdict": doc.get("verdict") or "",
+                "verdict": doc.get("verdict") or "", "confidence": sig.get("confidence"),
                 "tm": {"p_target": mc.get("p_target"), "p_stop": mc.get("p_stop"), "verdict": doc.get("verdict") or "",
                        "avg_R": mc.get("avg_R"), "avg_R_net": (doc.get("costs") or {}).get("mc_avg_R_net")}}
 
@@ -664,7 +728,7 @@ class Pilot(object):
         now = _now()
         return {"id": _rand.token_hex(4), "nonce": _rand.token_hex(8), "symbol": built["symbol"],
                 "fingerprint": built["fingerprint"], "order": built["order"], "risk": built["risk"],
-                "verdict": built["verdict"], "tm": built.get("tm"), "created": now,
+                "verdict": built["verdict"], "tm": built.get("tm"), "confidence": built.get("confidence"), "created": now,
                 "expires": now + self.s["expire_minutes"] * 60, "status": status, "message_id": None,
                 "auto": status == "approving"}
 
@@ -686,7 +750,10 @@ class Pilot(object):
                 evidence.log_trade(self.sd, {"day": _ny().date().isoformat(), "symbol": t["symbol"], "list_from": self.list_from(),
                                              "fingerprint": t["fingerprint"], "t212_ticker": rec.get("t212_ticker"),
                                              "expected_entry": t.get("quote"), "qty": rec.get("qty"),
-                                             "stop": rec.get("stop"), "target": rec.get("target")})
+                                             "stop": rec.get("stop"), "target": rec.get("target"),
+                                             "risk_gbp": rec.get("max_loss_gbp"), "cost_gbp": rec.get("cost_gbp"),
+                                             "confidence": t.get("confidence"), "pool": t.get("pool"),
+                                             "sizing": evidence.SIZING_NOW})
         except (PilotError, t212.T212Error) as e:
             text = self.not_placed(t, e)
         self.save()
@@ -889,8 +956,10 @@ class Pilot(object):
                 return False, "", "not the ticket you approved"
             return True, "%s %s at %s" % (by, t["id"], t212._utc_now().strftime("%H:%M:%SZ")), ""
 
+        t["pool"] = self.pool_of(t["symbol"])
         args = argparse.Namespace(ticket_id=t["fingerprint"], resend=False, fx_rate=None, state_dir=self.sd,
-                                  json=False, live=False, cash_check=True)
+                                  json=False, live=False, cash_check=True,
+                                  reserved_gbp=self.reserved_others(t["symbol"]))
         buf = io.StringIO()
         with redirect_stdout(buf):
             res = t212.cmd_place(self.client, args, confirm=confirm)
@@ -898,6 +967,11 @@ class Pilot(object):
         if res is None:
             raise PilotError("place did not send it")
         t["status"] = "placed"
+        if self.alloc_on():
+            ny = _ny()
+            if not allocation.settle(self.sd, ny.date().isoformat(), t["symbol"], "used", "bought"):
+                allocation.log(self.sd, ny.date().isoformat(), "used", symbol=t["symbol"], pool="free",
+                               why="bought from the free pool")
         entry_id = t212._ident((res.get("entry") or {}).get("id"))
         stop_note = ("stop at $%.2f is in, good till cancelled" % stop if res.get("stop")
                      else "the guard enforces the $%.2f stop in software (market sell at the stop)" % stop)

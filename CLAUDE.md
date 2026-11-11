@@ -22,6 +22,7 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/drift.py` | post-earnings drift **shadow** scan: shortlist, signal log, virtual results. No Trading 212 connection, never an order |
 | `trader-broker/evidence.py` | evidence mode (forward test): signal log, virtual results, slippage, Friday report |
 | `trader-broker/briefing.py`, `report.py` | 07:30 morning briefing; closing report from Trading 212's own fills |
+| `trader-broker/allocation.py` | demo cash allocation: per-trade cap, morning reservations, free pool, max open positions |
 | `trader-broker/account_budget.py` | budget and loss limits from the account value, every trading morning |
 | `trader-broker/day_risk.py` | today's realised losses plus risk still open at the stops, for the daily loss limit (`state/day-risk.json`) |
 | `trader-broker/netwait.py` | no internet: check every 2 min for up to 30, then a BACK ONLINE message saying what was missed |
@@ -119,6 +120,30 @@ The guard's protections:
   "stop placed". A position whose stop order was refused or is gone is alarmed again at most once an hour.
 - Tests: `tests/test_cash_and_late_fill.py`.
 
+## Cash allocation and confidence (from 12 Nov 2026): `trader-broker/allocation.py`
+
+- **Demo only:** `allocation.active(cfg)` is false unless `paper` is true (and no `live_enabled`).
+- **Per-trade cap:** `max_position_pct` 22 (was 75) of `budget_gbp`, so 4 trades fit inside the 90%
+  investable. trader-budget applies it; `t212.size_entry` applies it again (1% room for FX moves).
+  With stops about 1% away the cap binds on most trades: about GBP 15 at the stop, not GBP 49.
+- **`max_open_positions`** 4: held positions plus buys waiting to fill. A signal over it is still
+  built and logged (`skipped: 4 positions open...`), so it gets its virtual result.
+- **Reservations:** the 07:30 briefing writes `trader/state/allocation.json`: up to `max_reservations`
+  (2) blocks of one max-per-trade, for listed stocks that reported earnings after the last close or
+  report before the open (ranked by `adv_usd`). Never more than `100 - free_pool_pct` (50%) of the
+  investable cash. A plan, never a buy. A reservation ends `used` (bought), `released` (failed the
+  checks, skipped, not placed) or `expired` (`window_minutes` 90 after 09:45 NY). A re-run never
+  resets the day's plan. No plan: every buy uses the free pool.
+- **Cash check:** `t212.free_cash(..., reserved=)` also takes off active reservations for OTHER stocks
+  (`args.reserved_gbp` in `cmd_place`).
+- **Logs:** `trader/state/evidence/allocation.jsonl` (plan, reserved, used, released, expired, skipped).
+  Trade rows add `pool` (`free` / `reserved:SYM`), `sizing` (`v2`), `risk_gbp`, `cost_gbp`, `confidence`.
+- **Confidence** (logged only, never sizes or blocks): the Time Machine's average R before costs,
+  `low` < 0.00R <= `medium` < 0.10R <= `high` (`evidence.confidence_bands`). On every signal and trade.
+  The Friday report adds results in R by level, v2 rows only (real R = GBP result / `risk_gbp`).
+- Settings: `"allocation": {"enabled", "max_open_positions", "free_pool_pct", "max_reservations",
+  "window_minutes"}`. Tests: `tests/test_allocation.py`.
+
 ## Scheduling (launchd, `~/Library/LaunchAgents/com.daytraderskill.*.plist`)
 
 | Job | When | What |
@@ -143,6 +168,8 @@ The guard's protections:
   - max loss 1% a trade, 3% a day of the start-of-day value; `daily_loss_count` `open_risk`
     since 11 Nov (losses realised today + risk open at the stops; `full_risk` is the old count)
   - no `max_budget_gbp` cap
+- **Allocation (12 Nov):** `max_position_pct` 22, `allocation` on (4 positions, 50% free pool, 2
+  reservations, 90 min), `evidence.confidence_bands` [0.0, 0.10].
 - **Trading rules:** `max_trades_per_day` 5, `min_reward_risk` 1.5, entries 09:45 to 15:30 New York.
 - **Lists:** `allowed_tickers` holds 100 liquid large caps and ETFs (US-listed ETFs are mostly not
   buyable from a UK account); `blocked_tickers` is empty and always wins.
@@ -203,7 +230,12 @@ The guard's protections:
   backtests honestly, with costs, random baselines and buy-and-hold, and flag luck and overfitting.
 - **Tests:** they must never touch the network, the real config, launchd or the phone (use the existing
   fakes).
-- **Commits:** commit only when asked, and never push.
+- **Commits:** commit only when asked; push only when asked. Commits use the GitHub no-reply email
+  (`git config --local user.email`). The repo is a PUBLIC fork.
+- **Before every push:** the `.githooks/pre-push` secrets check runs (`core.hooksPath .githooks`; a
+  fresh clone needs `git config core.hooksPath .githooks`). It refuses commits that add `.env`,
+  `config.json`, `phone.json`, anything under `trader/`, token-shaped lines, or the exact key values
+  when they are in the shell. If it stops a push, stop and tell the user; never use `--no-verify`.
 - **Text files:** no em dashes in repo text files (a test checks).
 
 ## Where things are

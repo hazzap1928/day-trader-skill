@@ -17,6 +17,12 @@ With "autopilot": {"evidence_mode": true} (demo only; live refuses it):
     (from 11 Nov: both model the real exit, the stop, the 1R trailing stop and the 15:50 close, and
     the daily loss limit counts losses realised today plus risk still open at the stops). Rows logged
     before the tag existed are v1. The Friday report shows the two separately.
+  - Each signal carries a confidence score: the Time Machine's average R before costs (the number its
+    go/no-go rule rests on), with a level, low / medium / high, by evidence.confidence_bands (default
+    [0.0, 0.10]: low under 0.00R, high from 0.10R). It is logged only: nothing is sized or blocked by it.
+    The Friday report shows results in R by level (v2 signals only: v1 used a different simulation).
+  - Real trades from 12 Nov also carry pool ("free" or "reserved:SYM"), sizing ("v2": the per-trade cap
+    and cash pools of trader-broker/allocation.py), risk_gbp (the planned loss at the stop) and confidence.
   - Each Friday after the close, a report goes to the phone, every Friday with no end date.
 
 "evidence": {"start": "YYYY-MM-DD", "min_trades": 20}. There is no end date and no final PASS/FAIL day.
@@ -55,6 +61,10 @@ RULES_NAMES = {"v1": "Old rules (2R target in the simulations, full-risk daily l
                "v2": "New rules (real exit in the simulations, open-risk daily loss count)"}
 LISTS = ("allowed_tickers", "universe")
 LIST_NAMES = {"allowed_tickers": "Hand list (allowed_tickers)", "universe": "Filtered universe"}
+CONFIDENCE_BANDS = (0.0, 0.10)       # low < 0.00R <= medium < 0.10R <= high (evidence.confidence_bands)
+CONFIDENCE_SOURCE = "Time Machine average R before costs"
+LEVELS = ("low", "medium", "high")
+SIZING_NOW = "v2"                    # trades: v2 = the per-trade cap (max_position_pct) and cash pools, from 12 Nov
 FEE, SLIP = 0.0015, 0.0005           # the GBP account: FX fee and assumed slippage, each fill
 TRACKER = "SPY"                      # stands in for the GBP-listed S&P 500 tracker (no FX fee)
 TRACKER_COST = 0.0005                # slippage on each tracker leg
@@ -113,6 +123,41 @@ def settings(cfg):
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
         raise EvidenceError("evidence.min_trades in trader/config.json must be a whole number, 1 or more")
     return start, n
+
+
+def confidence_bands(cfg=None):
+    """(low_below, high_from) in R from evidence.confidence_bands, else the default."""
+    b = ((cfg or {}).get("evidence") or {}).get("confidence_bands")
+    if b is None:
+        return CONFIDENCE_BANDS
+    ok = (isinstance(b, list) and len(b) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in b)
+          and b[0] < b[1])
+    if not ok:
+        raise EvidenceError("evidence.confidence_bands in trader/config.json must be two numbers in R, "
+                            "low then high, like [0.0, 0.10]")
+    return float(b[0]), float(b[1])
+
+
+def level_of(score, bands=CONFIDENCE_BANDS):
+    if score is None:
+        return None
+    return "low" if score < bands[0] else ("high" if score >= bands[1] else "medium")
+
+
+def confidence(score, cfg=None):
+    """{"score", "level", "source"} for a Time Machine average R (before costs), or None without one.
+    Logged only: it never changes a size or a decision."""
+    try:
+        score = None if score is None else float(score)
+    except (TypeError, ValueError):
+        score = None
+    if score is None:
+        return None
+    try:
+        bands = confidence_bands(cfg)
+    except EvidenceError:
+        bands = CONFIDENCE_BANDS
+    return {"score": round(score, 4), "level": level_of(score, bands), "source": CONFIDENCE_SOURCE}
 
 
 # ---------------------------------------------------------------- files
@@ -569,7 +614,35 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
     traded = {s.get("id"): s for s in sigs if s.get("decision") == "traded"}
     r["kronos_real"] = {v: sum(1 for s in traded.values() if (s.get("kronos") or {}).get("verdict") == v)
                         for v in ("agree", "disagree")}
+    r["confidence_bands"] = confidence_bands(cfg)
+    r["by_confidence"] = by_confidence(sigs, trades, closed, r["confidence_bands"])
     return r
+
+
+def by_confidence(sigs, trades, closed, bands):
+    """Results in R by confidence level, v2 rows only (v1's Time Machine used a fixed 2R target).
+    Virtual: each signal's R after costs. Real: each closed trade's GBP result over its planned loss at the
+    stop (risk_gbp), for trades logged with both. A row's own level is used; else its tm_avg_R decides."""
+    def lvl(row):
+        c = row.get("confidence") or {}
+        return c.get("level") if c.get("level") in LEVELS else level_of(row.get("tm_avg_R"), bands)
+    out = {}
+    real_rows = {}
+    for t in trades:
+        if rules_of(t) == "v2" and t.get("risk_gbp") and lvl(t):
+            real_rows[(t.get("day"), t.get("t212_ticker"))] = (lvl(t), float(t["risk_gbp"]))
+    for name in LEVELS:
+        gs = [s for s in sigs if rules_of(s) == "v2" and lvl(s) == name]
+        gv = [s["virtual"]["R_net"] for s in gs if (s.get("virtual") or {}).get("R_net") is not None]
+        rr = []
+        for c in closed:
+            hit = real_rows.get((_ny_dt(c["entry_at"]), c.get("ticker")))
+            if hit and hit[0] == name and c.get("pl") is not None:
+                rr.append(c["pl"] / hit[1])
+        out[name] = {"signals": len(gs), "virtual": len(gv), "virtual_avg_R": _mean(gv),
+                     "virtual_win": (100.0 * sum(1 for x in gv if x > 0) / len(gv)) if gv else None,
+                     "real": len(rr), "real_avg_R": _mean(rr)}
+    return out
 
 
 def status_line(label, p):
@@ -630,6 +703,20 @@ def report_text(r):
             g["real"], _gbp(g["real_avg_gbp"]), _gbp(g["real_total_gbp"]), g["signals"], g["virtual"],
             "no data" if g["virtual_avg_R"] is None else "%+.3fR" % g["virtual_avg_R"],
             "no data" if g["virtual_win"] is None else "%.0f%%" % g["virtual_win"]))
+    bc = r.get("by_confidence") or {}
+    if any(g["signals"] or g["real"] for g in bc.values()):
+        lo, hi = r.get("confidence_bands") or CONFIDENCE_BANDS
+        lines.append("Confidence (%s, v2 signals; logged only, sizes unchanged): low under %+.2fR, medium "
+                     "%+.2fR to %+.2fR, high from %+.2fR" % (CONFIDENCE_SOURCE, lo, lo, hi, hi))
+        for name in LEVELS:
+            g = bc.get(name)
+            if not g:
+                continue
+            lines.append("  %s: virtual %d logged, %d resolved, average %s after costs, %s won; real %d closed, "
+                         "average %s" % (name, g["signals"], g["virtual"],
+                                         "no data" if g["virtual_avg_R"] is None else "%+.3fR" % g["virtual_avg_R"],
+                                         "no data" if g["virtual_win"] is None else "%.0f%%" % g["virtual_win"],
+                                         g["real"], "no data" if g["real_avg_R"] is None else "%+.3fR" % g["real_avg_R"]))
     lines.append("Demo money. Education and tooling, not financial advice.")
     return "\n".join(lines)
 

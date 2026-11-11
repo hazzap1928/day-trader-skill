@@ -16,6 +16,10 @@ What it reads, and from where (anything that fails says "no data", never a guess
   4. Earnings: Nasdaq's earnings calendar for the session and the next one, for what
      you hold and what the scanner or autopilot flagged.
   5. A to-do list, most urgent first, from the rules in todo().
+  6. Cash allocation (demo, with "allocation" enabled): the day's plan from trader-broker/allocation.py,
+     with up to two reservations for stocks on the list that reported earnings after the last close or
+     report before today's open (ranked by money traded a day). The plan is written to
+     trader/state/allocation.json for the autopilot. A plan is a plan, never a buy.
 
 Read-only: it only GETs. It never places, changes or cancels an order. Education and
 tooling, not financial advice.
@@ -60,6 +64,7 @@ tk = t212.ticket_module()
 phone_mod = t212.phone_module()
 net = t212.net_module()
 alerts = _load("trader-alerts", "alerts")
+allocation = _load("trader-broker", "allocation")
 
 
 # ---------------------------------------------------------------- seams the tests replace
@@ -365,9 +370,45 @@ def build(client, state_dir):
          "universe": universe_line(cfg, state_dir),
          "eod": (t212._read_json(os.path.join(state_dir, "state", "t212-guard.json"), {}) or {}).get("eod")}
     b["earnings"] = earnings([session, b["next"]], held, set(b["flagged"]))
+    b["allocation"] = allocation_line(cfg, state_dir, session, prev, held)
     b["todo"] = todo(b)
     b["drift"] = drift_line(state_dir, session, "briefing")
     return b
+
+
+def all_earnings(day):
+    """Every row of Nasdaq's earnings calendar for `day`, as [{"symbol", "when"}], or None on failure."""
+    try:
+        rows = json.loads(_fetch(EARNINGS % day.isoformat(), browser=True).decode("utf-8"))["data"]["rows"] or []
+    except Exception:
+        return None
+    when = {"time-pre-market": "before the open", "time-after-hours": "after the close"}
+    return [{"symbol": str(r.get("symbol") or "").upper(), "when": when.get(r.get("time"), "time not given")}
+            for r in rows if r.get("symbol")]
+
+
+def allocation_line(cfg, state_dir, session, prev, held):
+    """Make (or keep) the day's cash allocation plan and return its one line, or None with allocation off.
+    Demo only: allocation.active() is false unless "paper" is true."""
+    if not allocation.active(cfg):
+        return None
+    try:
+        day = session.isoformat()
+        plan = allocation.load_plan(state_dir, day)
+        if plan is None:
+            ucfg = t212.with_universe(cfg, state_dir)
+            allowed = t212.allowed_tickers(ucfg) or []
+            uni = t212._read_json(os.path.join(state_dir, "universe", "tradable.json"), {}) or {}
+            ranks = {str(x.get("symbol") or "").upper(): x.get("adv_usd") or 0
+                     for x in uni.get("tickers") or [] if isinstance(x, dict)}
+            today_rows, prev_rows = all_earnings(session), all_earnings(prev)
+            cands = allocation.catalysts(today_rows, prev_rows, allowed, ranks, held)
+            plan = allocation.save_plan(state_dir, allocation.make_plan(cfg, day, cands))
+            if today_rows is None or prev_rows is None:
+                return allocation.plan_text(plan) + " (earnings calendar: no data, so no reservations from it)"
+        return allocation.plan_text(plan)
+    except (allocation.AllocationError, t212.T212Error) as e:
+        return "Allocation (demo): no plan (%s). Every buy uses the free pool." % e
 
 
 def universe_line(cfg, state_dir):
@@ -453,6 +494,8 @@ def full_text(b):
             L.append("- %s: %s (%s), %s%s" % (label, e["symbol"], e["name"], e["when"], ", YOU HOLD IT" if e["held"] else ""))
     if b.get("drift"):
         L += ["", "## Post-earnings drift (shadow)", "- " + b["drift"]]
+    if b.get("allocation"):
+        L += ["", "## Cash allocation (demo)", "- " + b["allocation"]]
     L += ["", "## 5. To do, most urgent first"]
     names = {1: "NOW", 2: "before the open", 3: "today", 4: "note"}
     L += ["%d. [%s] %s" % (i, names[pr], t) for i, (pr, t) in enumerate(b["todo"], 1)]
@@ -503,6 +546,8 @@ def short_text(b, path):
     top = ["%d. %s" % (i, t) for i, t in enumerate(points, 1)]
     if b.get("drift"):
         top.append(b["drift"])
+    if b.get("allocation"):
+        top.append(b["allocation"])
     return "\n".join([head] + top + ["Full briefing: %s" % os.path.relpath(path, ROOT)])
 
 

@@ -138,6 +138,9 @@ class PlaceError(T212Error):
 INSUFFICIENT_FUNDS = "insufficient-free-for-stocks-buy"   # Trading 212's error type for a buy with too little cash
 
 
+POSITION_CAP_ROOM = 1.01        # size_entry's max_position_pct net: 1 % over the cap trader-budget sized to
+
+
 class NoCash(T212Error):
     """A buy the free cash does not cover. Raised before anything is sent (the autopilot's cash check)."""
 
@@ -763,6 +766,11 @@ def size_entry(entry, stop, ticket_qty, rate, cash_gbp, cfg, fractional=None):
     step = 0.01 if fractional else 1
     caps = [("the ticket", float(ticket_qty)), ("your max loss per trade", limit / loss_ps),
             ("the cash available to trade", max(cash_gbp, 0.0) / cost_ps)]
+    cap_pct, budget = _num(cfg.get("max_position_pct")), _num(cfg.get("budget_gbp"))
+    if cap_pct and budget and 0 < cap_pct < 100:
+        # trader-budget already caps the ticket at this; a second net here, with 1 % room for the GBP/USD
+        # rate moving between sizing and placing (so it never shaves a correctly sized ticket)
+        caps.append(("max_position_pct", budget * cap_pct / 100.0 * POSITION_CAP_ROOM / (entry / rate)))
     if _num(cfg.get("max_order_gbp")) is not None:
         caps.append(("max_order_gbp", float(cfg["max_order_gbp"]) / cost_ps))
     elif _num(cfg.get("max_order_usd")) is not None:
@@ -808,22 +816,29 @@ def pending_buys_gbp(pending, rate, state=None):
     return round(total, 2), unknown
 
 
-def free_cash(summary, pending, rate, cfg, state=None):
+def free_cash(summary, pending, rate, cfg, state=None, reserved=0.0):
     """Cash a new buy may use: Trading 212's cash available to trade, minus buys still waiting to
-    fill, minus the cash buffer (cash_buffer_pct of the day's budget_gbp, else of the account value)."""
+    fill, minus the cash buffer (cash_buffer_pct of the day's budget_gbp, else of the account value),
+    minus `reserved`: the demo autopilot's active reservations for OTHER stocks (trader-broker/allocation.py)."""
     cash = _num(((summary or {}).get("cash") or {}).get("availableToTrade")) or 0.0
     waiting, unknown = pending_buys_gbp(pending, rate, state)
     pct = _num((cfg or {}).get("cash_buffer_pct")) or 0.0
     base = _num((cfg or {}).get("budget_gbp")) or _num((summary or {}).get("totalValue")) or 0.0
     buffer = round(base * pct / 100.0, 2)
+    reserved = round(max(_num(reserved) or 0.0, 0.0), 2)
     return {"cash": round(cash, 2), "waiting": waiting, "unknown": unknown, "buffer": buffer,
-            "available": round(cash - waiting - buffer, 2)}
+            "reserved": reserved, "available": round(cash - waiting - buffer - reserved, 2)}
 
 
 def no_cash_text(fc, need=None):
     """One plain line on the cash, for the autopilot log (never the phone, never Trading 212's error JSON)."""
-    s = "free cash GBP %.2f, minus GBP %.2f for buys waiting to fill, minus the GBP %.2f buffer = GBP %.2f" % (
-        fc["cash"], fc["waiting"], fc["buffer"], fc["available"])
+    if fc.get("reserved"):
+        s = ("free cash GBP %.2f, minus GBP %.2f for buys waiting to fill, minus the GBP %.2f buffer, minus GBP %.2f "
+             "reserved for other stocks = GBP %.2f" % (fc["cash"], fc["waiting"], fc["buffer"], fc["reserved"],
+                                                       fc["available"]))
+    else:
+        s = "free cash GBP %.2f, minus GBP %.2f for buys waiting to fill, minus the GBP %.2f buffer = GBP %.2f" % (
+            fc["cash"], fc["waiting"], fc["buffer"], fc["available"])
     if fc.get("unknown"):
         s += "; a buy waiting to fill has no known price (%s), so no cash is counted as free" % ", ".join(fc["unknown"])
     if need is not None:
@@ -1177,7 +1192,7 @@ def cmd_place(client, args, confirm=None):
 
     # 4b. the autopilot's cash check: skip (never shrink) a buy the free cash does not cover
     if side == "buy" and getattr(args, "cash_check", False):
-        fc = free_cash(summary, pending, fx[0], cfg, state)
+        fc = free_cash(summary, pending, fx[0], cfg, state, reserved=getattr(args, "reserved_gbp", 0.0) or 0.0)
         need = round(ticket_qty * price / fx[0] * (1 + FX_FEE), 2)
         if fc["unknown"] or need > fc["available"] + 0.005:
             why = "no free cash: %s" % no_cash_text(fc, need)
