@@ -20,6 +20,7 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/autopilot.py` | always-on demo autopilot: scan, Time Machine, size, risk, place; phone commands |
 | `trader-broker/phone.py` | the user's own Telegram bot: messages, Approve/Reject buttons, an outbox for failed sends |
 | `trader-broker/drift.py` | post-earnings drift **shadow** scan: shortlist, signal log, virtual results. No Trading 212 connection, never an order |
+| `trader-broker/drift_buy.py` | drift **buying** (stage 3), OFF unless `drift.buy_enabled`: the 09:33 buys, reservations, holdings lines, DRIFT SELL, the Friday drift section |
 | `trader-broker/evidence.py` | evidence mode (forward test): signal log, virtual results, slippage, Friday report |
 | `trader-broker/briefing.py`, `report.py` | 07:30 morning briefing; closing report from Trading 212's own fills |
 | `trader-broker/allocation.py` | demo cash allocation: per-trade cap, morning reservations, free pool, max open positions |
@@ -82,6 +83,50 @@ The guard's protections:
 - **Why not:** `shortlist.json` also has `filled` (rows with EPS, forecast, both, all three), `in_list`
   and `why_not` (a count per failed rule), and the "none" line says how many had the figures and were in the list.
 - **Tests:** `tests/test_drift_scan.py`.
+
+## Drift buying (stage 3 of 4, built 12 Nov 2026, OFF): `trader-broker/drift_buy.py`
+
+- **Switch:** `"drift": {"buy_enabled": false}` is the default. Off means no buys, no reservations, no
+  logs: nothing changes. Demo only: `drift_buy.active` needs `paper` true and no `live_enabled`, and
+  `t212.py place` refuses a drift order on live, with buying off, or without a sell date after today.
+  Stage 4 is the user's config change; Claude never turns it on.
+- **When:** `buy_at` 09:33 New York, once a day, before the first intraday scan (09:45). A start after
+  09:45 logs every name "missed" and sends an alert: never bought late. /pause stops drift buys too.
+- **Skips** (logged on the signal row as `buy` and in `state/drift/buys.jsonl`): blocked; held or
+  waiting under either strategy; no free slot; the drift pool used; no cash reservation; no free cash;
+  at or under its stop at the open (yesterday's close minus `atr_mult` x ATR); the open-risk cap.
+- **The buy:** `t212.cmd_place` with `strategy="drift"`, `sell_date` (`drift_sell_date(day, 19)`: the
+  20th trading day held), its own `state/drift/orders.json` and `risk.json` (drift's checks, not
+  trader-risk), and the cash check against reservations for other stocks. Always a real broker stop
+  (good till cancelled), whatever `stop_mode` or `fractional_stops` say. A stop that is refused or not
+  placed raises a GUARD ALERT; the guard puts it back or holds it in software.
+- **Stop:** `atr_mult` (3) x the 14-day daily ATR under the entry. **Not from the tested research,
+  which held with no stop.** It is a setting.
+- **Size:** the smaller of one slot and `max_loss_per_trade_gbp` (1%) at the stop. Slot = the drift
+  pool / `slots`; drift pool = `max_share_pct` (50) % of the investable cash (the account less the 10%
+  buffer). With 10 slots one slot is about 4.5% of the account.
+- **Open-risk cap:** `max_open_risk_pct` (4) % of the account: the most all drift positions can lose
+  at their stops together (gaps can lose more).
+- **Cash reservations** (`allocation.json`, reservations with `"pool": "drift"`, 09:30 to 10:15 NY,
+  released when the buy step ends): the 07:30 briefing reserves drift's slots FIRST and intraday's
+  reservable share comes out of what drift does not use (`allocation.make_plan(..., drift=,
+  drift_used_gbp=)`). With no morning plan, or one without them, the buy step adds them; if it cannot
+  (or allocation is off) it buys nothing that day and says why. `allocation.reservation_for` ignores
+  drift reservations; `reserved_for_others` counts them.
+- **Kept apart from intraday:** drift buys are left out of trader-risk's trades a day, daily loss and
+  day trades (`check.is_drift`), of `day_risk.entries_today`, and of the autopilot's
+  `max_open_positions` count; the closing report and the Friday intraday figures leave drift trades out.
+- **Selling:** stage 1's 15:50 close on or after the sell date; an overdue one raises "DRIFT SELL
+  OVERDUE". After the closing report, `drift_buy.closed_since` sends DRIFT SELL (reason, result after
+  costs from Trading 212's fills, days held, SPY over the same days) once per buy and logs
+  `state/drift/trades.jsonl`. Turning buying off stops new buys only.
+- **Phone:** DRIFT BUY; DRIFT SELL; drift holdings ("day X of 20", gain, stop, sell date) in /status,
+  MARKET OPEN, the briefing and the closing report; "NOT PROTECTED OVERNIGHT" when no stop order
+  covers one. The briefing no longer calls drift positions "held overnight". The Friday report has a
+  drift section: its own pass rule, real and shadow apart, `min_trades` (20).
+- **Settings** (in `drift`): `buy_enabled`, `buy_at`, `slots` (10), `max_share_pct` (50),
+  `max_open_risk_pct` (4), `atr_mult` (3), `atr_days` (14), `hold_days` (20), `min_trades` (20).
+- **Tests:** `tests/test_drift_buy.py`.
 
 ## Real exit and the daily loss count (from 11 Nov 2026)
 
@@ -163,7 +208,7 @@ The guard's protections:
 | Job | When | What |
 |---|---|---|
 | `caffeinate` | always (KeepAlive) | `caffeinate -s`: no sleep on mains power (a closed lid still sleeps the laptop) |
-| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, sends MARKET OPEN, scans every 15 min 09:45 to 15:30 New York, runs the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results) and the evidence report on Fridays |
+| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, sends MARKET OPEN, scans every 15 min 09:45 to 15:30 New York, runs the drift buys at 09:33 (only with `drift.buy_enabled`), the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results and sends DRIFT SELL messages) and the evidence report on Fridays |
 | `t212-guard` | weekdays 13:00 UK | `run-guard.sh`: `t212.py budget --apply`, then `guard --watch` from the 09:30 open to 16:00 New York |
 | `briefing` | weekdays 07:30 UK | `run-briefing.sh`: the briefing; skips US holidays; retries its send for 30 min |
 
@@ -194,7 +239,7 @@ The guard's protections:
 - **Costs** (GBP account): 0.15% FX fee + 0.05% slippage on every buy and sell. Trading 212's API
   trades only in the primary currency, so a USD balance cannot avoid the fee for API orders.
 - **`autopilot`:** `auto_buy: true`, `evidence_mode: true`.
-- **`drift`:** `scan_enabled: true` since 10 Nov (shadow only; every threshold below is a setting).
+- **`drift`:** `scan_enabled: true` since 10 Nov; `buy_enabled` false (stage 3 built, not switched on).
 
 ## Evidence mode: the forward test (from 9 Nov 2026, no end date)
 

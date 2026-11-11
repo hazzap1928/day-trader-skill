@@ -1153,9 +1153,13 @@ def cmd_place(client, args, confirm=None):
         raise T212Error("live trading is switched off: it needs \"live_enabled\": true and \"paper\": false in "
                         "trader/config.json (trader-broker/go-live.sh). Nothing was sent.", 2)
     tk = ticket_module()
-    paths = {"orders": os.path.join(sd, "orders.json"), "config": os.path.join(sd, "config.json"),
-             "risk": os.path.join(sd, "state", "risk.json"), "state": os.path.join(sd, "state", "broker.json"),
-             "prices": os.path.join(sd, "prices.json")}
+    paths = {"orders": getattr(args, "orders_path", None) or os.path.join(sd, "orders.json"),
+             "config": os.path.join(sd, "config.json"),
+             "risk": getattr(args, "risk_path", None) or os.path.join(sd, "state", "risk.json"),
+             "state": os.path.join(sd, "state", "broker.json"), "prices": os.path.join(sd, "prices.json")}
+    strategy = str(getattr(args, "strategy", None) or "intraday").strip().lower()
+    if strategy not in STRATEGIES:
+        raise T212Error("strategy must be one of %s, not %r" % (", ".join(STRATEGIES), strategy), 2)
     try:
         doc = tk.read_json(paths["orders"], "orders file (run trader-budget first)")
         cfg = tk.read_json(paths["config"], "config (trader/config.json)")
@@ -1170,6 +1174,18 @@ def cmd_place(client, args, confirm=None):
         raise T212Error("evidence mode is on in trader/config.json; it is a demo forward test and never places on "
                         "a live account. Turn it off first. Nothing was sent.", 2)
     mode = stop_mode(cfg)
+    sell_date = None
+    if strategy == "drift":
+        # drift buying (trader-broker/drift_buy.py): demo only, behind drift.buy_enabled, a real stop always
+        if client.env != "demo" or cfg.get("paper") is not True or cfg.get("live_enabled"):
+            raise T212Error("drift buying is demo only (\"paper\": true); nothing was sent", 2)
+        if (cfg.get("drift") or {}).get("buy_enabled") is not True:
+            raise T212Error("drift.buy_enabled is off in trader/config.json; nothing was sent", 2)
+        sell_date = _iso_date(getattr(args, "sell_date", None))
+        if sell_date is None or sell_date <= datetime.date.fromisoformat(_today_ny(ticket_module())):
+            raise T212Error("a drift buy needs a sell_date after today, not %r; nothing was sent"
+                            % (getattr(args, "sell_date", None),), 2)
+        mode = "broker"               # held overnight and at weekends: a real stop, whatever stop_mode says
     allow = allowed_tickers(with_universe(cfg, sd))
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
     if not isinstance(orders, list) or not orders:
@@ -1205,6 +1221,8 @@ def cmd_place(client, args, confirm=None):
     if side == "buy" and allow is not None and str(order.get("symbol", "")).upper() not in allow:
         raise T212Error("ticket %d buys %s, which is not on your allowed_tickers list; nothing was sent"
                         % (index, str(order.get("symbol", "")).upper()), 2)
+    if strategy == "drift" and (side != "buy" or kind != "entry"):
+        raise T212Error("ticket %d: a drift order must be a buy to open; nothing was sent" % index, 2)
     if side == "sell" and kind != "exit":
         raise T212Error("ticket %d would sell short; this tool only buys to open and sells what you hold" % index, 2)
     if str(order.get("type", "market")).lower() != "market":
@@ -1260,7 +1278,7 @@ def cmd_place(client, args, confirm=None):
         stop = _num(order.get("stop_loss_stop_price")) or _num((order.get("plan") or {}).get("stop"))
         sz = size_entry(price, stop, ticket_qty, fx[0], cash, cfg, fractional_for(cfg, inst))
         bodies = [(MARKET, market_body(ticker, "buy", sz["qty"]))]
-        if mode == "broker" and is_fractional(sz["qty"]) and fractional_stops(cfg) == "software":
+        if mode == "broker" and is_fractional(sz["qty"]) and fractional_stops(cfg) == "software" and strategy != "drift":
             mode = "software"                     # fractional position: the guard holds the stop
         if mode == "broker":
             bodies.append((STOP, stop_body(ticker, sz["qty"], stop)))
@@ -1296,10 +1314,12 @@ def cmd_place(client, args, confirm=None):
             "paper": client.env == "demo", "t212_ticker": ticker, "reply": reply,
             "plain": "%s %s %s, market" % (side.upper(), _qty(sz["qty"]), ticker)}
     if side == "buy":
-        base.update(strategy="intraday",            # every buy today is intraday; a drift buy (stage 3) adds sell_date
+        base.update(strategy=strategy,               # "intraday", or "drift" with its sell_date
                     max_loss=sz["max_loss_usd"], max_loss_gbp=sz["max_loss_gbp"], stop=sz["stop_usd"],
                     entry=sz["entry_usd"], cost_gbp=sz["cost_gbp"], fx_rate=fx[0],
                     target=_num(order.get("take_profit_limit_price")) or _num((order.get("plan") or {}).get("target")))
+        if sell_date is not None:
+            base["sell_date"] = sell_date.isoformat()
     path, body = bodies[0]
     _record(paths["state"], state, dict(base, at=tk.ny_iso(_utc_now()), status="sending"))
     log_event(sd, secrets, "request", env=client.env, ticket=index, fingerprint=fp, method="POST", path=path, body=body)
@@ -2159,7 +2179,7 @@ def eod_close(client, state_dir):
         raise T212Error("the end-of-day close runs on the demo account only; nothing was sent", 2)
     tk = ticket_module()
     out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
-           "closed": [], "failed": [], "sold": [], "kept": [], "unknown": []}
+           "closed": [], "failed": [], "sold": [], "kept": [], "unknown": [], "overdue": []}
     g = _Guard(client, state_dir, out)
     state = tk.load_state(os.path.join(state_dir, "state", "broker.json"))
     today = _today_ny(tk)
@@ -2181,6 +2201,9 @@ def eod_close(client, state_dir):
             if not due:
                 out["kept"].append("%s: %s held, %s: kept, its stop left in place" % (ticker, _qty(held), why))
                 continue
+            if "overdue" in why:
+                out["overdue"].append("%s: its drift sell date was %s, so it is sold at today's close instead "
+                                      "(the Mac or the guard was off on the day)" % (ticker, rec.get("sell_date")))
         stops, others = guard_sell_orders(pending, ticker)
         if g.unclear.get(ticker):
             out["failed"].append("%s: NOT CLOSED, an earlier guard order is unclear (%s); sell it in the app"
@@ -2258,6 +2281,8 @@ def run_eod(client, state_dir):
         guard_alarm(client, "END-OF-DAY CLOSE FAILED: " + f)
     for f in res.get("unknown", []):
         guard_alarm(client, "END-OF-DAY CLOSE: " + f)
+    for f in res.get("overdue", []):
+        guard_alarm(client, "DRIFT SELL OVERDUE: " + f)
     return res
 
 

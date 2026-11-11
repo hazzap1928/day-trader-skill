@@ -503,11 +503,17 @@ def rec_is_entry(rec):
     return str(rec.get("side", "")).lower() == "buy"
 
 
+def is_drift(rec):
+    """A post-earnings drift buy (trader-broker/drift_buy.py): it has its own slots and risk cap, so it
+    never counts toward intraday's trades a day, daily loss or day trades."""
+    return str(rec.get("strategy") or "").strip().lower() == "drift"
+
+
 def placed_today(state, today):
-    """Orders recorded as placed today by trader-broker."""
+    """Intraday orders recorded as placed today by trader-broker (drift buys are not counted here)."""
     out = []
     for rec in (state or {}).get("orders", []):
-        if rec.get("status") == "placed" and rec_day(rec) == today:
+        if rec.get("status") == "placed" and rec_day(rec) == today and not is_drift(rec):
             out.append(rec)
     return out
 
@@ -519,7 +525,7 @@ def day_trades(state, today):
     days = set(business_days(datetime.date.fromisoformat(today)))
     sides = {}
     for rec in (state or {}).get("orders", []):
-        if rec.get("status") not in ("placed", "filled"):
+        if rec.get("status") not in ("placed", "filled") or is_drift(rec):
             continue
         d = rec_day(rec)
         if d not in days:

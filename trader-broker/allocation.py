@@ -181,20 +181,29 @@ def load_plan(sd, day):
 
 # ---------------------------------------------------------------- the plan
 
-def make_plan(cfg, day, candidates):
+def make_plan(cfg, day, candidates, drift=None, drift_used_gbp=0.0):
     """The day's plan from ranked candidates [{"symbol", "reason"}]: up to max_reservations blocks of
-    "max per trade", never more in all than the reservable share. Pure: writes nothing."""
+    "max per trade", never more in all than the reservable share. Pure: writes nothing.
+    drift: post-earnings drift reservations (trader-broker/drift_buy.py) that go FIRST; with them, and with
+    drift_used_gbp (what drift positions already cost), the intraday reservable share is taken from
+    what drift does not use: (investable - drift used - drift reserved) x (100 - free_pool_pct) / 100."""
     s = settings(cfg)
     f = figures(cfg)
     start = str(cfg.get("no_entries_before") or ENTRY_FROM)
     last = str(cfg.get("no_entries_after") or ENTRY_TO)
     end = min(_hm_add(start, s["window_minutes"]), last)
-    n = min(s["max_reservations"], int((f["reservable_gbp"] + 0.005) // f["per_trade_gbp"]) if f["per_trade_gbp"] else 0)
+    drift = [dict(r) for r in drift or []]
+    drift_reserved = sum(r["amount_gbp"] for r in drift)
+    reservable = f["reservable_gbp"]
+    if drift or drift_used_gbp:
+        left = max(f["investable_gbp"] - (drift_used_gbp or 0.0) - drift_reserved, 0.0)
+        reservable = min(reservable, left * (100.0 - s["free_pool_pct"]) / 100.0)
+    n = min(s["max_reservations"], int((reservable + 0.005) // f["per_trade_gbp"]) if f["per_trade_gbp"] else 0)
     blocked = {str(b).upper() for b in (cfg.get("blocked_tickers") or []) + (cfg.get("blocked") or [])}
-    res, seen = [], set()
+    res, seen = list(drift), {r["symbol"] for r in drift}
     for c in candidates or []:
         sym = str(c.get("symbol") or "").upper()
-        if len(res) >= n:
+        if len(res) - len(drift) >= n:
             break
         if not sym or sym in seen or sym in blocked:
             continue
@@ -239,9 +248,9 @@ def refresh(sd, day, now_hm):
 
 
 def reservation_for(plan, symbol):
-    """The active reservation for `symbol`, or None."""
+    """The active intraday reservation for `symbol`, or None (a drift one is drift_buy.drift_reservation's)."""
     for r in (plan or {}).get("reservations") or []:
-        if r.get("symbol") == str(symbol).upper() and r.get("status") == "active":
+        if r.get("symbol") == str(symbol).upper() and r.get("status") == "active" and r.get("pool") != "drift":
             return r
     return None
 
@@ -281,11 +290,9 @@ def _gbp(x):
 def plan_text(plan):
     """The morning line: max per trade, reservations, free pool, max positions."""
     f = plan["figures"]
-    if plan["reservations"]:
-        res = ", ".join("%s %s (%s, %s to %s NY)" % (_gbp(r["amount_gbp"]), r["symbol"], r["reason"], r["start"], r["end"])
-                        for r in plan["reservations"])
-    else:
-        res = "none"
+    act = [r for r in plan["reservations"] if r.get("status", "active") == "active"]
+    res = ", ".join("%s %s (%s, %s to %s NY)" % (_gbp(r["amount_gbp"]), r["symbol"], r["reason"], r["start"], r["end"])
+                    for r in act) or "none"
     return ("Allocation (demo): max per trade %s. Reserved: %s. Free pool: %s. Max %d positions at once. "
             "Reservations are a plan, not a buy." % (_gbp(f["per_trade_gbp"]), res, _gbp(plan["free_pool_gbp"]),
                                                      f["max_open_positions"]))

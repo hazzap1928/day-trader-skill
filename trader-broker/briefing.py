@@ -311,7 +311,14 @@ def todo(b):
         items.append((1, "%d guard alert%s since the last close; latest: %s" % (
             len(b["positions"]["alerts"]), "" if len(b["positions"]["alerts"]) == 1 else "s",
             b["positions"]["alerts"][-1]["text"][:160])))
+    for r in b.get("drift_rows") or []:
+        if not r["waiting"] and not r["protected"]:
+            items.append((1, "DRIFT %s is NOT PROTECTED OVERNIGHT (%s). Set a stop in the app (about $%s) or check "
+                             "trader/logs/guard.log." % (r["symbol"], r["stop_how"],
+                                                         t212._fmt(r["stop"]) if r["stop"] else "?")))
     for r in b["positions"]["rows"]:
+        if r.get("drift"):
+            continue                              # drift positions are reported above and in the drift section
         if not r["fully_covered"]:
             items.append((1, "%s: %s held with %s. Set a stop in the app, or let the guard put the ticket's "
                              "stop back after the open." % (r["symbol"], t212._qty(r["qty"]),
@@ -323,8 +330,11 @@ def todo(b):
                 items.append((1 if d == b["session"] else 2, "You hold %s and it reports earnings %s %s. Decide "
                               "before then whether to keep it through the report." % (
                                   e["symbol"], "today" if d == b["session"] else "on %s" % d.strftime("%a"), e["when"])))
-    if b["positions"]["rows"]:
-        names = ", ".join(r["symbol"] for r in b["positions"]["rows"])
+    if b.get("drift_rows") is None:
+        items.append((2, "Drift positions could not be read: check /status before the open."))
+    intraday = [r for r in b["positions"]["rows"] if not r.get("drift")]
+    if intraday:
+        names = ", ".join(r["symbol"] for r in intraday)
         eod = b.get("eod") or {}
         if eod.get("date") == b["prev"].isoformat():
             items.append((2, "Still held overnight: %s, although the end-of-day close ran on %s. Check the app and "
@@ -370,7 +380,11 @@ def build(client, state_dir):
          "universe": universe_line(cfg, state_dir),
          "eod": (t212._read_json(os.path.join(state_dir, "state", "t212-guard.json"), {}) or {}).get("eod")}
     b["earnings"] = earnings([session, b["next"]], held, set(b["flagged"]))
-    b["allocation"] = allocation_line(cfg, state_dir, session, prev, held)
+    b["drift_rows"] = drift_holdings(client, state_dir, cfg, session)
+    drift_t = {r["ticker"] for r in b["drift_rows"] or []}
+    for r in pos["rows"]:
+        r["drift"] = r["ticker"] in drift_t
+    b["allocation"] = allocation_line(cfg, state_dir, session, prev, held, b["drift_rows"])
     b["todo"] = todo(b)
     b["drift"] = drift_line(state_dir, session, "briefing")
     return b
@@ -387,9 +401,49 @@ def all_earnings(day):
             for r in rows if r.get("symbol")]
 
 
-def allocation_line(cfg, state_dir, session, prev, held):
+def _drift_buy():
+    db = _load("trader-broker", "drift_buy")
+    db.t212, db.allocation = t212, allocation
+    return db
+
+
+def drift_holdings(client, state_dir, cfg, session):
+    """Drift positions (drift_buy.holdings), [] when drift never bought, None when they could not be read."""
+    try:
+        db = _drift_buy()
+        state = t212._read_json(os.path.join(state_dir, "state", "broker.json"), {}) or {}
+        if not db.drift_tickers(state, client.env):
+            return []
+        rate = (t212._read_json(os.path.join(state_dir, "fx.json"), {}) or {}).get("usd_per_gbp")
+        return db.read_holdings(client, state_dir, cfg, float(rate), session) if rate else None
+    except Exception:
+        return None
+
+
+def drift_first(cfg, state_dir, session, held, drift_rows):
+    """(drift reservations for today's shortlist, what drift positions cost): drift's cash goes first in the plan."""
+    try:
+        db = _drift_buy()
+        if not db.active(cfg):
+            return [], 0.0
+        rows = drift_rows or []
+        used = sum(r["cost_gbp"] for r in rows)
+        sl = db._drift().read_shortlist(state_dir)
+        if not sl or sl.get("buy_day") != session.isoformat() or sl.get("error"):
+            return [], used
+        blocked = {str(b).upper() for b in t212.blocked_tickers(cfg)}
+        syms = [x["symbol"] for x in sl.get("shortlist") or []
+                if str(x["symbol"]).upper() not in blocked and str(x["symbol"]).upper() not in held]
+        res, _ = db.plan_reservations(cfg, syms, used, len(rows))
+        return res, used
+    except Exception:
+        return [], 0.0
+
+
+def allocation_line(cfg, state_dir, session, prev, held, drift_rows=None):
     """Make (or keep) the day's cash allocation plan and return its one line, or None with allocation off.
-    Demo only: allocation.active() is false unless "paper" is true."""
+    Demo only: allocation.active() is false unless "paper" is true. Drift's reservations (when drift
+    buying is on and today has a shortlist) go first."""
     if not allocation.active(cfg):
         return None
     try:
@@ -403,7 +457,8 @@ def allocation_line(cfg, state_dir, session, prev, held):
                      for x in uni.get("tickers") or [] if isinstance(x, dict)}
             today_rows, prev_rows = all_earnings(session), all_earnings(prev)
             cands = allocation.catalysts(today_rows, prev_rows, allowed, ranks, held)
-            plan = allocation.save_plan(state_dir, allocation.make_plan(cfg, day, cands))
+            dres, dused = drift_first(cfg, state_dir, session, held, drift_rows)
+            plan = allocation.save_plan(state_dir, allocation.make_plan(cfg, day, cands, drift=dres, drift_used_gbp=dused))
             if today_rows is None or prev_rows is None:
                 return allocation.plan_text(plan) + " (earnings calendar: no data, so no reservations from it)"
         return allocation.plan_text(plan)
@@ -493,7 +548,10 @@ def full_text(b):
         for e in rows or []:
             L.append("- %s: %s (%s), %s%s" % (label, e["symbol"], e["name"], e["when"], ", YOU HOLD IT" if e["held"] else ""))
     if b.get("drift"):
-        L += ["", "## Post-earnings drift (shadow)", "- " + b["drift"]]
+        L += ["", "## Post-earnings drift shortlist", "- " + b["drift"]]
+    if b.get("drift_rows"):
+        L += ["", "## Drift positions (demo, held up to 20 trading days; expected overnight)"]
+        L += ["- " + _drift_buy().holding_line(r) for r in b["drift_rows"]]
     if b.get("allocation"):
         L += ["", "## Cash allocation (demo)", "- " + b["allocation"]]
     L += ["", "## 5. To do, most urgent first"]
@@ -546,6 +604,8 @@ def short_text(b, path):
     top = ["%d. %s" % (i, t) for i, t in enumerate(points, 1)]
     if b.get("drift"):
         top.append(b["drift"])
+    if b.get("drift_rows"):
+        top.append("Drift: " + "; ".join(_drift_buy().holding_line(r) for r in b["drift_rows"]))
     if b.get("allocation"):
         top.append(b["allocation"])
     return "\n".join([head] + top + ["Full briefing: %s" % os.path.relpath(path, ROOT)])

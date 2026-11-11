@@ -61,7 +61,10 @@ DEFAULTS = {"scan_enabled": False, "min_surprise_pct": 10.0, "min_forecast": 0.1
             "entry_after_days": 2, "hold_days": 20, "slots": 10, "result_days": [5, 10, 20, 40],
             "fx_fee": 0.0015, "slippage": 0.0005, "tracker": "SPY", "tracker_cost": 0.0005, "scan_at": "15:35",
             "atr_days": 14, "atr_mult": 3.0, "gain_marks_pct": [5, 10, 15], "volume_days": 20,
-            "scan_budget_s": 600, "resolve_budget_s": 900}
+            "scan_budget_s": 600, "resolve_budget_s": 900,
+            # stage 3 (trader-broker/drift_buy.py): buying, OFF unless buy_enabled is true (demo only)
+            "buy_enabled": False, "buy_at": "09:33", "max_share_pct": 50.0, "max_open_risk_pct": 4.0,
+            "min_trades": 20}
 
 
 class DriftError(Exception):
@@ -113,16 +116,16 @@ def settings(cfg):
         raise DriftError("drift in trader/config.json must be an object, e.g. {\"scan_enabled\": true}")
     s = dict(DEFAULTS)
     s.update(raw)
-    for k in ("scan_enabled", "forecast_either_side"):
+    for k in ("scan_enabled", "forecast_either_side", "buy_enabled"):
         if not isinstance(s[k], bool):
             raise DriftError("drift.%s must be true or false" % k)
     for k in ("min_surprise_pct", "min_forecast", "fx_fee", "slippage", "tracker_cost", "atr_mult",
-              "scan_budget_s", "resolve_budget_s"):
+              "scan_budget_s", "resolve_budget_s", "max_share_pct", "max_open_risk_pct"):
         if isinstance(s[k], bool) or not isinstance(s[k], (int, float)) or s[k] < 0:
             raise DriftError("drift.%s must be a number, 0 or more" % k)
         s[k] = float(s[k])
     for k, lo, hi in (("entry_after_days", 1, 10), ("hold_days", 1, 60), ("slots", 1, 50), ("atr_days", 2, 50),
-                      ("volume_days", 2, 60)):
+                      ("volume_days", 2, 60), ("min_trades", 1, 1000)):
         if isinstance(s[k], bool) or not isinstance(s[k], int) or not lo <= s[k] <= hi:
             raise DriftError("drift.%s must be a whole number from %d to %d" % (k, lo, hi))
     for k in ("result_days", "gain_marks_pct"):
@@ -137,6 +140,15 @@ def settings(cfg):
         raise DriftError("drift.tracker must be a ticker, like SPY")
     if not _hm(s["scan_at"]):
         raise DriftError("drift.scan_at must be a New York time like 15:35")
+    b = _hm(s["buy_at"])
+    if not b or not (9, 30) <= b < (9, 45):
+        raise DriftError("drift.buy_at must be a New York time from 09:30 to 09:44, before the intraday window")
+    if not 0 < s["max_share_pct"] <= 100:
+        raise DriftError("drift.max_share_pct must be above 0 and at most 100")
+    if not 0 < s["max_open_risk_pct"] <= 20:
+        raise DriftError("drift.max_open_risk_pct must be above 0 and at most 20")
+    if s["atr_mult"] <= 0:
+        raise DriftError("drift.atr_mult must be above 0")
     return s
 
 
@@ -631,22 +643,26 @@ def _names(doc, limit=10):
 def _line_for(sd, cfg, want_buy_day, head):
     if cfg is not None and not settings(cfg)["scan_enabled"]:
         return None
+    tag = SHADOW
+    if cfg is not None and settings(cfg)["buy_enabled"] and cfg.get("paper") is True and not cfg.get("live_enabled"):
+        tag = "drift buying ON (demo): bought at %s New York if every check passes" % settings(cfg)["buy_at"]
     doc = read_shortlist(sd)
     if not doc or doc.get("buy_day") != _date(want_buy_day).isoformat():
-        return "%s (%s): %s." % (head, SHADOW, NO_SCAN)
+        return "%s (%s): %s." % (head, tag, NO_SCAN)
     if doc.get("error"):
-        return "%s (%s): %s." % (head, SHADOW, NO_SCAN + ", " + doc["error"])
+        return "%s (%s): %s." % (head, tag, NO_SCAN + ", " + doc["error"])
     if not doc.get("shortlist"):
         f = doc.get("filled") or {}
         detail = (" (%d with EPS, forecast and surprise; %d in the %s)" % (
             f["all_three"], doc["in_list"], "universe" if doc.get("list_from") == "universe" else "allowed list")
             if "all_three" in f and doc.get("in_list") is not None else "")
         return "%s (%s): none. %d report%s on %s%s, %d qualified%s." % (
-            head, SHADOW, doc.get("rows", 0), "" if doc.get("rows") == 1 else "s", _day(doc["report_day"]), detail,
+            head, tag, doc.get("rows", 0), "" if doc.get("rows") == 1 else "s", _day(doc["report_day"]), detail,
             doc.get("qualified", 0), "" if not doc.get("qualified") else ", no free virtual slot" if
             any("slot" in (x.get("why") or "") for x in doc.get("not_shortlisted") or []) else "")
-    return "%s (%s): %s. From %s's reports, %d qualified; virtual sell at the close on %s." % (
-        head, SHADOW, _names(doc), _day(doc["report_day"]), doc.get("qualified", 0), _day(doc["exit_day"]))
+    return "%s (%s): %s. From %s's reports, %d qualified; %s at the close on %s." % (
+        head, tag, _names(doc), _day(doc["report_day"]), doc.get("qualified", 0),
+        "virtual sell" if tag == SHADOW else "sell date", _day(doc["exit_day"]))
 
 
 def closing_line(sd, cfg, today):

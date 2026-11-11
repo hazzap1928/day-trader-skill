@@ -439,7 +439,7 @@ class ReportAndBriefing(Base):
              "unclear": {}, "errors": [], "total": None, "cash": None, "bought_today": [],
              "week_start": D(2026, 11, 9), "drift": "Drift shortlist for tomorrow (SHADOW: nothing is bought): NEG."}
         self.assertIn("Drift shortlist for tomorrow (SHADOW", rp.short_text(r, os.path.join(self.dir, "x.md")))
-        self.assertIn("## Post-earnings drift (shadow)", rp.full_text(r))
+        self.assertIn("## Post-earnings drift shortlist", rp.full_text(r))
 
 
 class NeverAnOrder(Base):

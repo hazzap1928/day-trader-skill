@@ -59,10 +59,13 @@ def count_of(cfg):
 
 
 def entries_today(broker_state, today):
-    """Today's placed buys (one record per entry), from trader/state/broker.json."""
+    """Today's placed intraday buys (one record per entry), from trader/state/broker.json. Drift buys are
+    left out: they have their own risk cap (drift.max_open_risk_pct), not intraday's daily loss limit."""
     out = {}
     for r in (broker_state or {}).get("orders") or []:
         if r.get("status") != "placed" or str(r.get("date") or "") != today:
+            continue
+        if str(r.get("strategy") or "").strip().lower() == "drift":
             continue
         if (r.get("kind") or ("entry" if str(r.get("side", "")).lower() == "buy" else "")) != "entry":
             continue

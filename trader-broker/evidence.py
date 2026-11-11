@@ -540,8 +540,12 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
     closed = []
     if fills is not None:
         trips, _ = report_mod.round_trips(fills)
+        broker = t212()._read_json(os.path.join(sd, "state", "broker.json"), {}) or {}
+        drift_keys = {(x.get("t212_ticker"), str(x.get("date") or "")) for x in broker.get("orders") or []
+                      if str(x.get("strategy") or "").lower() == "drift" and str(x.get("side", "")).lower() == "buy"}
         closed = [c for c in trips if start <= _ny_dt(c["exit_at"]) <= upto and c.get("entry_at")
-                  and _ny_dt(c["entry_at"]) >= start]
+                  and _ny_dt(c["entry_at"]) >= start
+                  and (c["ticker"], _ny_dt(c["entry_at"])) not in drift_keys]     # drift has its own section
     r["real"] = closed
     r["real_avg_gbp"] = _mean([c["pl"] for c in closed if c.get("pl") is not None])
     r["real_avg_ret"] = _mean([c["pl"] / c["cost_gbp"] for c in closed if c.get("pl") is not None and c.get("cost_gbp")])
@@ -721,9 +725,22 @@ def report_text(r):
     return "\n".join(lines)
 
 
+def drift_lines(sd, cfg, today):
+    """The Friday report's drift section (trader-broker/drift_buy.py), or [] (off, or it could not be built)."""
+    try:
+        db = _load("trader-broker", "drift_buy")
+        db.t212 = t212()
+        return db.friday_lines(sd, cfg, today) or []
+    except Exception as e:
+        return ["", "## Post-earnings drift (demo)", "- no data (%s)" % str(e)[:120]]
+
+
 def send_report(client, sd, cfg, report_mod, phone=None, environ=None):
     r = build_report(client, sd, cfg, report_mod)
     text = report_text(r)
+    extra = drift_lines(sd, cfg, r["today"])
+    if extra:
+        text = text + "\n" + "\n".join(extra)
     d = os.path.join(sd, "reports")
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "evidence-%s.md" % r["today"]), "w", encoding="utf-8") as fh:

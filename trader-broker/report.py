@@ -201,11 +201,17 @@ def build(client, state_dir):
     guard = t212._read_json(os.path.join(state_dir, "state", "t212-guard.json"), {}) or {}
     broker = t212._read_json(os.path.join(state_dir, "state", "broker.json"), {}) or {}
     pilot = t212._read_json(os.path.join(state_dir, "state", "autopilot.json"), {}) or {}
-    today, week, bought_today = [], [], []
+    today, week, bought_today, drift_closed = [], [], [], []
+    drift_keys = {(x.get("t212_ticker"), str(x.get("date") or "")) for x in broker.get("orders") or []
+                  if str(x.get("strategy") or "").lower() == "drift" and str(x.get("side", "")).lower() == "buy"}
     if fills is not None:
         closed, open_lots = round_trips(fills)
         for c in closed:
             d = tk.to_eastern(c["exit_at"]).date()
+            if c.get("entry_at") and (c["ticker"], tk.to_eastern(c["entry_at"]).date().isoformat()) in drift_keys:
+                if d == day:
+                    drift_closed.append(c)          # a drift sale: reported as DRIFT SELL, not an intraday trade
+                continue
             sym = (c["ticker"] or "").split("_")[0].upper()
             rec, tm = ticket_for(sym, d.isoformat(), broker, pilot)
             c.update(symbol=sym, reason=exit_reason(c, guard, t212._num((rec or {}).get("stop")), d.isoformat()),
@@ -218,9 +224,9 @@ def build(client, state_dir):
             if d == day:
                 today.append(c)
         for f in fills:
-            if f["side"] == "BUY" and tk.to_eastern(f["at"]).date() == day:
+            if f["side"] == "BUY" and tk.to_eastern(f["at"]).date() == day and (f["ticker"], day.isoformat()) not in drift_keys:
                 bought_today.append(f)
-    r.update(today=today, week=week, bought_today=bought_today, fills_ok=fills is not None)
+    r.update(today=today, week=week, bought_today=bought_today, fills_ok=fills is not None, drift_closed=drift_closed)
     try:
         s = client.get(t212.SUMMARY) or {}
         r["total"] = t212._num(s.get("totalValue"))
@@ -236,6 +242,19 @@ def build(client, state_dir):
     r["alerts"] = guard_alerts(state_dir, alerts.eastern_to_utc(datetime.datetime.combine(day, datetime.time(0, 0))))
     r["unclear"] = guard.get("unclear") or {}
     r["drift"] = drift_line(state_dir, day, "closing")
+    r["drift_rows"] = []
+    try:
+        db = _load("trader-broker", "drift_buy")
+        db.t212 = t212
+        dt = db.drift_tickers(broker, client.env)
+        if dt and r["open"] is not None:
+            cfg = t212._read_json(os.path.join(state_dir, "config.json"), {}) or {}
+            rate = float((t212._read_json(os.path.join(state_dir, "fx.json"), {}) or {}).get("usd_per_gbp") or 0) or None
+            pending = client.get(t212.ORDERS) or []
+            r["drift_rows"] = db.holdings(broker, r["open"], pending, client.env, guard, rate, day, cfg) if rate else []
+            r["open"] = [p for p in r["open"] if t212._o_ticker(p) not in dt]     # drift is meant to be held
+    except Exception as e:
+        r["errors"].append("drift positions: %s" % t212.scrub(e, client._secrets))
     return r
 
 
@@ -378,8 +397,17 @@ def full_text(r):
     L += ["  - " + a for a in r["alerts"]]
     if r["unclear"]:
         L.append("- UNCLEAR guard orders: " + "; ".join("%s (%s)" % kv for kv in sorted(r["unclear"].items())))
+    if r.get("drift_rows") or r.get("drift_closed"):
+        L += ["", "## Drift positions (demo, held up to 20 trading days)"]
+        for c in r.get("drift_closed") or []:
+            L.append("- SOLD today: %s %s at $%s, %s (a DRIFT SELL message has the result against SPY)" % (
+                c["ticker"].split("_")[0], t212._qty(c["qty"]), t212._fmt(c["exit"]),
+                _signed(c["pl"]) if c.get("pl") is not None else "result not known"))
+        db = _load("trader-broker", "drift_buy")
+        db.t212 = t212
+        L += ["- " + db.holding_line(x) for x in r.get("drift_rows") or []]
     if r.get("drift"):
-        L += ["", "## Post-earnings drift (shadow)", "- " + r["drift"]]
+        L += ["", "## Post-earnings drift shortlist", "- " + r["drift"]]
     L += ["", "## Against the Time Machine", tm_line(r["today"]), "",
           "Education and tooling, not financial advice."]
     return "\n".join(L) + "\n"
@@ -406,6 +434,14 @@ def short_text(r, path):
         lines.append("no data: " + e)
     tm = tm_line(r["today"]).split(" One day")[0]
     lines.append(tm if tm.endswith(".") else tm + ".")
+    if r.get("drift_rows"):
+        db = _load("trader-broker", "drift_buy")
+        db.t212 = t212
+        lines.append("Drift held: " + "; ".join(db.holding_line(x) for x in r["drift_rows"]))
+        bad = db.unprotected(r["drift_rows"])
+        if bad:
+            lines.append("!!! DRIFT NOT PROTECTED OVERNIGHT: %s (no stop order at Trading 212). Set a stop in the app."
+                         % ", ".join(x["symbol"] for x in bad))
     if r.get("drift"):
         lines.append(r["drift"])
     lines.append("Full report: %s" % (os.path.relpath(path, ROOT) if path.startswith(ROOT + os.sep) else path))

@@ -55,11 +55,12 @@ All market times are New York time; the Mac runs on UK time. Jobs are launchd ag
 | Before the open | The budget and loss limits are reset from the account value (section 4). |
 | 13:00 UK | The guard job starts and waits for the 09:30 open. |
 | 09:30 | Market opens. The opening range (09:30 to 09:45) forms. MARKET OPEN message. |
+| 09:33 | Drift buys (only with `drift.buy_enabled` true; OFF by default): today's drift shortlist, before the intraday window (section 12). |
 | 09:45 to 15:30 | The pipeline runs every 15 minutes (`autopilot.every_minutes`). No entries outside this window (`no_entries_before`, `no_entries_after`). |
 | Every 5 minutes, 09:30 to 16:00 | The guard checks every position and its stop. |
 | 15:35 | The post-earnings drift **shadow** scan (no orders, section 12). |
-| 15:50 | End-of-day close: intraday positions are sold at market (`eod_close.at`). |
-| About 15:55 | Closing report from Trading 212's own fills; virtual results filled in. |
+| 15:50 | End-of-day close: intraday positions, and drift positions on or after their sell date, are sold at market (`eod_close.at`). |
+| About 15:55 | Closing report from Trading 212's own fills; virtual results filled in; a DRIFT SELL message for each drift position sold. |
 | Fridays | Evidence report: real and virtual results, slippage, against the S&P 500 tracker. |
 
 On a 1:00 p.m. early-close day the entry cutoff, flat-by time and simulations move earlier to match.
@@ -416,6 +417,38 @@ ranked by surprise relative to price, into a virtual 10-slot book: buy at the op
 day after the report, sell at the close of the 20th day held. Results are tracked at 5, 10, 20 and 40
 days against SPY, after costs. In research it had a real signal but **did not beat the index** on
 the unseen 2024 to 2026 period.
+
+### Post-earnings drift buying (stage 3 of 4, OFF by default)
+
+Behind `"drift": {"buy_enabled": false}` (demo only; live refuses it in `drift_buy.active` and in
+`t212.py place`). With it off, nothing buys drift. When it is on, at 09:33 New York, before the
+intraday window, `trader-broker/drift_buy.py` works through today's shortlist:
+
+- **Skips, each logged with its reason** in the drift signal log and `state/drift/buys.jsonl`:
+  blocked; held or waiting under either strategy; no free slot; drift's share used; no cash
+  reservation; no free cash; already under its stop at the open (yesterday's close minus 3xATR);
+  the open-risk cap; /pause; a start after 09:45 ("missed": never bought late).
+- **The order:** a market buy through `t212.py place` (every placing check), labelled `"drift"` with
+  `sell_date` = the 20th trading day held, and a real Trading 212 stop (good till cancelled) whatever
+  `stop_mode` says. The stop is `atr_mult` (3) x the 14-day ATR under the entry. **This stop is not
+  from the research, which held with no stop.** A refused stop raises a GUARD ALERT; the guard puts it
+  back or holds it in software (market hours only), and /status, MARKET OPEN, the briefing and the
+  closing report say "NOT PROTECTED OVERNIGHT".
+- **Size:** the smaller of one slot and 1% of the account at the stop. One slot is the drift pool
+  (`max_share_pct` 50% of the investable 90%) divided by `slots` (10): about 4.5% of the account.
+- **Cash:** drift never buys without a reservation in `state/allocation.json`. The 07:30 plan reserves
+  drift's slots first (intraday's reservations come from what drift does not use); if that plan is
+  missing or has none, the buy step reserves them itself; if it cannot, that day's buys are skipped.
+- **Limits of its own:** `slots`, `max_share_pct`, and `max_open_risk_pct` (4% of the account at the
+  drift stops in total). Drift does not count toward intraday's 4 positions, trades a day or daily loss.
+- **Selling:** the 15:50 close on the sell date (or the next close the Mac is on, with a DRIFT SELL
+  OVERDUE alert), or earlier by the stop. No trailing stop or half sale. DRIFT SELL gives the result
+  after costs, days held and SPY over the same days. Turning buying off stops new buys only.
+- **Friday:** its own section and pass rule (positive average after costs AND beating SPY over the
+  same holding periods), real trades and shadow signals apart, under 20 closed: too few to judge.
+
+**Known risk:** a stop cannot stop a gap. A stock that opens far under its stop sells at the open,
+so one drift loss can be more than 1% of the account.
 
 ---
 

@@ -495,6 +495,9 @@ class Pilot(object):
                 side = str(o.get("side") or "").upper()
                 if side == "BUY" or (not side and (t212._num(o.get("quantity")) or 0) > 0):
                     held.add(str(t212._o_ticker(o) or "").split("_")[0].upper())
+            # drift positions have their own slots: they never count toward intraday's max_open_positions
+            state = t212._read_json(self.p("state", "broker.json"), {}) or {}
+            held -= {t.split("_")[0].upper() for t in self.drift_buy().drift_tickers(state, self.client.env)}
         except t212.T212Error as e:
             self.say("positions count failed (%s): the cash check at placing time decides"
                      % t212.scrub(e, self.client._secrets))
@@ -1068,6 +1071,7 @@ class Pilot(object):
                  self.universe_line()]
         if self.s["evidence_mode"]:
             lines.append("EVIDENCE MODE is ON: %s" % self.evidence_day())
+        lines += self.drift_lines()
         return "\n".join(lines)
 
     def record_day(self):
@@ -1099,6 +1103,7 @@ class Pilot(object):
         if self.s["evidence_mode"]:
             self.evidence_close(report)
         self.drift_resolve()
+        self.drift_sells()
 
     # ------------------------------------------------------------ post-earnings drift (SHADOW, never an order)
 
@@ -1135,6 +1140,96 @@ class Pilot(object):
                 self.say("drift: %d virtual results updated (shadow)" % drift.resolve(self.sd, cfg))
         except Exception as e:
             self.say("drift results failed (shadow, nothing affected): %s" % t212.scrub(e, self.client._secrets))
+
+    def drift_buy(self):
+        """trader-broker/drift_buy.py with this autopilot's own modules (one set of fakes in the tests)."""
+        db = mod("trader-broker", "drift_buy")
+        db.t212, db.allocation, db.drift = t212, allocation, mod("trader-broker", "drift")
+        return db
+
+    def drift_buy_due(self, ny):
+        if self.state.get("drift_buy") == self.state.get("day"):
+            return False
+        try:
+            cfg = self.drift_cfg()
+            db = self.drift_buy()
+            if not db.active(cfg):
+                return False
+            h, m = _hm(db.settings(cfg)["buy_at"], "09:33")
+        except Exception:
+            return False
+        return ny >= ny.replace(hour=h, minute=m, second=0, microsecond=0)
+
+    def drift_quote(self, sym):
+        """A fresh quote (trader-alerts, the same as intraday) for a drift buy, or None."""
+        self.run(["trader-alerts/alerts.py", "quote", sym, "--write", self.p("prices.json")], "a quote")
+        doc = t212._read_json(self.p("prices.json"), {}) or {}
+        px = t212._num((doc.get("prices") or {}).get(sym))
+        d = (doc.get("detail") or {}).get(sym) or {}
+        t = t212._iso_ts(d.get("time") or "") or t212._iso_ts(d.get("fetched") or "")
+        if px and t is not None and 0 <= _now() - t <= 15 * 60:
+            return px
+        return None
+
+    def drift_buy_step(self):
+        """The morning drift buys (drift_buy.py), once a day, before the intraday window. Never stops the day."""
+        self.state["drift_buy"] = self.state.get("day")
+        self.save()
+        try:
+            db = self.drift_buy()
+            cfg = self.drift_cfg()
+            if not db.active(cfg):
+                return
+            rate = self.rate()
+            if not rate:
+                self.fx_fresh()
+                rate = self.rate()
+            if not rate:
+                raise PilotError("no GBP/USD rate in trader/fx.json")
+            res = db.buy_today(self.client, self.sd, cfg, _ny(), rate, self.drift_quote, bool(self.state.get("paused")),
+                               self.say, lambda text: phone_mod.push(self.sd, text, phone=self.phone))
+            self.say("drift buy: %s; bought %s; skipped %s" % (
+                res["status"], ", ".join(b["symbol"] for b in res["bought"]) or "none",
+                "; ".join("%s (%s)" % kv for kv in res["skipped"]) or "none"))
+        except Exception as e:
+            self.say("drift buy step failed (nothing more is bought today): %s" % t212.scrub(e, self.client._secrets))
+            phone_mod.push(self.sd, "DRIFT (demo): the buy step failed (%s). Nothing more is bought today."
+                           % t212.scrub(e, self.client._secrets), phone=self.phone)
+
+    def drift_sells(self):
+        """After the close: DRIFT SELL for each drift position that was sold (sell date or stop). Read-only."""
+        try:
+            db = self.drift_buy()
+            cfg = self.drift_cfg()
+            if not db.drift_tickers(t212._read_json(self.p("state", "broker.json"), {}) or {}, self.client.env) \
+                    and not db.load_jsonl(db.trades_path(self.sd)):
+                return
+            report = mod("trader-broker", "report")
+            report.t212, report.tk = t212, tk
+            for row, text in db.closed_since(self.client, self.sd, cfg, _ny().date(), report, self.rate()):
+                phone_mod.push(self.sd, text, phone=self.phone)
+                self.say(text)
+        except Exception as e:
+            self.say("drift sells: could not be checked (%s)" % t212.scrub(e, self.client._secrets))
+
+    def drift_lines(self):
+        """Drift holdings for /status and MARKET OPEN: day X of 20, gain or loss, stop, sell date."""
+        try:
+            db = self.drift_buy()
+            if not db.drift_tickers(t212._read_json(self.p("state", "broker.json"), {}) or {}, self.client.env):
+                return []                         # no drift buy ever: nothing to show, and no extra request
+            rate = self.rate()
+            if not rate:
+                return []
+            rows = db.read_holdings(self.client, self.sd, self.drift_cfg(), rate, _ny().date())
+            lines = db.holding_lines(rows)
+            bad = db.unprotected(rows)
+            if bad:
+                lines.append("!!! NOT PROTECTED OVERNIGHT (no stop order at Trading 212): %s. Set a stop in the app."
+                             % ", ".join(r["symbol"] for r in bad))
+            return lines
+        except Exception as e:
+            return ["Drift holdings: no data (%s)" % t212.scrub(e, self.client._secrets)]
 
     def drift_due(self, ny):
         try:
@@ -1306,6 +1401,7 @@ class Pilot(object):
         lines.append(self.budget_line())
         lines.append(self.universe_line())
         lines += self.positions_lines()
+        lines += self.drift_lines()
         if first and last:
             lines.append("Checks every %d min from %s to %s New York. /pause stops new buys." % (
                 self.s["every_minutes"], first.strftime("%H:%M"), last.strftime("%H:%M")))
@@ -1432,6 +1528,8 @@ class Pilot(object):
             if getattr(self, "net_down", False):
                 next_cycle = self.offline(next_cycle, step, last, summary_at)
                 continue
+            if self.drift_buy_due(ny):
+                self.drift_buy_step()                   # drift buys first each morning, before 09:45
             if ny >= next_cycle and next_cycle <= last:
                 try:
                     self.cycle_started = _now()
