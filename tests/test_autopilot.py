@@ -195,8 +195,10 @@ class Cycle(PilotBase):
     def test_a_passing_ticket_goes_to_the_phone_with_two_buttons(self):
         p, t = self.ticket()
         text, buttons = self.phone.sent[-1]
-        self.assertIn("DEMO TICKET: BUY 8 TSLA", text)
-        self.assertIn("Nothing is placed unless you tap Approve", text)
+        self.assertIn("<b>Buy TSLA?</b>", text)
+        self.assertIn("<b>8 shares</b>", text)
+        self.assertIn("Safety net: auto-sells if it drops to $358.32", text)
+        self.assertIn("Nothing is bought unless you do", text)
         self.assertEqual([b[0] for b in buttons], ["Approve", "Reject"])
         self.assertEqual(buttons[0][1], "ap:%s:%s" % (t["id"], t["nonce"]))
         self.assertEqual(t["expires"] - t["created"], 600)
@@ -266,7 +268,7 @@ class Approve(PilotBase):
         self.assertEqual([x[1] for x in posts], ["/equity/orders/market", "/equity/orders/stop"])
         self.assertTrue(all(c[4].startswith("https://demo.trading212.com/") for c in self.router.calls))
         self.assertEqual(t["status"], "placed")
-        self.assertIn("PLACED on demo", self.phone.edits[-1][1])
+        self.assertIn("Approved and bought", self.phone.edits[-1][1])
         rec = [r for r in self.broker_log() if r.get("status") == "placed"][0]
         self.assertTrue(rec["reply"].startswith("phone approve %s" % t["id"]))
         steps = [c[0].rsplit("/", 1)[1] for c in self.pipe.calls]
@@ -290,7 +292,7 @@ class Approve(PilotBase):
         self.clock[0] += 600
         p.expire()
         self.assertEqual(t["status"], "expired")
-        self.assertIn("EXPIRED", self.phone.edits[-1][1])
+        self.assertIn("Expired.</b> Nothing was bought", self.phone.edits[-1][1])
 
     def test_a_second_tap_never_places_twice(self):
         p, t = self.ticket()
@@ -306,14 +308,14 @@ class Approve(PilotBase):
         self.tap(p, t, nonce="0" * 16)
         self.assertEqual(t["status"], "pending")
         self.assertEqual(self.router.posts(), [])
-        self.assertIn("Unknown ticket", self.phone.answers[-1])
+        self.assertIn("Unknown request", self.phone.answers[-1])
 
     def test_a_price_that_ran_away_is_not_chased(self):
         p, t = self.ticket()
         self.pipe.quote = 368.00                      # entry 364.18 + 0.5 x 5.86 = 367.11
         self.tap(p, t)
         self.assertEqual(t["status"], "refused")
-        self.assertIn("too late to chase", self.phone.edits[-1][1])
+        self.assertIn("run too far above the planned buy price", self.phone.edits[-1][1])
         self.assertEqual(self.router.posts(), [])
 
     def test_risk_blocking_after_the_tap_places_nothing(self):
@@ -348,12 +350,22 @@ class AutoBuy(PilotBase):
         self.assertIn("TSLA: placed", line)
         self.assertEqual([x[1] for x in self.router.posts()], ["/equity/orders/market", "/equity/orders/stop"])
         self.assertTrue(all(c[4].startswith("https://demo.trading212.com/") for c in self.router.calls))
+        self.assertEqual(self.phone.sent, [])          # not filled yet: one message comes with the fill
+        self.router.routes.clear()
+        self.router.add("GET", "/equity/positions", FakeResp([]))
+        p.watch_positions()
+        self.router.routes.clear()
+        self.router.add("GET", "/equity/positions", FakeResp([dict(HELD7[0], averagePricePaid=364.2)]))
+        p.watch_positions()
+        self.assertEqual(len(self.phone.sent), 1)      # BOUGHT and FILLED are one message
         text = self.phone.sent[-1][0]
-        self.assertRegex(text, r"^BOUGHT \(demo, automatic\): \d+ TSLA\n")
-        for want in ("Entry: $", "Cost: about £", "Stop: $358.32",
-                     "Target: $370.04", "Max loss at the stop: about £", "Time Machine: average +0.30R a trade before costs (+0.12R after); 60 % of the replays that made "
-                     "or lost money made money, 50 % breaks even"):
+        self.assertTrue(text.startswith("🟢 <b>Bought TSLA</b>\n"), text)
+        for want in ("at <b>$364.20</b> each", "Cost: <b>£", "Safety net: auto-sells if it drops to $358.32",
+                     "Most I could lose: <b>about £", "Past similar trades: a profit before fees, around +£",
+                     "Reply /pause"):
             self.assertIn(want, text)
+        for jargon in ("R ", "Target", "Time Machine", "_US_EQ", "demo", "EVIDENCE"):
+            self.assertNotIn(jargon, text)
         self.assertIsNone(self.phone.sent[-1][1])                  # no buttons
         rec = [r for r in self.broker_log() if r.get("status") == "placed"][0]
         self.assertTrue(rec["reply"].startswith("auto-buy"))
@@ -381,8 +393,9 @@ class AutoBuy(PilotBase):
                 ap._run = self.pipe
                 self.pipe.verdict = "PASS"
                 self.assertEqual(self.router.posts(), [])
-                self.assertIn("NOT PLACED (demo): TSLA passed the checks when built", self.phone.sent[-1][0])
-                self.assertIn(why, self.phone.sent[-1][0])
+                self.assertTrue(self.phone.sent[-1][0].startswith("⚠️ Couldn't buy TSLA: "), self.phone.sent[-1][0])
+                self.assertNotIn("{", self.phone.sent[-1][0])     # never raw API output
+                self.assertIn(why, p.state["tickets"][-1]["note"])         # the full reason stays in the log
 
     def test_the_daily_limits_live_in_the_risk_check_it_reruns(self):
         p, _ = self.cycle()
@@ -410,8 +423,9 @@ class AutoBuy(PilotBase):
 
     def test_status_says_it_buys_automatically(self):
         p = self.pilot()
+        self.router.add("GET", "/equity/positions", FakeResp([]))
         p.command("/status")
-        self.assertIn("buys automatically", self.phone.sent[-1][0])
+        self.assertIn("Buying: automatic", self.phone.sent[-1][0])
 
 
 class Watching(PilotBase):
@@ -423,11 +437,12 @@ class Watching(PilotBase):
         self.router.routes.clear()
         self.router.add("GET", "/equity/positions", FakeResp(HELD7))
         p.watch_positions()
-        self.assertIn("FILLED (demo): bought 7 TSLA_US_EQ", self.phone.sent[-1][0])
+        self.assertIn("🟢 <b>Bought TSLA</b>\n• <b>7 shares</b>", self.phone.sent[-1][0])
         self.router.routes.clear()
         self.router.add("GET", "/equity/positions", FakeResp([]))
         p.watch_positions()
-        self.assertIn("EXIT (demo): sold 7 TSLA_US_EQ", self.phone.sent[-1][0])
+        self.assertIn("<b>Sold TSLA</b>", self.phone.sent[-1][0])
+        self.assertIn("7 shares", self.phone.sent[-1][0])
 
     def test_the_summary_records_the_day_for_the_briefing(self):
         p = self.pilot()
@@ -440,8 +455,9 @@ class Watching(PilotBase):
 
     def test_status_from_the_phone(self):
         p = self.pilot()
+        self.router.add("GET", "/equity/positions", FakeResp([]))
         p.command("/status")
-        self.assertIn("Autopilot (demo, asks for Approve)", self.phone.sent[-1][0])
+        self.assertIn("Buying: asks you first", self.phone.sent[-1][0])
 
 
 class Day(PilotBase):
@@ -463,8 +479,8 @@ class Day(PilotBase):
             self.assertEqual(p.day(), "done")
         scans = [c for c in self.pipe.calls if c[0].endswith("scan.py")]
         self.assertEqual(len(scans), 24)              # 9:45, 10:00 ... 15:30
-        self.assertIn("MARKET OPEN (demo) Thu 05 Nov 09:30 New York", self.phone.sent[0][0])
-        self.assertIn("CLOSING REPORT (demo) Thu 05 Nov", self.phone.sent[-1][0])
+        self.assertIn("<b>US market open</b> (2:30pm UK)", self.phone.sent[0][0])
+        self.assertIn("<b>Thursday 5 Nov: day summary</b>", self.phone.sent[-1][0])
         self.assertLessEqual(self.clock[0], NOW + (5 * 60 + 26) * 60)   # by about 15:56 New York
         self.assertEqual(self.router.posts(), [])
         self.assertTrue(p.state["summary_sent"])
@@ -479,7 +495,7 @@ class Day(PilotBase):
 class GuardToPhone(PilotBase):
     def test_guard_alerts_go_to_the_phone(self):
         t212.guard_alarm(self.client, "key rejected")
-        self.assertIn("GUARD ALERT (DEMO): key rejected", self.pushed[-1])
+        self.assertIn("Safety guard problem</b>\nkey rejected", self.pushed[-1])
 
     def test_guard_news_is_orders_sent_not_quiet_checks(self):
         res = {"positions": [{"ticker": "A", "status": "covered", "held": 1},

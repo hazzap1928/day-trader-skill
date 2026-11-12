@@ -543,7 +543,7 @@ class InTheAutopilot(test_autopilot.PilotBase):
         self.assertLess(f.scans[0], at_1535 + 120)
         self.assertEqual(len(f.resolves), 1)
         self.assertGreater(f.resolves[0], f.scans[0])
-        self.assertIn("CLOSING REPORT (demo)", self.phone.sent[-1][0])
+        self.assertIn("day summary</b>", self.phone.sent[-1][0])
         self.assertEqual(self.router.posts(), [])
 
     def test_a_late_start_scans_just_before_the_report(self):

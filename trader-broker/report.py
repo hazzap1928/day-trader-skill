@@ -457,11 +457,56 @@ def save(r, state_dir):
     return path
 
 
+def market_move(day, fetch=None):
+    """How the S&P 500 tracker (SPY, Yahoo daily bars, the source the Friday report already uses) moved on
+    New York day `day`, close against the previous close, in percent. None without data. Never raises."""
+    try:
+        if fetch is None:
+            ev = _load("trader-broker", "evidence")
+            fetch = lambda: ev.fetch_bars(ev.TRACKER, "5d", "1d")
+        rows = [(tk.to_eastern(datetime.datetime.utcfromtimestamp(b[0])).date(), b[4]) for b in fetch() or []]
+        rows = [x for x in rows if x[1]]
+        if len(rows) < 2 or rows[-1][0] != day:
+            return None
+        return (rows[-1][1] / rows[-2][1] - 1) * 100
+    except Exception:
+        return None
+
+
+def watch_data(state_dir, day, which):
+    """The drift watchlist's figures for the phone (drift.watch_data); "missing" when it cannot be read."""
+    try:
+        drift = _load("trader-broker", "drift")
+        cfg = t212._read_json(os.path.join(state_dir, "config.json"), {}) or {}
+        return drift.watch_data(state_dir, cfg, day, which)
+    except Exception:
+        return {"missing": True}
+
+
+def phone_text(r, path, state_dir, market=None):
+    """The evening report for the phone, in plain words (trader-broker/messages.py)."""
+    M = phone_mod.messages()
+    M.use(state_dir)
+    r = dict(r, open_tickers=[t212._o_ticker(p) for p in r.get("open") or []])
+    watch = M.watchlist(watch_data(state_dir, r["day"], "closing"), "closing")
+    if r.get("drift_rows"):
+        watch = M.drift_holdings(r["drift_rows"]) + ([""] if watch else []) + watch
+    for c in r.get("drift_closed") or []:
+        watch = ["%s %s sold today: %s (its own message follows)" % (
+            "\U0001f7e2" if (c.get("pl") or 0) > 0 else "\U0001f534", M.company(c["ticker"]),
+            M.signed_gbp(c.get("pl")))] + watch
+    shown = os.path.relpath(path, ROOT) if path.startswith(ROOT + os.sep) else path
+    return M.evening(r, shown, compare=M.compare_line(r.get("today")), watch=watch,
+                     market=M.market_line(market) if market is not None else None)
+
+
 def send(client, state_dir, phone=None, environ=None):
-    """Build, save and send. Returns (sent, path, short text)."""
+    """Build, save and send. Returns (sent, path, phone text). The saved report keeps every detail."""
     r = build(client, state_dir)
     path = save(r, state_dir)
-    text = short_text(r, path)
+    cfg = t212._read_json(os.path.join(state_dir, "config.json"), {}) or {}
+    market = market_move(r["day"]) if (cfg.get("report") or {}).get("market_line") else None
+    text = phone_text(r, path, state_dir, market)
     ok = phone_mod.push(state_dir, text, environ=environ, phone=phone)
     return ok, path, text
 
@@ -485,7 +530,7 @@ def main(argv=None, environ=None):
         print(short_text(r, path))
         return 0
     ok, path, text = send(client, a.state_dir, environ=environ)
-    print(text)
+    print(phone_mod.messages().plain(text))
     if not ok:
         sys.stderr.write("report: not sent to the phone; saved %s\n" % path)
         return 1

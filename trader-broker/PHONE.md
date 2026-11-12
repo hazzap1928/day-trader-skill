@@ -60,27 +60,33 @@ Why Telegram:
 
 ## What you get on your phone
 
+Every message is plain English for someone who is not a trader, written in one place:
+`trader-broker/messages.py` (one function per message type; change the wording there). No R values, no
+"stop"/"target" jargon, no order ids. Money in pounds, share prices in dollars. Sent with Telegram's HTML
+formatting (bold); if Telegram rejects the formatting the same words go as plain text, and a message over
+Telegram's 4,096-character limit is split between paragraphs. The logs and the reports in `trader/reports/`
+keep the full detail.
+
 | Message | When |
 |---|---|
-| MARKET OPEN | each trading day at the open: guard and autopilot running, evidence mode, positions and their stops |
-| DEMO TICKET + Approve / Reject | a ticket passed every check (only when `auto_buy` is off) |
-| BOUGHT (demo, automatic) | with `"autopilot": {"auto_buy": true}`: what was bought, the cost and max loss in GBP, the stop, the target and the Time Machine's odds |
-| PLACED / NOT PLACED | after your Approve, or when an automatic buy failed a placing-time check (and why) |
-| FILLED / EXIT | the positions changed (checked each minute) |
-| GUARD / GUARD ALERT | the guard placed a stop, trailed it or sold; or it cannot protect you |
-| END-OF-DAY CLOSE | 15:50 New York: the guard sold every open position (`eod_close`) and lists them; a failed sale is a loud GUARD ALERT |
-| MORNING BRIEFING | 07:30 UK on weekdays (`briefing.py`) |
-| EVIDENCE MODE REPORT | every Friday after the close while the forward test is on (no end date): a running ON TRACK / NOT ON TRACK status for this week and since the start, with the closed-trade count (too few trades to judge below `evidence.min_trades`), real and virtual results after costs, slippage, the tracker and Kronos |
-| CLOSING REPORT | about 15:55 New York: each trade with entry, exit, reason and P&L after fees; day and week totals; win rate; account; anything open; results against the Time Machine |
+| 🔔 US market open | each trading day at the open: safety guard and autopilot running, what is held and its safety net |
+| 👀 Buy X? + Approve / Reject | a trade passed every check (only when `auto_buy` is off) |
+| 🟢 Bought X | once the buy has filled, with the real fill price: shares, cost in GBP, the safety net, the most it could lose, when the trail starts, and a one-line verdict from past similar trades (after fees, in pounds). BOUGHT and FILLED are one message |
+| ⚠️ Couldn't buy X | an automatic buy failed a placing-time check: one plain sentence (the raw error stays in the log). Cash skips are summed up once per scan |
+| 🔴/🟢 Sold X | a sale during the day (safety net hit, profit locked in), with the result in pounds from Trading 212's fills. Sales at the 15:50 close are in the evening report instead |
+| 🛡️ Safety net | the guard set a missing safety net (a late fill), or raised it (once a day per stock) |
+| ⚠️ safety guard problems | the guard cannot protect a position, or a sale at the close failed: what to do, in plain words |
+| ☀️ Good morning | 07:30 UK on weekdays (`briefing.py`) |
+| 📊 Day summary | about 15:55 New York: the day and week in pounds, each trade, past trades vs today, how the US market moved (`"report": {"market_line": true}`), tomorrow's earnings watchlist |
+| 📊 Week summary | every Friday after the close while the forward test is on: on track or not, this week and since the start, against holding the S&P 500 |
 
 The autopilot is **always on**: launchd starts `com.daytraderskill.autopilot` at login and restarts it if
 it stops. Whenever the Mac is on it answers commands, weekends and before the open included. It also:
 - **Sends the outbox:** delivers anything that could not be sent earlier.
 - **Catches up the briefing:** on a trading day it reruns a morning briefing that never started or never
   got through, from 07:45 UK until the open.
-- **Confirms the open:** at each open it sends a MARKET OPEN message with the guard's state and last check,
-  the autopilot's state, evidence mode, and every open position with its stop. It shouts if a position
-  has no stop.
+- **Confirms the open:** at each open it sends a "US market open" message with the guard's and the
+  autopilot's state and every open position with its safety net. It says so loudly if a position has none.
 
 The briefing itself tries to send every 2 minutes for 30 minutes, then waits in the outbox.
 

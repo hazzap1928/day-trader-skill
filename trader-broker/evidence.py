@@ -745,8 +745,22 @@ def send_report(client, sd, cfg, report_mod, phone=None, environ=None):
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "evidence-%s.md" % r["today"]), "w", encoding="utf-8") as fh:
         fh.write(text + "\n")
-    ok = t212().phone_module().push(sd, text, phone=phone, environ=environ)
+    ok = t212().phone_module().push(sd, phone_text(sd, cfg, r), phone=phone, environ=environ)
     return ok, text, r
+
+
+def phone_text(sd, cfg, r):
+    """The Friday report for the phone, in plain words (trader-broker/messages.py). The saved file keeps the detail."""
+    M = t212().phone_module().messages()
+    M.use(sd)
+    drift = None
+    try:
+        db = _load("trader-broker", "drift_buy")
+        db.t212 = t212()
+        drift = db.friday_phone(sd, cfg, r["today"])
+    except Exception:
+        drift = ["\u26a0\ufe0f The earnings-trades figures couldn't be read this week."]
+    return M.friday(r, drift)
 
 
 def due(cfg, today_iso, weekday):

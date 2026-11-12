@@ -253,7 +253,7 @@ class GuardTrail(Base):
         self.router.add("GET", "/equity/history/orders", FakeResp({"items": [{"order": dict(
             stop_order(), status="CANCELLED")}], "nextPagePath": None}))
         self.guard()
-        self.assertTrue(any("GONE at Trading 212 (CANCELLED)" in p for p in self.pushed))
+        self.assertTrue(any("Trading 212 dropped the safety net" in p for p in self.pushed))
         self.assertIn(TICKER, self.read("state/t212-guard.json")["software"])
 
     def test_the_guards_own_cancels_are_remembered(self):

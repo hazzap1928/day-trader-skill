@@ -377,8 +377,8 @@ class Pilot(test_autopilot.PilotBase):
         p = self.pilot()
         self.router.add("GET", "/equity/positions", test_t212_place.FakeResp([]))
         self.router.add("GET", "/equity/orders", test_t212_place.FakeResp([]))
-        self.assertIn("Universe: 5 stocks (S&P 500, filtered; built ", p.open_message())
-        self.assertIn("5 tickers allowed", p.status_text())
+        self.assertIn("Universe: 5 stocks (S&P 500, filtered; built ", p.universe_line())
+        self.assertIn("Choosing from 5 companies", p.status_text())
 
     def test_a_slow_cycle_is_reported_once_a_day(self):
         p = self.pilot()
@@ -386,9 +386,9 @@ class Pilot(test_autopilot.PilotBase):
         self.assertEqual(self.phone.sent, [])
         p.slow_cycle(13 * 60)
         p.slow_cycle(14 * 60)
-        slow = [t for t, _ in self.phone.sent if t.startswith("SLOW CYCLE")]
+        slow = [t for t, _ in self.phone.sent if t.startswith("⚠️ One check for trades took")]
         self.assertEqual(len(slow), 1)
-        self.assertIn("13m 00s, over 80% of the 15-minute gap. Universe: 5 stocks", slow[0])
+        self.assertIn("13m 00s, close to the 15-minute gap between checks (5 stocks on the list)", slow[0])
 
     def test_kronos_never_runs_into_the_next_cycle(self):
         p = self.pilot()

@@ -16,6 +16,7 @@ trader/state/phone.json. Education and tooling, not financial advice.
 
 import argparse
 import datetime
+import importlib.util
 import json
 import os
 import sys
@@ -27,6 +28,60 @@ API = "https://api.telegram.org/bot%s/%s"
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 TIMEOUT = 40
 MAX_TEXT = 3900               # Telegram's limit is 4096 characters a message
+_MSG = []
+
+
+def messages():
+    """trader-broker/messages.py: every word sent to the phone."""
+    if not _MSG:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "messages.py")
+        spec = importlib.util.spec_from_file_location("trader_broker_messages", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _MSG.append(mod)
+    return _MSG[0]
+
+
+def split(text, limit=MAX_TEXT):
+    """Long messages in pieces under Telegram's limit, cut between paragraphs (else lines), never inside one."""
+    text = str(text)
+    if len(text) <= limit:
+        return [text]
+    parts, cur = [], ""
+    for para in text.split("\n\n"):
+        for piece in ([para] if len(para) <= limit else _lines(para, limit)):
+            add = piece if not cur else cur + "\n\n" + piece
+            if len(add) <= limit:
+                cur = add
+            else:
+                if cur:
+                    parts.append(cur)
+                cur = piece
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def _lines(para, limit):
+    out, cur = [], ""
+    for line in para.split("\n"):
+        while len(line) > limit:                  # one huge line: cut it (it never holds a tag across)
+            out.append(line[:limit])
+            line = line[limit:]
+        add = line if not cur else cur + "\n" + line
+        if len(add) <= limit:
+            cur = add
+        else:
+            out.append(cur)
+            cur = line
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _bad_format(e):
+    return "can't parse entities" in str(e).lower() or "can't find end" in str(e).lower() \
+        or "unsupported start tag" in str(e).lower()
 
 
 class PhoneError(Exception):
@@ -112,22 +167,35 @@ class Phone(object):
 
     # ------------------------------------------------------------ out
 
+    def _html(self, method, text, **params):
+        """Telegram HTML (bold and so on). If Telegram rejects the formatting, the same words go as plain text."""
+        try:
+            return self.call(method, text=text, parse_mode="HTML", **params)
+        except PhoneError as e:
+            if not _bad_format(e):
+                raise
+            return self.call(method, text=messages().plain(text)[:MAX_TEXT], **params)
+
     def send(self, text, buttons=None):
-        """buttons: [(label, callback_data), ...] on one row. Returns the message id."""
+        """buttons: [(label, callback_data), ...] on one row, on the last piece. Returns the message id
+        (of the last piece: a long message goes in pieces under Telegram's 4,096-character limit)."""
         if not self.paired:
             raise PhoneError("no phone paired yet: run python3 trader-broker/phone.py setup")
-        params = {"chat_id": self.state["chat_id"], "text": text[:MAX_TEXT], "disable_web_page_preview": True}
-        if buttons:
-            params["reply_markup"] = {"inline_keyboard": [[{"text": l, "callback_data": d} for l, d in buttons]]}
-        res = self.call("sendMessage", **params)
+        res = None
+        pieces = split(text)
+        for i, piece in enumerate(pieces):
+            params = {"chat_id": self.state["chat_id"], "disable_web_page_preview": True}
+            if buttons and i == len(pieces) - 1:
+                params["reply_markup"] = {"inline_keyboard": [[{"text": l, "callback_data": d} for l, d in buttons]]}
+            res = self._html("sendMessage", piece, **params)
         return (res or {}).get("message_id")
 
     def edit(self, message_id, text):
         """Replace a message's text and take its buttons away."""
         if message_id is None:
             return
-        self.call("editMessageText", chat_id=self.state["chat_id"], message_id=message_id, text=text[:MAX_TEXT],
-                  reply_markup={"inline_keyboard": []})
+        self._html("editMessageText", split(text)[0], chat_id=self.state["chat_id"], message_id=message_id,
+                   reply_markup={"inline_keyboard": []})
 
     def answer(self, callback_id, text=""):
         self.call("answerCallbackQuery", callback_query_id=callback_id, text=text[:190])
@@ -238,7 +306,7 @@ def queue(state_dir, text):
     """Keep a message that could not be sent; the next one that gets through takes it along."""
     doc = _read(outbox_path(state_dir), {}) or {}
     items = doc.get("items") or []
-    items.append({"at": _now(), "text": str(text)[:1500]})
+    items.append({"at": _now(), "text": str(text)[:3000]})
     doc["items"] = items[-OUTBOX_MAX:]
     doc["dropped"] = int(doc.get("dropped") or 0) + max(0, len(items) - OUTBOX_MAX)
     _write(outbox_path(state_dir), doc)
@@ -250,12 +318,8 @@ def flush_outbox(p, state_dir):
     items = doc.get("items") or []
     if not items:
         return 0
-    head = "DELIVERED LATE: %d message%s that could not be sent at the time%s:" % (
-        len(items), "" if len(items) == 1 else "s",
-        "" if not doc.get("dropped") else " (%d older ones dropped)" % doc["dropped"])
-    body = "\n".join("- %s %s" % (datetime.datetime.fromtimestamp(i["at"]).strftime("%a %H:%M"), i["text"])
-                     for i in items)
-    p.send((head + "\n" + body)[:MAX_TEXT])
+    p.send(messages().delivered_late([(datetime.datetime.fromtimestamp(i["at"]).strftime("%a %H:%M"), i["text"])
+                                      for i in items], doc.get("dropped") or 0))
     _write(outbox_path(state_dir), {"items": []})
     return len(items)
 
@@ -282,8 +346,7 @@ def main(argv=None, environ=None):
         p = Phone(token_from(environ), a.state_dir)
         if a.cmd == "setup":
             chat, user, name = p.pair()
-            p.send("Paired with this Mac's day-trader-skill (demo). Only taps from you, %s, are accepted."
-                   % (name or "you"))
+            p.send(messages().paired(name or "you"))
             print("Paired: chat %s, user %s. A confirmation is on your phone." % (chat, user))
             return 0
         if a.cmd == "send":
@@ -291,7 +354,7 @@ def main(argv=None, environ=None):
             print("Sent.")
             return 0
         p.updates()                                   # skip anything older than this test
-        mid = p.send("TEST from day-trader-skill: tap a button. Nothing is placed, this is only a test.",
+        mid = p.send(messages().test_tap(),
                      [("Approve", "test:approve"), ("Reject", "test:reject")])
         end = _now() + a.wait
         print("Sent. Tap Approve or Reject on your phone (waiting %ds)." % a.wait)
@@ -300,10 +363,10 @@ def main(argv=None, environ=None):
                 if u["kind"] == "tap" and u["data"].startswith("test:"):
                     which = u["data"].split(":", 1)[1]
                     p.answer(u["id"], "Got it: %s" % which)
-                    p.edit(mid, "TEST: you tapped %s. The round trip works. Nothing was placed." % which.upper())
+                    p.edit(mid, "\U0001f9ea Test: you tapped %s. The round trip works. Nothing was bought." % which.upper())
                     print("You tapped %s: the round trip works." % which.upper())
                     return 0
-        p.edit(mid, "TEST: no tap within %ds." % a.wait)
+        p.edit(mid, "\U0001f9ea Test: no tap within %ds." % a.wait)
         print("No tap within %ds." % a.wait)
         return 1
     except PhoneError as e:

@@ -161,9 +161,11 @@ class Buys(DriftBase):
     def test_the_drift_buy_message(self):
         self.account()
         self.buy()
-        text = [p for p in self.pushed_db if p.startswith("DRIFT BUY")][0]
-        for part in ("0.76 TSLA", "cost about £", "Stop $354.00", "Sell date Thu 03 Dec", "Max loss at the stop about £"):
+        text = [p for p in self.pushed_db if p.startswith("🟢 <b>Bought TSLA</b>")][0]
+        for part in ("<b>0.76 shares</b>", "Cost: <b>£", "auto-sells if it drops to $354.00",
+                     "sell on Thursday 3 Dec", "Most I could lose: <b>about £"):
             self.assertIn(part, text)
+        self.assertTrue(any(s.startswith("DRIFT BUY (demo): 0.76 TSLA") for s in self.said))   # the log keeps the detail
 
     def test_a_real_stop_whatever_stop_mode_or_fractional_stops_say(self):
         for over in ({"stop_mode": "market"}, {"fractional_stops": "software"}):
@@ -181,10 +183,10 @@ class Buys(DriftBase):
         self.account(stop_reply=http_error(400, "stop refused"))
         res = self.buy()
         self.assertFalse(res["bought"][0]["stop_ok"])
-        self.assertIn("NOT IN PLACE", [p for p in self.pushed_db if p.startswith("DRIFT BUY")][0])
+        self.assertIn("The safety net isn't in yet", [p for p in self.pushed_db if "<b>Bought TSLA</b>" in p][0])
         self.assertEqual(self.records()[-1]["status"], "stop_not_placed")
-        self.assertTrue(any(p.startswith("GUARD ALERT (DEMO): DRIFT TSLA: bought, but its stop") and
-                            "NOT PROTECTED OVERNIGHT" in p for p in self.pushed))
+        self.assertTrue(any(p.startswith("⚠️ <b>Bought TSLA, but its safety net didn't go in</b>") and
+                            "no protection overnight" in p for p in self.pushed), self.pushed)
 
     def test_drift_reserves_its_own_cash_when_the_morning_plan_is_missing(self):
         self.assertFalse(os.path.exists(alloc.path(self.dir)))
@@ -210,7 +212,7 @@ class Buys(DriftBase):
         self.assertEqual(res["bought"], [])
         self.assertEqual(self.router.posts(), [])
         self.assertIn("no cash reservation", self.signal()["why"])
-        self.assertTrue(any("no drift buys today" in p for p in self.pushed_db))
+        self.assertTrue(any("No earnings buys today" in p for p in self.pushed_db))
         saved = alloc._write
         alloc._write = lambda p, d: (_ for _ in ()).throw(OSError("disk full"))
         try:
@@ -285,7 +287,7 @@ class Skips(DriftBase):
     def test_a_late_start_is_missed_never_bought_late(self):
         self.buy(ny=datetime.datetime(2026, 11, 5, 9, 50))
         self.assertIn("missed", self.signal()["why"])
-        self.assertTrue(any("MISSED" in p for p in self.pushed_db))
+        self.assertTrue(any("Missed today's earnings buys" in p for p in self.pushed_db))
         self.assertEqual(self.router.calls, [])
 
     def test_no_shortlist_for_today(self):
@@ -492,7 +494,7 @@ class EndOfDay(DriftBase):
         res = self.close("2026-11-03")
         self.assertEqual(len(self.router.posts()), 1)
         self.assertIn("sell date was 2026-11-03", res["overdue"][0])
-        self.assertTrue(any("DRIFT SELL OVERDUE" in p for p in self.pushed))
+        self.assertTrue(any("should have been sold by now" in p for p in self.pushed))
 
     def test_kept_before_the_sell_date(self):
         res = self.close("2026-11-06")

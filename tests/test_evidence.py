@@ -143,7 +143,7 @@ class Pilot(PilotBase):
         sig = self.signals()[0]
         self.assertTrue(sig["cost_block_ignored"])
         self.assertEqual(sig["decision"], "traded")
-        self.assertIn("BOUGHT (demo, automatic, EVIDENCE MODE)", self.phone.sent[-1][0])
+        self.assertEqual(p.state["tickets"][-1]["status"], "placed")    # bought; its message comes with the fill
 
     def test_every_signal_is_logged_with_its_plan_and_expectation(self):
         self.pipe.triggered = ("TSLA", "AAPL")
@@ -188,8 +188,10 @@ class Pilot(PilotBase):
 
     def test_status_says_evidence_mode(self):
         p = self.pilot()
+        self.router.add("GET", "/equity/positions", FakeResp([]))
         p.command("/status")
-        self.assertIn("EVIDENCE MODE forward test", self.phone.sent[-1][0])
+        self.assertIn("Buying: automatic", self.phone.sent[-1][0])
+        self.assertNotIn("EVIDENCE", self.phone.sent[-1][0])
 
     def test_ready_needs_auto_buy_and_a_window(self):
         self.assertEqual(ap.check_ready(self.cfg, "demo", self.phone), [])

@@ -19,6 +19,7 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/t212.py` | Trading 212 API: reads, `place` (a typed yes in a terminal), `guard` (exits only), `budget`, `fx` |
 | `trader-broker/autopilot.py` | always-on demo autopilot: scan, Time Machine, size, risk, place; phone commands |
 | `trader-broker/phone.py` | the user's own Telegram bot: messages, Approve/Reject buttons, an outbox for failed sends |
+| `trader-broker/messages.py` | **every word sent to the phone**, one function per message type (see "Phone messages") |
 | `trader-broker/drift.py` | post-earnings drift **shadow** scan: shortlist, signal log, virtual results. No Trading 212 connection, never an order |
 | `trader-broker/drift_buy.py` | drift **buying** (stage 3), OFF unless `drift.buy_enabled`: the 09:33 buys, reservations, holdings lines, DRIFT SELL, the Friday drift section |
 | `trader-broker/evidence.py` | evidence mode (forward test): signal log, virtual results, slippage, Friday report |
@@ -202,6 +203,31 @@ The guard's protections:
   The Friday report adds results in R by level, v2 rows only (real R = GBP result / `risk_gbp`).
 - Settings: `"allocation": {"enabled", "max_open_positions", "free_pool_pct", "max_reservations",
   "window_minutes"}`. Tests: `tests/test_allocation.py`.
+
+## Phone messages (from 12 Nov 2026): `trader-broker/messages.py`
+
+- **All phone wording lives in `messages.py`.** New message types go there too, in the same style:
+  plain English for a non-trader, emojis sparingly, money in GBP first, share prices in USD, company name
+  with the ticker in brackets (names from `trader/universe/tradable.json`; `messages.use(state_dir)`).
+  Never on the phone: R values, "Time Machine", "EVIDENCE MODE", "SHADOW", "end-of-day close", "at market",
+  order or trace ids, `_US_EQ`, raw API errors. The past-trades verdict (`past_trades`) turns the Time
+  Machine's average R into words before fees and pounds after fees (avg R after costs x the max loss).
+- **Telegram HTML:** `phone.Phone.send` uses `parse_mode` HTML; every outside string goes through `esc()`
+  (or `company()`/`tidy()`). If Telegram rejects the formatting it resends `messages.plain()`. Over 3,900
+  characters it splits between paragraphs, buttons on the last piece.
+- **Logs and reports keep the old full wording.** `Pilot.event(log_text, phone=...)` logs one and sends the
+  other. `report.short_text`, `briefing.short_text`, `t212.render_eod`, `guard_news` and the drift
+  `buy_text`/`sell_text` are the log and CLI versions.
+- **Fewer messages:** one buy message once the buy has filled (`Pilot.announce`, then `fill_message`;
+  state `announce` in autopilot.json). A buy placed before it filled (stop due, entry not filled) sends
+  nothing then; the fill message says the safety net is being set and the guard's "Safety net is now in"
+  follows. One message per sale during the day (`sale_message`, result from Trading 212's fills); sales
+  at the 15:50 close go in the evening report only, and the guard no longer sends its END-OF-DAY list
+  (failures still alarm). A raised trailing stop is told once a day per stock; a sale at a software stop
+  is told by the autopilot's sale message.
+- **Market line:** `"report": {"market_line": true}` (set 12 Nov) adds how SPY moved today (Yahoo daily
+  bars, the Friday report's source) to the evening report. Off when the key is missing (as in the tests).
+- **Tests:** `tests/test_messages.py` (wording, escaping, fallback, splitting).
 
 ## Scheduling (launchd, `~/Library/LaunchAgents/com.daytraderskill.*.plist`)
 

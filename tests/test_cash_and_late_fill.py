@@ -58,7 +58,7 @@ class NoFreeCash(CashPilot):
         p = self.pilot()
         line = p.cycle()
         self.assertEqual(self.router.posts(), [])                       # nothing sent to Trading 212
-        self.assertEqual(self.texts(), ["3 candidates skipped, no free cash (demo): TSLA, AAPL, MSFT"])
+        self.assertEqual(self.texts(), ["⚠️ Couldn't buy 3 stocks: not enough cash in the account. Skipped: TSLA, AAPL, MSFT."])
         self.assertIn("3 candidates skipped, no free cash", line)
         self.assertEqual(len(self.built()), 1)                          # the rest were not built
         self.assertNotIn("AAPL", p.state["tried"])                      # so a later scan can try them
@@ -103,7 +103,7 @@ class NoFreeCash(CashPilot):
         p = self.pilot()
         p.cycle()                    # 4,100.25 - CHTR 2,201.85 waiting - 500 buffer < TSLA's 2,335
         self.assertEqual(self.router.posts(), [])
-        self.assertEqual(self.texts(), ["1 candidate skipped, no free cash (demo): TSLA"])
+        self.assertEqual(self.texts(), ["⚠️ Couldn't buy TSLA: not enough cash in the account. Skipped it."])
 
     def test_the_cost_and_the_free_cash(self):
         fc = t212.free_cash(LOW, [{"ticker": "X_US_EQ", "side": "BUY", "quantity": 10, "filledQuantity": 4,
@@ -122,7 +122,7 @@ class InsufficientFundsFromT212(CashPilot):
         p = self.pilot()
         p.cycle()
         self.assertEqual(len(self.router.posts()), 1)                   # the one refused buy, never retried
-        self.assertEqual(self.texts(), ["2 candidates skipped, no free cash (demo): TSLA, AAPL"])
+        self.assertEqual(self.texts(), ["⚠️ Couldn't buy 2 stocks: not enough cash in the account. Skipped: TSLA, AAPL."])
         self.assertFalse(any("traceId" in t or "NOT PLACED" in t for t in self.texts()))
         self.assertEqual(p.state["tickets"][0]["status"], "no cash")
         self.assertEqual(p.state["tickets"][0]["note"], "Trading 212 refused it: insufficient funds")
@@ -147,7 +147,7 @@ class TicketCap(CashPilot):
         self.pipe.quote = 350.0                                         # under the 358.32 stop
         self.acct()
         self.pilot().cycle()
-        self.assertTrue(self.texts()[0].startswith("NOT PLACED (demo): TSLA passed the checks"), self.texts())
+        self.assertEqual(self.texts(), ["⚠️ Couldn't buy TSLA: the price had already fallen to the safety-net level. Skipped it."])
 
 
 class LateFill(CashPilot):
@@ -157,7 +157,13 @@ class LateFill(CashPilot):
         p = self.pilot()
         p.cycle()
         self.assertEqual([x[1] for x in self.router.posts()], ["/equity/orders/market"])
-        self.assertTrue(any("TSLA BOUGHT BUT STOP NOT PLACED" in t for t in self.texts()))   # still sent
+        self.assertEqual(self.texts(), [])           # not filled yet: the buy message waits for the fill
+        self.assertEqual(p.state["announce"]["TSLA"]["safety"], "pending")
+        p.state["positions"] = {}
+        self.router.routes.clear()
+        self.router.add("GET", "/equity/positions", FakeResp([position(qty=1)]))
+        p.watch_positions()
+        self.assertIn("Safety net: being set now: auto-sells if it drops to $358.32", self.texts()[-1])
         rec = [r for r in self.read("state/broker.json")["orders"] if r.get("status") == "stop_not_placed"][0]
         qty = float(rec["qty"])
         # it fills; the guard's next pass sees the position and no stop order
@@ -170,7 +176,8 @@ class LateFill(CashPilot):
             t212.guard_phone(self.client, res)
         stop = self.router.posts("/equity/orders/stop")[-1][2]
         self.assertEqual((stop["ticker"], stop["quantity"], stop["stopPrice"]), (TICKER, -qty, 358.32))
-        self.assertTrue(any("stop placed: SELL %s at 358.32" % t212._qty(qty) in m for m in self.pushed), self.pushed)
+        self.assertTrue(any("Safety net is now in for TSLA: auto-sells" in m and "$358.32" in m for m in self.pushed),
+                        self.pushed)
 
 
 class RealertHourly(Base):
@@ -182,7 +189,7 @@ class RealertHourly(Base):
         self.router.add("POST", "/equity/orders/stop", http_error(400, "bad stop"))
 
     def alarms(self):
-        return [m for m in self.pushed if m.startswith("GUARD ALERT")]
+        return [m for m in self.pushed if "refused the safety net" in m]
 
     def run_pass(self, minutes_later=0):
         self.clock[0] += minutes_later * 60
@@ -197,7 +204,7 @@ class RealertHourly(Base):
         self.assertEqual(len(self.alarms()), 1)
         self.run_pass(31)
         self.assertEqual(len(self.alarms()), 2)
-        self.assertIn("STOP STILL NOT PLACED", self.alarms()[-1])
+        self.assertIn("This Mac is watching it instead", self.alarms()[-1])
         self.run_pass(5)
         self.run_pass(30)
         self.assertEqual(len(self.alarms()), 2)

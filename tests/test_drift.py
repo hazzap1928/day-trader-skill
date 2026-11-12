@@ -37,7 +37,7 @@ class CloseKeepsDrift(test_eod_close.Close):
         self.assertEqual(res["closed"], [])
         self.assertEqual(res["failed"], [])
         self.assertIn("drift, sell date 2026-11-06", res["kept"][0])
-        self.assertIn("kept: TSLA_US_EQ", self.pushed[-1])
+        self.assertIn("kept: TSLA_US_EQ", t212.render_eod(res))
         self.assertFalse(res["nothing"])
         self.assertIn("kept", self.read("state/t212-guard.json")["eod"])
 
@@ -85,7 +85,7 @@ class CloseKeepsDrift(test_eod_close.Close):
         self.assertEqual(self.writes(), [])
         self.assertEqual(res["closed"], [])
         self.assertIn("no buy record", res["unknown"][0])
-        self.assertTrue(any(p.startswith("GUARD ALERT (DEMO): END-OF-DAY CLOSE: TSLA_US_EQ") for p in self.pushed))
+        self.assertTrue(any(p.startswith("\u26a0\ufe0f At the close: TSLA") for p in self.pushed))
         self.assertTrue(any("no buy record" in n[1] for n in self.notes))          # the Mac too
 
     def test_a_refused_buy_is_not_a_buy_record(self):

@@ -45,7 +45,7 @@ class Place(Base):
         self.assertEqual(rec["status"], "stop_rejected")
         sw = self.read("state/t212-guard.json")["software"][TICKER]
         self.assertEqual(sw["stop"], 358.32)
-        self.assertTrue(any("STOP REJECTED by Trading 212 for TSLA_US_EQ" in p for p in self.pushed))
+        self.assertTrue(any("TSLA: Trading 212 refused the safety net" in p for p in self.pushed))
         self.assertTrue(any("ENFORCES IT IN SOFTWARE" in n[1] for n in self.notes))
 
     def test_a_stop_gone_from_the_list_is_looked_up_in_the_history(self):
@@ -98,7 +98,7 @@ class GuardChecks(Base):
         self.assertEqual(code, 0)
         self.assertEqual(self.router.posts(), [])                   # above the stop: it only watches
         self.assertIn("software stop", text)
-        self.assertTrue(any("STOP REJECTED by Trading 212 for TSLA_US_EQ" in p for p in self.pushed))
+        self.assertTrue(any("TSLA: Trading 212 refused the safety net" in p for p in self.pushed))
         self.assertIn(TICKER, self.read("state/t212-guard.json")["software"])
         r.routes.clear()
         r.add("GET", "/equity/positions", FakeResp([position(price=358.0)]))
@@ -115,7 +115,7 @@ class GuardChecks(Base):
         self.router.add("GET", "/equity/orders", FakeResp([dict(stop_order(), status="REJECTED")]))
         code, text, _ = self.guard()
         self.assertIn("software stop", text)
-        self.assertTrue(any("STOP REJECTED" in p for p in self.pushed))
+        self.assertTrue(any("Trading 212 refused the safety net" in p for p in self.pushed))
         self.assertEqual(self.router.posts(), [])
 
     def test_a_working_stop_needs_no_history_call(self):
@@ -164,7 +164,7 @@ class GuardChecks(Base):
         self.router.add("POST", "/equity/orders/stop", http_error(400, "rejected"))
         self.guard()
         self.assertIn(TICKER, self.read("state/t212-guard.json")["software"])
-        self.assertTrue(any("REFUSED by Trading 212" in p for p in self.pushed))
+        self.assertTrue(any("Trading 212 refused the safety net" in p for p in self.pushed))
 
     def test_fractional_stops_software_watches_a_fractional_position(self):
         self.write("config.json", dict(self.cfg, fractional_stops="software"))

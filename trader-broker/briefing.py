@@ -611,6 +611,54 @@ def short_text(b, path):
     return "\n".join([head] + top + ["Full briefing: %s" % os.path.relpath(path, ROOT)])
 
 
+def phone_text(b, path, state_dir):
+    """The briefing for the phone, in plain words (trader-broker/messages.py). The saved file keeps the detail."""
+    M = phone_mod.messages()
+    M.use(state_dir)
+    got = [f["pct"] for f in b.get("futures") or [] if f.get("pct") is not None]
+    p, problems = b["positions"], []
+    if b["account"].get("error") or p.get("error"):
+        problems.append("\u26a0\ufe0f Couldn't reach Trading 212 this morning. The safety guard and autopilot need it: "
+                        "check the API key.")
+    if p.get("unclear"):
+        problems.append("\u26a0\ufe0f A safety-guard order for %s had an unclear result. Please check the Trading 212 app."
+                        % ", ".join(M.company(t) for t in sorted(p["unclear"])))
+    if p.get("alerts"):
+        problems.append("\u26a0\ufe0f The safety guard raised %d problem%s since the last close (details in the full briefing)."
+                        % (len(p["alerts"]), "" if len(p["alerts"]) == 1 else "s"))
+    held, intraday = [], [r for r in p.get("rows") or [] if not r.get("drift")]
+    for r in intraday:
+        how = (M.safety_words("order", r["stop"]) if r["fully_covered"] else
+               M.safety_words("partial", covered=r["covered"], qty=r["qty"]) if r["covered"] else M.safety_words("none"))
+        held.append((r["ticker"], r["qty"], r.get("price"), how))
+    if intraday:
+        problems.append("\u26a0\ufe0f Still holding from yesterday: %s. These are normally sold at the close."
+                        % ", ".join(M.company(r["ticker"]) for r in intraday))
+    big = [e for e in b.get("econ") or [] if e.get("big")]
+    news = "; ".join("%s at %s UK" % (e["name"], e["uk_time"] or "a time not given") for e in big[:3]) or None
+    ear = [(e["symbol"], "today" if d == b["session"] else "on %s" % d.strftime("%A"))
+           for d, rows in sorted((b.get("earnings") or {}).items()) for e in rows or [] if e.get("held")]
+    reserved = []
+    try:
+        plan = allocation.load_plan(state_dir, b["session"].isoformat()) or {}
+        reserved = [r["symbol"] for r in plan.get("reservations") or []
+                    if r.get("status", "active") == "active" and r.get("pool") != "drift"]
+    except Exception:
+        reserved = []
+    watch = []
+    try:
+        drift = _load("trader-broker", "drift")
+        cfg = t212._read_json(os.path.join(state_dir, "config.json"), {}) or {}
+        watch = M.watchlist(drift.watch_data(state_dir, cfg, b["session"], "briefing"), "briefing")
+    except Exception:
+        watch = []
+    if b.get("drift_rows"):
+        watch = M.drift_holdings(b["drift_rows"]) + ([""] if watch else []) + watch
+    return M.briefing(b, os.path.relpath(path, ROOT), watch=watch, held=held,
+                      futures_pct=(sum(got) / len(got)) if got else None, problems=problems, news=news,
+                      earnings_held=ear, reserved=reserved)
+
+
 def save(b, state_dir):
     d = os.path.join(state_dir, "briefings")
     os.makedirs(d, exist_ok=True)
@@ -640,9 +688,8 @@ def main(argv=None, environ=None):
         w = net.wait_online(_sleep, _now, log=lambda t: print("briefing: " + t), label="the briefing")
         if not w["ok"]:
             net.record(a.state_dir, "briefing", w["start"], w["end"], ["the morning briefing"], gave_up=True)
-            phone_mod.queue(a.state_dir, "MORNING BRIEFING MISSED: no internet from %s for %d minutes, so it was "
-                                         "not built. Run python3 trader-broker/briefing.py when you can."
-                            % (net.hm(w["start"]), net.minutes(w["start"], w["end"])))
+            phone_mod.queue(a.state_dir, phone_mod.messages().briefing_missed(net.hm(w["start"]),
+                                                                             net.minutes(w["start"], w["end"])))
             sys.stderr.write("briefing: no internet for %d minutes; gave up\n" % net.minutes(w["start"], w["end"]))
             return 1
         late = w
@@ -655,12 +702,13 @@ def main(argv=None, environ=None):
         client = _NoAccount(str(e))
     b = build(client, a.state_dir)
     path = save(b, a.state_dir)
-    msg = short_text(b, path)
-    print(msg)
+    print(short_text(b, path))
+    msg = phone_text(b, path, a.state_dir)
     if late is not None:
         missed = ["the briefing ran %d minutes late, at %s" % (net.minutes(late["start"], late["end"]), net.hm(late["end"]))]
         net.record(a.state_dir, "briefing", late["start"], late["end"], missed)
-        msg = net.back_online("The morning briefing", late["start"], late["end"], missed) + "\n\n" + msg
+        msg = phone_mod.messages().back_online("The morning briefing", net.hm(late["start"]), net.hm(late["end"]),
+                                              net.minutes(late["start"], late["end"]), missed) + "\n\n" + msg
     if not a.no_send:
         if not send_with_retry(a.state_dir, msg, environ):
             sys.stderr.write("briefing: not sent to the phone after %d tries; it waits in the outbox; saved %s\n"

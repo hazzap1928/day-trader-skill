@@ -55,12 +55,14 @@ class AnyHour(Base):
         self.clock[0] = SATURDAY
         p = self.pilot()
         self.say("/status")
+        self.router.add("GET", "/equity/positions", FakeResp([]))
         with redirect_stdout(io.StringIO()):
             p.serve(max_loops=2)
         text = self.phone.sent[-1][0]
-        self.assertIn("Autopilot (demo", text)
-        self.assertIn("Market: closed (weekend); next open 2026-11-09 09:30 New York", text)
-        self.assertIn("Guard: running (pid 4242)", text)
+        self.assertIn("<b>Status, Saturday 7 Nov</b>", text)
+        self.assertIn("Market: closed (weekend); next opens 2026-11-09 09:30 New York", text)
+        self.assertIn("Safety guard: running", text)
+        self.assertIn("Practice account", text)
 
     def test_pause_and_resume_before_the_open(self):
         self.clock[0] = THURSDAY_0800_UK
@@ -85,8 +87,8 @@ class AnyHour(Base):
         p = self.pilot()
         with redirect_stdout(io.StringIO()):
             p.day()
-        self.assertTrue(self.phone.sent[0][0].startswith("Autopilot (demo"))       # answered at 09:20
-        self.assertTrue(any(t.startswith("MARKET OPEN") for t, _ in self.phone.sent))
+        self.assertTrue(self.phone.sent[0][0].startswith("📋 <b>Status"))       # answered at 09:20
+        self.assertTrue(any(t.startswith("🔔 <b>US market open") for t, _ in self.phone.sent))
 
     def test_a_new_day_starts_fresh(self):
         p = self.pilot()
@@ -100,7 +102,8 @@ class AnyHour(Base):
         ap.phone_mod.queue(self.dir, "GUARD ALERT: waited")
         p = self.pilot()
         p.flush_phone()
-        self.assertIn("DELIVERED LATE: 1 message", self.phone.sent[-1][0])
+        self.assertIn("<b>Sent late</b>: 1 message", self.phone.sent[-1][0])
+        self.assertIn("GUARD ALERT: waited", self.phone.sent[-1][0])
 
     def test_not_ready_still_answers_with_the_reason_and_says_so_once_a_day(self):
         self.say("/status")
@@ -108,7 +111,7 @@ class AnyHour(Base):
             code = ap.serve_unready(self.dir, self.client, self.phone, ["no allowed_tickers"], {}, max_loops=1)
         self.assertEqual(code, 3)
         texts = [t for t, _ in self.phone.sent]
-        self.assertTrue(texts[0].startswith("Autopilot NOT RUNNING (demo):"))
+        self.assertTrue(texts[0].startswith("⚠️ <b>The autopilot isn't running</b>"))
         self.assertIn("no allowed_tickers", texts[1])
         with redirect_stderr(io.StringIO()):
             ap.serve_unready(self.dir, self.client, self.phone, ["no allowed_tickers"], {}, max_loops=1)
@@ -123,40 +126,42 @@ class OpenMessage(Base):
     def test_guard_autopilot_positions_and_their_stops(self):
         self.accounts(HELD7, [STOP])
         text = self.pilot().open_message()
-        self.assertIn("MARKET OPEN (demo) Thu 05 Nov", text)
-        self.assertIn("Guard: running (pid 4242)", text)
-        self.assertIn("Autopilot: running, always on (pid 4343)", text)
-        self.assertIn("TSLA_US_EQ 7 at $366.00: stop $358.32 (stop order, NEW)", text)
+        self.assertIn("<b>US market open</b> (3:30pm UK)", text)
+        self.assertIn("Safety guard: running ✅", text)
+        self.assertIn("Autopilot: will ask you before buying", text)
+        self.assertIn("TSLA: 7 shares, now $366.00. 🛡️ Safety net at $358.32", text)
 
     def test_a_stopped_autopilot_service_is_loud(self):
         self.accounts([])
         self.jobs["com.daytraderskill.autopilot"] = {"loaded": True, "running": False, "pid": None, "out": ""}
-        self.assertIn("the always-on service is NOT RUNNING", self.pilot().open_message())
+        self.assertIn("Autopilot: ⚠️ <b>not running as a service</b>", self.pilot().open_message())
 
     def test_a_missing_stop_and_a_software_stop_are_called_out(self):
         self.accounts(HELD7)
-        self.assertIn("!!! NO STOP !!!", self.pilot().open_message())
+        self.assertIn("⚠️ <b>No safety net</b>", self.pilot().open_message())
         self.write("state/t212-guard.json", {"software": {"TSLA_US_EQ": {"stop": 358.32}}})
-        self.assertIn("software stop $358.32", self.pilot().open_message())
+        self.assertIn("This Mac sells it at $358.32", self.pilot().open_message())
 
     def test_a_stopped_guard_is_loud(self):
         self.accounts([])
         self.jobs["com.daytraderskill.t212-guard"] = {"loaded": True, "running": False, "pid": None, "out": ""}
-        self.assertIn("Guard: !!! NOT RUNNING (loaded, stopped)", self.pilot().open_message())
+        self.assertIn("Safety guard: ⚠️ NOT RUNNING, so nothing is checking the safety nets", self.pilot().open_message())
 
     def test_evidence_mode_and_the_day_of_the_test(self):
         self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True, "evidence_mode": True},
                                        evidence={"start": "2026-11-02"}))
         self.accounts([])
         text = self.pilot().open_message()
-        self.assertIn("EVIDENCE MODE is ON: forward test since 2026-11-02, no end date, trading day 4", text)
+        self.assertIn("buying automatically", text)
+        self.assertNotIn("EVIDENCE", text)                    # plain words only: the logs keep the mode
 
     def test_the_guards_last_check_comes_from_its_log(self):
         os.makedirs(os.path.join(self.dir, "logs"), exist_ok=True)
         with open(os.path.join(self.dir, "logs", "guard.log"), "w") as fh:
             fh.write("2026-11-05T09:35:31-05:00  stop guard (broker stops) on demo: 0 open positions\n")
         self.accounts([])
-        self.assertIn("last check 2026-11-05 09:35 New York", self.pilot().open_message())
+        self.assertEqual(ap._guard_state(self.dir)[1], "running (pid 4242); last check 2026-11-05 09:35 New York")
+        self.assertIn("Safety guard: running ✅", self.pilot().open_message())
 
     def test_sent_once_at_the_open(self):
         self.clock[0] = utc(2026, 11, 5, 14, 30)
@@ -169,7 +174,7 @@ class OpenMessage(Base):
             p.day()
             p.state["summary_sent"] = False
             p.day()
-        self.assertEqual(sum(1 for t, _ in self.phone.sent if t.startswith("MARKET OPEN")), 1)
+        self.assertEqual(sum(1 for t, _ in self.phone.sent if t.startswith("🔔 <b>US market open")), 1)
 
 
 class BriefingCatchUp(Base):

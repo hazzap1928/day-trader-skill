@@ -665,6 +665,27 @@ def _line_for(sd, cfg, want_buy_day, head):
         "virtual sell" if tag == SHADOW else "sell date", _day(doc["exit_day"]))
 
 
+def watch_data(sd, cfg, day, which):
+    """The same facts as closing_line/briefing_line, as data for the phone's watchlist (messages.watchlist):
+    {"off"} with the scan off; else "missing" or "error", or the shortlist's names. Never raises."""
+    try:
+        if cfg is not None and not settings(cfg)["scan_enabled"]:
+            return {"off": True}
+        want = add_trading_days(day, 1) if which == "closing" else day
+        buying = bool(cfg is not None and settings(cfg)["buy_enabled"] and cfg.get("paper") is True
+                      and not cfg.get("live_enabled"))
+        doc = read_shortlist(sd)
+        if not doc or doc.get("buy_day") != _date(want).isoformat():
+            return {"missing": True, "buying": buying}
+        if doc.get("error"):
+            return {"error": doc["error"], "buying": buying}
+        return {"buying": buying, "rows": doc.get("rows", 0), "report_day": doc.get("report_day"),
+                "qualified": doc.get("qualified", 0), "exit_day": doc.get("exit_day"),
+                "names": [str(x.get("symbol") or "?") for x in doc.get("shortlist") or []]}
+    except Exception:
+        return {"missing": True}
+
+
 def closing_line(sd, cfg, today):
     """For the closing report on New York day `today`: tomorrow's shortlist. Never raises; None when the scan is off."""
     try:

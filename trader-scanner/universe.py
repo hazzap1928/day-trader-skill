@@ -538,6 +538,21 @@ def change_text(change, doc, limit=8):
     return "\n".join(lines)
 
 
+def _msgs(state_dir):
+    m = mod("trader-broker", "t212").phone_module().messages()
+    m.use(state_dir)
+    return m
+
+
+def phone_text(change, doc, state_dir, limit=8):
+    """The phone message after a refresh, in plain words (change_text keeps the detail for the log)."""
+    M = _msgs(state_dir)
+    if change.get("first"):
+        return M.universe_built(doc["count"])
+    return M.universe_changed(doc["count"], change.get("previous", 0), [r["symbol"] for r in change["added"]],
+                              [r["symbol"] for r in change["removed"]], limit)
+
+
 def briefing_line(cfg, state_dir, now=None):
     """One line for the morning briefing: what the autopilot may trade today and where the list came from."""
     st = status(cfg, state_dir, now)
@@ -635,12 +650,12 @@ def cmd_build(a, environ):
     except UniverseError as e:
         if not a.no_write:
             log_failure(a.state_dir, str(e))
-        _notify(a, "UNIVERSE NOT REFRESHED (demo): %s" % e, environ)
+        _notify(a, _msgs(a.state_dir).universe_failed(), environ)
         raise
     doc["seconds"] = round(_now() - t0, 1)
     if not a.no_write:
         save(a.state_dir, doc, change)
-        _notify(a, change_text(change, doc), environ)
+        _notify(a, phone_text(change, doc, a.state_dir), environ)
     if a.json:
         print(json.dumps({"count": doc["count"], "pool": doc["pool"], "added": change["added"],
                           "removed": change["removed"], "seconds": doc["seconds"]}, indent=2))

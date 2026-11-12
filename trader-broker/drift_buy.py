@@ -439,8 +439,9 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
             skip(sym, "missed: the buy step did not run before %s New York (the Mac or the autopilot was off); "
                       "the rule buys at the open, so it is never bought late" % LATEST_START)
         out["status"] = "missed"
-        push("DRIFT (demo): today's buys were MISSED (%s): the autopilot was not running at %s New York. "
-             "Nothing was bought late." % (", ".join(names), s["buy_at"]))
+        say("DRIFT (demo): today's buys were MISSED (%s): the autopilot was not running at %s New York. "
+            "Nothing was bought late." % (", ".join(names), s["buy_at"]))
+        push(_msgs(sd).drift_missed(s["buy_at"]))
         return out
     if paused:
         for sym in names:
@@ -486,7 +487,8 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
         for sym in ok:
             skip(sym, "no cash reservation, so nothing is bought: " + err)
         out["status"] = "no reservation"
-        push("DRIFT (demo): no drift buys today: %s. Logged; nothing was bought." % err)
+        say("DRIFT (demo): no drift buys today: %s. Logged; nothing was bought." % err)
+        push(_msgs(sd).drift_none(err))
         return out
     risk_now = sum(r["risk_gbp"] for r in rows)
     fractional = bool(cfg.get("fractional"))
@@ -549,10 +551,18 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
                 "note": res.get("note")}
         out["bought"].append(info)
         log_buy(sd, sym, day, status="bought", **{k: v for k, v in info.items() if k != "symbol"})
-        push(buy_text(info, s))
+        say(buy_text(info, s))
+        push(_msgs(sd).drift_bought(info))
     release_all(sd, dayi, "the drift buy step is done")
     out["status"] = "done"
     return out
+
+
+def _msgs(sd):
+    """trader-broker/messages.py: the plain-English phone messages."""
+    m = _t212().phone_module().messages()
+    m.use(sd)
+    return m
 
 
 def buy_text(i, s):
@@ -724,6 +734,30 @@ def friday_lines(sd, cfg, today=None):
                                 [r["results"][h]["ret_net_pct"] for r in shadow],
                                 [r["results"][h]["vs_tracker_pct"] for r in shadow], s["min_trades"]))
     return L
+
+
+def friday_phone(sd, cfg, today=None):
+    """The drift part of the Friday phone message (messages.friday_drift), or None when drift is off."""
+    s = settings(cfg)
+    if not (s["scan_enabled"] or s["buy_enabled"]):
+        return None
+    real = load_jsonl(trades_path(sd))
+    h = str(s["hold_days"])
+    shadow = [r for r in _drift().load_signals(sd) if (r.get("results") or {}).get(h, {}).get("ret_net_pct") is not None]
+
+    def judge(rets, vs):
+        n = len(rets)
+        if not n:
+            return None
+        avg, avg_vs = sum(rets) / n, (sum(vs) / len(vs) if vs else None)
+        ok = avg > 0 and avg_vs is not None and avg_vs > 0
+        status = ("on track" if ok else "not on track") if n >= s["min_trades"] else \
+            "too few to judge yet (%d of %d)" % (n, s["min_trades"])
+        return {"n": n, "avg": avg, "vs": avg_vs, "status": status}
+    return _msgs(sd).friday_drift(
+        judge([r["ret_pct"] for r in real if r.get("ret_pct") is not None],
+              [r["vs_spy_pct"] for r in real if r.get("vs_spy_pct") is not None]),
+        judge([r["results"][h]["ret_net_pct"] for r in shadow], [r["results"][h]["vs_tracker_pct"] for r in shadow]))
 
 
 def _judge_line(label, rets, vs, min_n, extra=None):

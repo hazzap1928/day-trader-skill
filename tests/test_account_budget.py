@@ -162,7 +162,9 @@ class Autopilot(PilotBase):
         self.assertEqual(len([c for c in self.router.calls if c[1] == "/equity/account/summary"]), 1)
         self.assertEqual(self.read("config.json")["max_loss_per_trade_gbp"], 50.26)
         self.assertIn("Budget (from the GBP 5,026.83 account on 2026-11-05): invest up to GBP 4,524.14, keep GBP 502.69 "
-                      "cash; max loss GBP 50.26 a trade, GBP 150.80 a day", p.status_text())
+                      "cash; max loss GBP 50.26 a trade, GBP 150.80 a day", p.budget_line())
+        self.router.add("GET", "/equity/positions", FakeResp([]))
+        self.assertIn("Most I'll risk: £50.26 a trade, £150.80 a day", p.status_text())
 
     def test_a_failed_reading_keeps_yesterdays_limits_and_says_so(self):
         self.router.add("GET", "/equity/account/summary", test_t212_place.http_error(500))
@@ -170,7 +172,7 @@ class Autopilot(PilotBase):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             p.apply_budget()
         self.assertEqual(self.read("config.json")["max_loss_per_trade_gbp"], 30)
-        self.assertIn("BUDGET NOT UPDATED", self.phone.sent[-1][0])
+        self.assertIn("Couldn't update today's spending limits", self.phone.sent[-1][0])
 
 
 if __name__ == "__main__":

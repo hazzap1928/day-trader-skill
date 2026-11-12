@@ -68,8 +68,9 @@ class Close(Base):
         self.assertEqual(order, [("DELETE", "/equity/orders/7001"), ("POST", "/equity/orders/market")])
         self.assertEqual(self.router.posts()[0][2], {"ticker": TICKER, "quantity": -7, "extendedHours": False})
         self.assertEqual(res["failed"], [])
-        self.assertIn("END-OF-DAY CLOSE (demo)", self.pushed[-1])
-        self.assertIn("closed: TSLA_US_EQ: SELL 7 at market, order id 9300, cancelled STOP 358.32", self.pushed[-1])
+        self.assertEqual(self.pushed, [])        # the sales go in the evening report, not a message of their own
+        self.assertIn("closed: TSLA_US_EQ: SELL 7 at market, order id 9300, cancelled STOP 358.32",
+                      t212.render_eod(res))           # the log keeps the detail
         self.assertTrue(t212.eod_done_today(self.dir))
 
     def test_every_order_it_sends_is_a_sell(self):
@@ -86,7 +87,7 @@ class Close(Base):
         self.assertEqual(self.router.posts()[1][2]["stopPrice"], 358.32)
         self.assertIn("REFUSED", res["failed"][0])
         self.assertIn("stop 358.32 put back", res["failed"][0])
-        self.assertTrue(any("END-OF-DAY CLOSE FAILED" in p for p in self.pushed))
+        self.assertTrue(any("Couldn't sell everything at the close" in p for p in self.pushed))
         self.assertTrue(any("END-OF-DAY CLOSE FAILED" in n[1] for n in self.notes))     # the Mac too
 
     def test_an_unclear_sale_is_never_repeated_and_alarms(self):
@@ -102,13 +103,14 @@ class Close(Base):
         res = self.close()
         self.assertEqual(self.router.posts(), [])
         self.assertIn("NOT CLOSED", res["failed"][0])
-        self.assertTrue(any("END-OF-DAY CLOSE FAILED" in p for p in self.pushed))
+        self.assertTrue(any("Couldn't sell everything at the close" in p for p in self.pushed))
 
     def test_nothing_open_says_so(self):
         self.account([], orders_then=([],))
         res = self.close()
         self.assertTrue(res["nothing"])
-        self.assertIn("nothing open", self.pushed[-1])
+        self.assertIn("nothing open", t212.render_eod(res))
+        self.assertEqual(self.pushed, [])
         self.assertEqual(self.router.posts(), [])
 
     def test_demo_only(self):

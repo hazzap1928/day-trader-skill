@@ -82,6 +82,7 @@ def _load(folder, name):
 
 t212 = _load("trader-broker", "t212")
 phone_mod = t212.phone_module()
+M = phone_mod.messages()          # every word sent to the phone (trader-broker/messages.py)
 net = t212.net_module()
 evidence = _load("trader-broker", "evidence")
 allocation = _load("trader-broker", "allocation")
@@ -301,6 +302,7 @@ class Pilot(object):
         self.cfg = self.read_cfg()
         self.s = settings(self.cfg)
         self.state = self._load_state()
+        M.use(self.sd)
 
     # ------------------------------------------------------------ files
 
@@ -334,12 +336,14 @@ class Pilot(object):
     def say(self, text):
         self.out("%s  %s" % (_ny().strftime("%H:%M"), text))
 
-    def event(self, text, push=True):
+    def event(self, text, push=True, phone=None):
+        """text goes to the log and today's events, in full; phone (the plain-English message from
+        messages.py) goes to the phone. push=False, or phone None with push on: the log text is sent."""
         self.state["events"].append({"at": _ny().strftime("%H:%M"), "text": text})
         self.save()
         self.say(text)
         if push:
-            phone_mod.push(self.sd, text, phone=self.phone)
+            phone_mod.push(self.sd, phone if phone is not None else M.esc(text), phone=self.phone)
 
     def run(self, args, what):
         code, out, err = _run(args)
@@ -543,7 +547,7 @@ class Pilot(object):
         new = [x for x in syms if x not in told]
         if new:
             told.extend(new)
-            self.event(line)
+            self.event(line, phone=M.no_cash(syms))
         else:
             self.say(line + " (already on your phone today)")
         return line
@@ -561,10 +565,11 @@ class Pilot(object):
             return
         self.state["slow_warned"] = True
         self.save()
-        phone_mod.push(self.sd, "SLOW CYCLE (demo): one scan took %dm %02ds, over 80%% of the %d-minute gap. "
-                       "Universe: %d stocks. Consider raising universe.min_avg_traded_usd." % (
-                           took // 60, took % 60, self.s["every_minutes"], len(t212.allowed_tickers(self.cfg) or [])),
-                       phone=self.phone)
+        self.say("SLOW CYCLE (demo): one scan took %dm %02ds, over 80%% of the %d-minute gap. Universe: %d stocks. "
+                 "Consider raising universe.min_avg_traded_usd." % (
+                     took // 60, took % 60, self.s["every_minutes"], len(t212.allowed_tickers(self.cfg) or [])))
+        phone_mod.push(self.sd, M.slow_cycle(took // 60, took % 60, self.s["every_minutes"],
+                                             len(t212.allowed_tickers(self.cfg) or [])), phone=self.phone)
 
     def log_signal(self, decision, **extra):
         """Evidence mode: every triggered signal goes in the log, traded or not."""
@@ -751,22 +756,14 @@ class Pilot(object):
         return float(r) if r else None
 
     def ticket_text(self, t):
+        """The approval request (auto-buy off): plain English, with Approve and Reject buttons."""
         o, rv = t["order"], t["risk"]
         plan = o.get("plan") or {}
         rate = self.rate()
         loss = rv.get("max_loss")
-        lines = ["DEMO TICKET: BUY %s %s at about $%.2f (market order)" % (o.get("qty"), t["symbol"],
-                                                                         float(plan.get("entry") or 0)),
-                 "Stop $%.2f, target $%.2f, reward:risk %s" % (float(plan.get("stop") or 0),
-                                                               float(plan.get("target") or 0),
-                                                               rv.get("reward_risk", "?")),
-                 "Most you lose at the stop: about %s ($%.2f)" % (_gbp(loss / rate) if loss and rate else "?",
-                                                                 loss or 0),
-                 "Time Machine: %s" % t["verdict"],
-                 "trader-risk: PASS",
-                 "Expires %s (in %d minutes). Nothing is placed unless you tap Approve." % (
-                     _uk(t["expires"]), round(self.s["expire_minutes"]))]
-        return "\n".join(lines)
+        return M.ticket(t["symbol"], o.get("qty"), plan.get("entry"), plan.get("stop"),
+                        (loss / rate) if loss and rate else None, t.get("tm"), _uk(t["expires"]),
+                        round(self.s["expire_minutes"]))
 
     def new_ticket(self, built, status):
         now = _now()
@@ -786,11 +783,14 @@ class Pilot(object):
         t["approved_at"] = _now()
         self.state["tickets"].append(t)
         self.save()
+        phone = None
         try:
             self._approve(t, by="auto-buy")
-            text = self.bought_text(t)
+            rec = self.placed_record(t)
+            fill = self.fill_price(rec)
+            text = self.bought_text(t, rec, fill)
+            phone = self.announce(t, rec, fill)
             if self.s["evidence_mode"]:
-                rec = self.placed_record(t)
                 evidence.log_trade(self.sd, {"day": _ny().date().isoformat(), "symbol": t["symbol"], "list_from": self.list_from(),
                                              "fingerprint": t["fingerprint"], "t212_ticker": rec.get("t212_ticker"),
                                              "expected_entry": t.get("quote"), "qty": rec.get("qty"),
@@ -799,31 +799,49 @@ class Pilot(object):
                                              "confidence": t.get("confidence"), "pool": t.get("pool"),
                                              "sizing": evidence.SIZING_NOW})
         except (PilotError, t212.T212Error) as e:
-            text = self.not_placed(t, e)
+            text, phone = self.not_placed(t, e)
         self.save()
         if text is None:                        # no cash: logged here, summed up once per scan, no message of its own
             self.say("%s skipped, no free cash: %s" % (t["symbol"], t["note"]))
             return t
-        self.event(text)
+        self.event(text, push=phone is not None, phone=phone)
         return t
 
     def not_placed(self, t, e):
-        """The phone text for a ticket that was not placed, or None for no cash (no message of its own)."""
+        """(log text, phone text) for a ticket that was not placed; (None, None) for no cash (no message of
+        its own). The log keeps the full error; the phone gets one plain sentence, or nothing yet when the
+        buy went in and only waits to fill (its message comes with the fill)."""
         msg = t212.scrub(e, self.client._secrets)
         t["note"] = msg
         if t212.is_no_cash(e):
             t["status"] = "no cash"
             if not isinstance(e, t212.NoCash):
                 t["note"] = "Trading 212 refused it: insufficient funds"
-            return None
+            return None, None
         if isinstance(e, t212.T212Error) and e.code == 3:
             t["status"] = "entry placed, stop not placed"
-            return "!!! %s BOUGHT BUT STOP NOT PLACED (demo) !!! %s" % (t["symbol"], msg)
+            return ("!!! %s BOUGHT BUT STOP NOT PLACED (demo) !!! %s" % (t["symbol"], msg),
+                    self.no_stop_phone(t, msg))
         if isinstance(e, t212.T212Error) and "UNCLEAR" in msg:
             t["status"] = "unclear"
-            return "!!! %s: UNCLEAR whether it was bought (demo). Check the app. !!! %s" % (t["symbol"], msg)
+            return ("!!! %s: UNCLEAR whether it was bought (demo). Check the app. !!! %s" % (t["symbol"], msg),
+                    M.buy_unclear(t["symbol"]))
         t["status"] = "refused"
-        return "NOT PLACED (demo): %s passed the checks when built, but at placing time: %s" % (t["symbol"], msg)
+        return ("NOT PLACED (demo): %s passed the checks when built, but at placing time: %s" % (t["symbol"], msg),
+                M.not_bought(t["symbol"], msg))
+
+    def no_stop_phone(self, t, msg):
+        """The buy went in but its stop did not. Not filled yet (the usual case): nothing now, the buy
+        message comes with the fill and says the safety net is being set (the guard places it). Filled
+        with the stop refused: say so now."""
+        if "not filled yet" in msg or "has not filled" in msg:
+            self.state.setdefault("announce", {})[t["symbol"].upper()] = {"ticket": t["id"], "done": False,
+                                                                          "safety": "pending"}
+            self.save()
+            return None
+        self.state.setdefault("announce", {})[t["symbol"].upper()] = {"ticket": t["id"], "done": True}
+        self.save()
+        return M.bought_no_safety_net(t["symbol"], (t["order"].get("plan") or {}).get("stop"))
 
     def placed_record(self, t):
         rec = {}
@@ -832,20 +850,59 @@ class Pilot(object):
                 rec = r
         return rec
 
-    def bought_text(self, t):
-        """What was bought, from the placement record and the position Trading 212 now shows."""
-        rec = None
-        for r in (t212._read_json(self.p("state", "broker.json"), {}) or {}).get("orders") or []:
-            if r.get("fingerprint") == t["fingerprint"] and r.get("status") in ("placed", "stop_placed"):
-                rec = r
-        rec = rec or {}
-        fill = None
+    def fill_price(self, rec):
+        """The average price paid, once Trading 212 shows the position; None while the buy waits to fill."""
         try:
             for p in self.client.get(t212.POSITIONS) or []:
-                if t212._o_ticker(p) == rec.get("t212_ticker"):
-                    fill = t212._num(p.get("averagePricePaid"))
+                if t212._o_ticker(p) == (rec or {}).get("t212_ticker") and (t212._num(p.get("quantity")) or 0) > 0:
+                    return t212._num(p.get("averagePricePaid"))
         except t212.T212Error:
             pass
+        return None
+
+    def announce(self, t, rec, fill):
+        """The phone's buy message: now when it has filled, else held until watch_positions sees the fill
+        (one message per buy, with the real fill price)."""
+        sym = t["symbol"].upper()
+        if fill:
+            self.state.setdefault("announce", {})[sym] = {"ticket": t["id"], "done": True}
+            return self.buy_message(t, rec, fill)
+        self.state.setdefault("announce", {})[sym] = {"ticket": t["id"], "done": False}
+        return None
+
+    def close_uk(self):
+        """The end-of-day close (15:50 New York) on the Mac's UK clock, e.g. 8:50pm; None when it is off."""
+        try:
+            e = t212.eod_settings(self.cfg)
+        except t212.T212Error:
+            return None
+        if not e:
+            return None
+        ny = _ny().replace(hour=e["at"][0], minute=e["at"][1], second=0, microsecond=0)
+        utc = tk.eastern_to_utc(ny.replace(tzinfo=None))
+        return M.uk_clock(datetime.datetime.fromtimestamp(utc.replace(tzinfo=datetime.timezone.utc).timestamp()))
+
+    def buy_message(self, t, rec, fill, safety=None):
+        rec = rec or {}
+        plan = t["order"].get("plan") or {}
+        stop = t212._num(rec.get("stop")) or t212._num(plan.get("stop"))
+        price = fill or t212._num(rec.get("entry")) or t212._num(plan.get("entry"))
+        trail_from = None
+        try:
+            tr = t212.trail_settings(self.cfg)
+        except t212.T212Error:
+            tr = None
+        if tr and tr.get("distance_r") is not None and price and stop and price > stop:
+            trail_from = price + tr["activate_r"] * (price - stop)
+        if safety is None:
+            safety = {"stop_placed": "in", "software_stop": "software"}.get(rec.get("status"), "pending")
+        return M.bought(t["symbol"], rec.get("qty") or t["order"].get("qty"), price, rec.get("cost_gbp"), stop,
+                        rec.get("max_loss_gbp"), tm=t.get("tm"), trail_from=trail_from, close_uk=self.close_uk(),
+                        safety=safety)
+
+    def bought_text(self, t, rec=None, fill=None):
+        """What was bought, for the log: from the placement record and the position Trading 212 shows."""
+        rec = rec or {}
         odds = report_mod().tm_words(t.get("tm") or {})
         stop_how = ("a stop order at Trading 212, good till cancelled" if rec.get("status") == "stop_placed"
                     else "enforced by the guard in software: a market sell at the stop")
@@ -876,7 +933,7 @@ class Pilot(object):
             if t["status"] == "pending" and _now() >= t["expires"]:
                 t["status"] = "expired"
                 self.save()
-                self._edit(t, self.ticket_text(t) + "\n\nEXPIRED at %s. Nothing was placed." % _uk(t["expires"]))
+                self._edit(t, M.ticket_end(self.ticket_text(t), "expired"))
                 self.say("ticket %s (%s) expired: nothing placed" % (t["id"], t["symbol"]))
 
     def _edit(self, t, text):
@@ -907,15 +964,15 @@ class Pilot(object):
         if cmd == "/pause":
             self.state["paused"] = True
             self.save()
-            self.phone.send("Paused: no new tickets until you send /resume. The guard keeps protecting positions.")
+            self.phone.send(M.paused())
         elif cmd == "/resume":
             self.state["paused"] = False
             self.save()
-            self.phone.send("Resumed: the next cycle scans again.")
+            self.phone.send(M.resumed())
         elif cmd == "/status":
             self.phone.send(self.status_text())
         else:
-            self.phone.send("Commands: /pause, /resume, /status. Tickets are answered with their buttons.")
+            self.phone.send(M.help_text())
 
     def tap(self, u):
         m = re.match(r"^(ap|rj):([0-9a-f]{8}):([0-9a-f]{16})$", u["data"])
@@ -923,48 +980,53 @@ class Pilot(object):
         if m:
             t = next((x for x in self.state["tickets"] if x["id"] == m.group(2)), None)
         if t is None or not hmac.compare_digest(t["nonce"], m.group(3)):
-            self.phone.answer(u["id"], "Unknown ticket: nothing done.")
+            self.phone.answer(u["id"], M.TAP["unknown"])
             return
         if t["status"] != "pending":
-            self.phone.answer(u["id"], "Already %s: nothing more done." % t["status"])
+            self.phone.answer(u["id"], M.TAP["already"] % t["status"])
             return
         if _now() >= t["expires"]:
             t["status"] = "expired"
             self.save()
-            self.phone.answer(u["id"], "Expired: nothing placed.")
-            self._edit(t, self.ticket_text(t) + "\n\nEXPIRED. You tapped after %s. Nothing was placed." % _uk(t["expires"]))
+            self.phone.answer(u["id"], M.TAP["expired"])
+            self._edit(t, M.ticket_end(self.ticket_text(t), "expired"))
             return
         if m.group(1) == "rj":
             t["status"] = "rejected"
             self.save()
-            self.phone.answer(u["id"], "Rejected: nothing placed.")
-            self._edit(t, self.ticket_text(t) + "\n\nREJECTED by you. Nothing was placed.")
+            self.phone.answer(u["id"], M.TAP["rejected"])
+            self._edit(t, M.ticket_end(self.ticket_text(t), "rejected"))
             self.say("ticket %s (%s) rejected" % (t["id"], t["symbol"]))
             return
         t["status"] = "approving"         # a second tap, or a crash and restart, never places twice
         t["approved_at"] = _now()
         self.save()
-        self.phone.answer(u["id"], "Approved: checking again, then placing on demo.")
+        self.phone.answer(u["id"], M.TAP["approved"])
         self.approve(t)
 
     def approve(self, t):
+        phone, end = None, "placed"
         try:
             text = self._approve(t)
+            rec = self.placed_record(t)
+            fill = self.fill_price(rec)
+            phone = self.announce(t, rec, fill)
         except (PilotError, t212.T212Error) as e:
             msg = t212.scrub(e, self.client._secrets)
             if t["status"] == "approving":
                 t["status"] = "refused"
             t["note"] = msg
-            text = "NOT PLACED: %s" % msg
+            text, end = "NOT PLACED: %s" % msg, "refused"
             if isinstance(e, t212.T212Error) and e.code == 3:
                 t["status"] = "entry placed, stop not placed"
-                text = "!!! ENTRY PLACED, STOP NOT PLACED !!! %s" % msg
+                text, end = "!!! ENTRY PLACED, STOP NOT PLACED !!! %s" % msg, "no_stop"
+                phone = self.no_stop_phone(t, msg)
             elif isinstance(e, t212.T212Error) and "UNCLEAR" in msg:
                 t["status"] = "unclear"
-                text = "!!! UNCLEAR whether it was placed. Check the app. !!! %s" % msg
+                text, end = "!!! UNCLEAR whether it was placed. Check the app. !!! %s" % msg, "unclear"
         self.save()
-        self._edit(t, self.ticket_text(t) + "\n\n" + text)
-        self.event("%s %s" % (t["symbol"], text))
+        self._edit(t, M.ticket_end(self.ticket_text(t), end, t.get("note")))
+        self.event("%s %s" % (t["symbol"], text), push=phone is not None, phone=phone)
 
     def _approve(self, t, by="phone approve"):
         """Fresh quote, chase limit, trader-risk again, then t212.py place with your Approve (or, on demo
@@ -1040,21 +1102,147 @@ class Pilot(object):
         for t in sorted(set(before) | set(now)):
             b, n = (before.get(t) or {}).get("qty", 0), (now.get(t) or {}).get("qty", 0)
             if n > b + 1e-9:
+                phone = self.fill_message(t, n - b, (now[t] or {}).get("avg"))
                 self.event("FILLED (demo): bought %s %s at about $%s; you hold %s"
-                           % (t212._qty(n - b), t, t212._fmt((now[t] or {}).get("avg")), t212._qty(n)))
+                           % (t212._qty(n - b), t, t212._fmt((now[t] or {}).get("avg")), t212._qty(n)),
+                           push=phone is not None, phone=phone)
             elif n + 1e-9 < b:
                 px = (now.get(t) or before.get(t) or {}).get("price")
+                phone = self.sale_message(t, b - n, px)
                 self.event("EXIT (demo): sold %s %s near $%s; you hold %s"
-                           % (t212._qty(b - n), t, t212._fmt(px), t212._qty(n) if n else "none"))
+                           % (t212._qty(b - n), t, t212._fmt(px), t212._qty(n) if n else "none"),
+                           push=phone is not None, phone=phone)
+
+    def _drift_ticker(self, t212_ticker):
+        try:
+            db = self.drift_buy()
+            return t212_ticker in db.drift_tickers(t212._read_json(self.p("state", "broker.json"), {}) or {},
+                                                   self.client.env)
+        except Exception:
+            return False
+
+    def fill_message(self, t212_ticker, qty, avg):
+        """The one buy message, with the real fill price: for a buy the autopilot placed (unless it was already
+        announced at placing time), or a plain one for a buy it did not place. Drift buys have their own."""
+        sym = M.ticker(t212_ticker)
+        a = (self.state.get("announce") or {}).get(sym)
+        if a and a.get("done"):
+            return None
+        if a:
+            a["done"] = True
+            self.save()
+            tkt = next((x for x in self.state["tickets"] if x["id"] == a.get("ticket")), None)
+            if tkt is not None:
+                return self.buy_message(tkt, self.placed_record(tkt) or self.any_record(tkt), avg, a.get("safety"))
+        if self._drift_ticker(t212_ticker):
+            return None
+        return M.bought_simple(t212_ticker, qty, avg)
+
+    def any_record(self, t):
+        rec = {}
+        for r in (t212._read_json(self.p("state", "broker.json"), {}) or {}).get("orders") or []:
+            if r.get("fingerprint") == t["fingerprint"] and r.get("kind", "entry") == "entry":
+                rec = r
+        return rec
+
+    def at_close(self, t212_ticker):
+        """True for the 15:50 close's sales: those go in the evening report, a few minutes later."""
+        eod = (t212._read_json(self.p("state", "t212-guard.json"), {}) or {}).get("eod") or {}
+        if eod.get("date") == _ny().date().isoformat() and any(
+                (x or {}).get("ticker") == t212_ticker for x in eod.get("sold") or []):
+            return True
+        try:
+            e = t212.eod_settings(self.cfg)
+        except t212.T212Error:
+            e = None
+        if not e:
+            return False
+        ny = _ny()
+        return (ny.hour, ny.minute) >= tuple(e["at"])
+
+    def sale_message(self, t212_ticker, qty, px):
+        """One message per sale during the day, with the result from Trading 212's own fills. None for the
+        15:50 close (the evening report has them) and for drift (DRIFT SELL after the close)."""
+        if self.at_close(t212_ticker) or self._drift_ticker(t212_ticker):
+            return None
+        try:
+            report = report_mod()
+            day = _ny().date()
+            since = tk.eastern_to_utc(datetime.datetime.combine(day - datetime.timedelta(days=report.HISTORY_DAYS),
+                                                                datetime.time(0, 0)))
+            closed, _ = report.round_trips(report.history(self.client, since))
+            mine = [c for c in closed if c["ticker"] == t212_ticker and tk.to_eastern(c["exit_at"]).date() == day]
+            if mine:
+                c = mine[-1]
+                guard = t212._read_json(self.p("state", "t212-guard.json"), {}) or {}
+                rec, _ = report.ticket_for(M.ticker(t212_ticker), day.isoformat(),
+                                           t212._read_json(self.p("state", "broker.json"), {}) or {}, {})
+                why = report.exit_reason(c, guard, t212._num((rec or {}).get("stop")), day.isoformat())
+                return M.sold(t212_ticker, c.get("qty"), c.get("entry"), c.get("exit"), why, c.get("pl"))
+        except Exception as e:                  # the fill history is a nicety here: the evening report has it
+            self.say("sale details for %s not read yet (%s)" % (t212_ticker, t212.scrub(e, self.client._secrets)))
+        return M.sold_unknown(t212_ticker, qty, px)
 
     def status_text(self):
+        """/status, in plain words. The full detail is in the logs and `autopilot.py status`."""
         st = self.state
         placed = sum(1 for t in st["tickets"] if t["status"] == "placed")
-        return ("Autopilot (demo, %s%s) %s: %d passing tickets today, %d placed, %s pending%s. %d tickers allowed." % (
-            "buys automatically" if self.s["auto_buy"] else "asks for Approve",
-            ", EVIDENCE MODE forward test" if self.s["evidence_mode"] else "", st["day"], len(st["tickets"]),
-            placed, len(self.pending()), ", PAUSED" if st.get("paused") else "",
-            len(t212.allowed_tickers(self.cfg) or [])) + self.status_extra())
+        alerts = mod("trader-alerts", "alerts")
+        m = alerts.market_status(_utc())
+        if m.get("open"):
+            market = "open"
+        else:
+            market = "closed (%s)%s" % (m.get("reason") or "closed",
+                                        "; next opens %s New York" % m["next_open"] if m.get("next_open") else "")
+        g_ok, g_line = _guard_state(self.sd)
+        if not g_ok and not m.get("open"):
+            g_line = "not running (it starts at 1pm UK on trading days)"
+        return M.status(st["day"], m.get("open"), market, g_ok, g_line, self.s["auto_buy"], st.get("paused"),
+                        placed, self.holdings(), cash_line=self.limits_words(), extra=self.drift_lines())
+
+    def limits_words(self):
+        """Today's loss limits and how many companies it picks from, in one plain line."""
+        c = self.cfg
+        f = (((c.get("account_budget") or {}).get("last") or {}).get("figures") or {}) \
+            if (c.get("account_budget") or {}).get("enabled") else {}
+        per = f.get("max_loss_per_trade_gbp", c.get("max_loss_per_trade_gbp"))
+        day = f.get("max_daily_loss_gbp", c.get("max_daily_loss_gbp"))
+        n = len(t212.allowed_tickers(self.cfg) or [])
+        return "Most I'll risk: %s a trade, %s a day. Choosing from %d companies" % (M.gbp(per), M.gbp(day), n)
+
+    def holdings(self):
+        """[(ticker, qty, price, safety words)] for the phone, or [] when Trading 212 cannot be read."""
+        try:
+            pos = [p for p in self.client.get(t212.POSITIONS) or [] if (t212._num(p.get("quantity")) or 0) > 0]
+            pending = self.client.get(t212.ORDERS) or [] if pos else []
+        except t212.T212Error:
+            return []
+        soft = (t212._read_json(self.p("state", "t212-guard.json"), {}) or {}).get("software") or {}
+        drift = set()
+        if pos:
+            try:
+                drift = self.drift_buy().drift_tickers(t212._read_json(self.p("state", "broker.json"), {}) or {},
+                                                       self.client.env)
+            except Exception:
+                drift = set()
+        out = []
+        for p in pos:
+            ticker = t212._o_ticker(p)
+            if ticker in drift:
+                continue                          # drift holdings have their own lines
+            qty = t212._num(p.get("quantity")) or 0
+            stops, _ = t212.guard_sell_orders(pending, ticker)
+            covered = sum(abs(t212._num(o.get("quantity")) or 0) for o in stops)
+            if stops and covered + 1e-9 >= qty:
+                how = M.safety_words("order", stops[0].get("stopPrice"))
+            elif soft.get(ticker):
+                how = M.safety_words("software", soft[ticker].get("stop"))
+            elif stops:
+                how = M.safety_words("partial", covered=covered, qty=qty)
+            else:
+                how = M.safety_words("none")
+            out.append((ticker, qty, p.get("currentPrice"), how))
+        return out
 
     def universe_line(self):
         try:
@@ -1096,8 +1284,8 @@ class Pilot(object):
             ok, path, _ = report.send(self.client, self.sd, phone=self.phone)
             self.say("closing report %s (%s)" % ("sent" if ok else "NOT sent", path))
         except Exception as e:
-            phone_mod.push(self.sd, "CLOSING REPORT (demo): could not be built (%s)"
-                           % t212.scrub(e, self.client._secrets), phone=self.phone)
+            self.say("CLOSING REPORT (demo): could not be built (%s)" % t212.scrub(e, self.client._secrets))
+            phone_mod.push(self.sd, M.report_failed("today's evening report"), phone=self.phone)
         self.state["summary_sent"] = True
         self.save()
         if self.s["evidence_mode"]:
@@ -1193,8 +1381,7 @@ class Pilot(object):
                 "; ".join("%s (%s)" % kv for kv in res["skipped"]) or "none"))
         except Exception as e:
             self.say("drift buy step failed (nothing more is bought today): %s" % t212.scrub(e, self.client._secrets))
-            phone_mod.push(self.sd, "DRIFT (demo): the buy step failed (%s). Nothing more is bought today."
-                           % t212.scrub(e, self.client._secrets), phone=self.phone)
+            phone_mod.push(self.sd, M.drift_failed(), phone=self.phone)
 
     def drift_sells(self):
         """After the close: DRIFT SELL for each drift position that was sold (sell date or stop). Read-only."""
@@ -1207,7 +1394,7 @@ class Pilot(object):
             report = mod("trader-broker", "report")
             report.t212, report.tk = t212, tk
             for row, text in db.closed_since(self.client, self.sd, cfg, _ny().date(), report, self.rate()):
-                phone_mod.push(self.sd, text, phone=self.phone)
+                phone_mod.push(self.sd, M.drift_sold(row), phone=self.phone)
                 self.say(text)
         except Exception as e:
             self.say("drift sells: could not be checked (%s)" % t212.scrub(e, self.client._secrets))
@@ -1222,14 +1409,10 @@ class Pilot(object):
             if not rate:
                 return []
             rows = db.read_holdings(self.client, self.sd, self.drift_cfg(), rate, _ny().date())
-            lines = db.holding_lines(rows)
-            bad = db.unprotected(rows)
-            if bad:
-                lines.append("!!! NOT PROTECTED OVERNIGHT (no stop order at Trading 212): %s. Set a stop in the app."
-                             % ", ".join(r["symbol"] for r in bad))
-            return lines
+            return M.drift_holdings(rows)
         except Exception as e:
-            return ["Drift holdings: no data (%s)" % t212.scrub(e, self.client._secrets)]
+            self.say("drift holdings: no data (%s)" % t212.scrub(e, self.client._secrets))
+            return ["\u26a0\ufe0f Couldn't read the few-weeks holdings just now."]
 
     def drift_due(self, ny):
         try:
@@ -1248,8 +1431,8 @@ class Pilot(object):
                 ok, _, r = evidence.send_report(self.client, self.sd, self.cfg, report, phone=self.phone)
                 self.say("evidence report %s: %s" % ("sent" if ok else "NOT sent", r["status"]))
         except Exception as e:
-            phone_mod.push(self.sd, "EVIDENCE REPORT (demo): could not be built (%s)"
-                           % t212.scrub(e, self.client._secrets), phone=self.phone)
+            self.say("EVIDENCE REPORT (demo): could not be built (%s)" % t212.scrub(e, self.client._secrets))
+            phone_mod.push(self.sd, M.report_failed("this week's summary"), phone=self.phone)
 
     # ------------------------------------------------------------ no internet
 
@@ -1267,9 +1450,8 @@ class Pilot(object):
             self.state["paused"] = True
             self.state["paused_why"] = "no internet for %d minutes" % net.minutes(start, _now())
             self.save()
-            phone_mod.push(self.sd, "AUTOPILOT OFFLINE for %d minutes: buying is PAUSED for the rest of today. "
-                                    "The guard is separate and keeps protecting positions when it can reach "
-                                    "Trading 212." % net.minutes(start, _now()), phone=self.phone)
+            self.say("AUTOPILOT OFFLINE for %d minutes: buying is PAUSED for the rest of today" % net.minutes(start, _now()))
+            phone_mod.push(self.sd, M.offline_paused(net.minutes(start, _now())), phone=self.phone)
             w = net.wait_online(_sleep, _now, limit=max(0.0, deadline - _now()), deadline=deadline,
                                 log=self.say, label="the autopilot")
         end = _now()
@@ -1281,17 +1463,19 @@ class Pilot(object):
         if slots:
             missed.append("%d scan cycle%s (%s New York), so no tickets then" % (
                 len(slots), "" if len(slots) == 1 else "s", ", ".join(slots)))
-        extra = ["Fills and exits during the outage are reported next, from the positions."]
+        extra = ["Anything bought or sold meanwhile is reported next."]
         if paused:
-            extra.append("Buying is PAUSED for the rest of today because the outage lasted %d minutes or more. "
+            extra.append("Buying stays paused for the rest of today because the outage lasted %d minutes or more. "
                          "Send /resume to start again." % (net.GIVE_UP_AFTER // 60))
         net.record(self.sd, "autopilot", start, end, missed, gave_up=paused)
         self.state["events"].append({"at": _ny().strftime("%H:%M"),
                                      "text": "offline %d min; missed %s" % (net.minutes(start, end), "; ".join(missed) or "nothing")})
         self.save()
         if w["ok"]:
-            phone_mod.push(self.sd, net.back_online("The autopilot (demo)", start, end, missed, extra),
-                           phone=self.phone)
+            phone_mod.push(self.sd, M.back_online("The autopilot", net.hm(start), net.hm(end), net.minutes(start, end),
+                                                  ["%d check%s for trades (%s New York)" % (
+                                                      len(slots), "" if len(slots) == 1 else "s", ", ".join(slots))]
+                                                  if slots else [], extra), phone=self.phone)
         return nc
 
     # ------------------------------------------------------------ always on: the phone at any hour
@@ -1361,8 +1545,8 @@ class Pilot(object):
             value = t212._num((self.client.get(t212.SUMMARY) or {}).get("totalValue"))
             r, changed = ab.apply(value, self.p("config.json"), today)
         except (ab.BudgetError, t212.T212Error) as e:
-            phone_mod.push(self.sd, "BUDGET NOT UPDATED (demo): %s. Yesterday's budget and limits stay."
-                           % t212.scrub(e, self.client._secrets), phone=self.phone, once_key="budget-" + today)
+            self.say("BUDGET NOT UPDATED (demo): %s. Yesterday's budget and limits stay." % t212.scrub(e, self.client._secrets))
+            phone_mod.push(self.sd, M.budget_not_updated(), phone=self.phone, once_key="budget-" + today)
             return
         self.cfg = self.read_cfg()
         self.s = settings(self.cfg)
@@ -1385,27 +1569,20 @@ class Pilot(object):
             b, c.get("cash_buffer_pct"), c.get("max_loss_per_trade_gbp"), c.get("max_daily_loss_gbp"))
 
     def open_message(self, first=None, last=None):
-        """The confirmation at the open: guard and autopilot running, positions and their stops, evidence mode."""
-        ny = _ny()
+        """The confirmation at the open: guard and autopilot running, what is held and its safety net."""
         g_ok, g_line = _guard_state(self.sd)
+        if not g_ok:
+            g_line = "NOT RUNNING, so nothing is checking the safety nets. Restart it (see CLAUDE.md)"
         aj = _launchd(AUTOPILOT_LABEL)
-        lines = ["MARKET OPEN (demo) %s New York" % ny.strftime("%a %d %b %H:%M"),
-                 "Guard: %s" % g_line,
-                 "Autopilot: %s, %s%s" % (
-                     ("running, always on (pid %s)" % aj["pid"]) if aj["running"] else
-                     "!!! the always-on service is NOT RUNNING (this message is from pid %d) !!!" % os.getpid(),
-                     "buys automatically" if self.s["auto_buy"] else "asks for Approve",
-                     ", PAUSED (send /resume)" if self.state.get("paused") else "")]
-        if self.s["evidence_mode"]:
-            lines.append("EVIDENCE MODE is ON: %s" % self.evidence_day())
-        lines.append(self.budget_line())
-        lines.append(self.universe_line())
-        lines += self.positions_lines()
-        lines += self.drift_lines()
-        if first and last:
-            lines.append("Checks every %d min from %s to %s New York. /pause stops new buys." % (
-                self.s["every_minutes"], first.strftime("%H:%M"), last.strftime("%H:%M")))
-        return "\n".join(lines)
+
+        def uk(ny):
+            if ny is None:
+                return None
+            utc = tk.eastern_to_utc(ny.replace(tzinfo=None))
+            return M.uk_clock(datetime.datetime.fromtimestamp(utc.replace(tzinfo=datetime.timezone.utc).timestamp()))
+        return M.market_open(uk(_ny()), g_ok, g_line, aj["running"], self.s["auto_buy"], self.state.get("paused"),
+                             self.holdings(), uk(first), uk(last), self.drift_lines(),
+                             every=self.s["every_minutes"])
 
     def evidence_day(self):
         alerts = mod("trader-alerts", "alerts")
@@ -1418,32 +1595,6 @@ class Pilot(object):
             n += 1 if alerts.trading_day(d)[0] else 0
             d += datetime.timedelta(days=1)
         return "forward test since %s, no end date, trading day %d" % (start, n)
-
-    def positions_lines(self):
-        try:
-            pos = [p for p in self.client.get(t212.POSITIONS) or [] if (t212._num(p.get("quantity")) or 0) > 0]
-            pending = self.client.get(t212.ORDERS) or []
-        except t212.T212Error as e:
-            return ["Positions: no data (%s)" % t212.scrub(e, self.client._secrets)]
-        if not pos:
-            return ["Open positions: none."]
-        soft = (t212._read_json(self.p("state", "t212-guard.json"), {}) or {}).get("software") or {}
-        out = ["Open positions:"]
-        for p in pos:
-            ticker = t212._o_ticker(p)
-            qty = t212._num(p.get("quantity")) or 0
-            stops, _ = t212.guard_sell_orders(pending, ticker)
-            covered = sum(abs(t212._num(o.get("quantity")) or 0) for o in stops)
-            if stops and covered + 1e-9 >= qty:
-                how = "stop $%s (stop order, %s)" % (t212._fmt(stops[0].get("stopPrice")), stops[0].get("status", "?"))
-            elif soft.get(ticker):
-                how = "software stop $%s (the guard sells at it)" % t212._fmt(soft[ticker].get("stop"))
-            elif stops:
-                how = "!!! stop covers only %s of %s !!!" % (t212._qty(covered), t212._qty(qty))
-            else:
-                how = "!!! NO STOP !!!"
-            out.append("  %s %s at $%s: %s" % (ticker, t212._qty(qty), t212._fmt(p.get("currentPrice")), how))
-        return out
 
     def serve(self, max_loops=None):
         """Always on (launchd keeps it alive): answer /status, /pause and /resume at any hour, deliver the outbox,
@@ -1598,15 +1749,17 @@ def main(argv=None, environ=None):
             pilot.serve()
             return 0
         if a.cmd == "open-check":
-            text = "TEST, not the real open:\n" + pilot.open_message()
-            print(text)
+            text = "\U0001f9ea <b>Test, not the real open</b>\n" + pilot.open_message()
+            print(M.plain(text))
             if a.send:
                 pilot.phone.send(text)
             return 0
         if a.cmd == "status":
-            print(pilot.status_text())
+            text = pilot.status_text()
+            print(M.plain(text))
+            print(M.plain(pilot.status_extra()))
             if a.send:
-                pilot.phone.send(pilot.status_text())
+                pilot.phone.send(text)
             print("keep-awake: %s; %s" % (_keep_awake()[1], _on_mains()[1]))
             if not _on_mains()[0]:
                 print("WARNING: %s" % _on_mains()[1])
@@ -1627,7 +1780,7 @@ def main(argv=None, environ=None):
     except (PilotError, t212.T212Error, tk.TicketError, phone_mod.PhoneError) as e:
         msg = t212.scrub(e, client._secrets) if client else str(e)
         sys.stderr.write("autopilot: %s\n" % msg)
-        phone_mod.push(a.state_dir, "AUTOPILOT STOPPED (demo): %s" % msg, environ=environ)
+        phone_mod.push(a.state_dir, M.stopped(), environ=environ)
         return 2
 
 
@@ -1639,7 +1792,7 @@ def serve_unready(state_dir, client, phone, problems, environ, max_loops=None):
     mark = os.path.join(state_dir, "state", "autopilot-unready.json")
     today = _ny().date().isoformat()
     if (t212._read_json(mark, {}) or {}).get("day") != today:
-        phone_mod.push(state_dir, why, phone=phone)
+        phone_mod.push(state_dir, M.not_running(problems), phone=phone)
         t212._write_json(mark, {"day": today})
     started, n = _now(), 0
     while (max_loops is None or n < max_loops) and _now() - started < 300:
@@ -1647,9 +1800,9 @@ def serve_unready(state_dir, client, phone, problems, environ, max_loops=None):
         try:
             for u in phone.updates(wait=POLL_WAIT):
                 if u["kind"] == "text":
-                    phone.send(why + "\nFix it, and it starts within 5 minutes.")
+                    phone.send(M.not_running(problems))
                 elif u["kind"] == "tap":
-                    phone.answer(u["id"], "The autopilot is not running: nothing done.")
+                    phone.answer(u["id"], M.TAP["not_running"])
         except phone_mod.PhoneError:
             _sleep(60)
     return 3                                     # launchd starts it again: the checks run afresh

@@ -2275,8 +2275,7 @@ def run_eod(client, state_dir):
     """The close, then your phone: what was sold, and a loud alarm for anything that was not."""
     res = eod_close(client, state_dir)
     text = render_eod(res)
-    _say(text)
-    _phone_push(client, text)
+    _say(text)            # the sales go in the evening report a few minutes later; problems are alarmed below
     for f in res["failed"]:
         guard_alarm(client, "END-OF-DAY CLOSE FAILED: " + f)
     for f in res.get("unknown", []):
@@ -2329,6 +2328,11 @@ def phone_module():
     return _PHONE[0]
 
 
+def messages():
+    """trader-broker/messages.py: the plain-English phone messages."""
+    return phone_module().messages()
+
+
 def _phone_push(client, text, once_key=None):
     """Best effort, to your phone if one is paired (trader-broker/phone.py). Tests replace it."""
     try:
@@ -2336,6 +2340,12 @@ def _phone_push(client, text, once_key=None):
                                    environ=getattr(client, "environ", None), once_key=once_key)
     except Exception:
         return False
+
+
+def _m(client):
+    m = messages()
+    m.use(getattr(client, "state_dir", None))
+    return m
 
 
 def guard_alarm(client, text):
@@ -2351,14 +2361,14 @@ def guard_alarm(client, text):
     except OSError:
         pass
     _notify("Trading 212 stop guard (%s)" % client.env, text)
-    _phone_push(client, "GUARD ALERT (%s): %s" % (client.env.upper(), text))
+    _phone_push(client, _m(client).guard_alert(text))
 
 
 GUARD_NEWS = ("stop placed", "SOLD AT STOP", "STOP SALE FAILED", "stop failed", "unclear", "below stop")
 
 
 def guard_news(res):
-    """What in one pass is worth your phone: orders the guard sent or could not send, and warnings."""
+    """What in one pass is worth knowing: orders the guard sent or could not send (the log's wording)."""
     out = []
     for r in res.get("positions") or []:
         st, tr = r.get("status") or "", r.get("trail") or ""
@@ -2374,11 +2384,31 @@ def guard_news(res):
     return out
 
 
-def guard_phone(client, res):
-    for line in guard_news(res):
-        _phone_push(client, "GUARD (%s): %s" % (client.env, line))
+def guard_phone_texts(m, res):
+    """[(text, once_key)] for the phone from one guard pass, in plain words. A raised trailing stop is
+    told once a day per position (the log has every raise); a sale at the stop is left to the autopilot's
+    sale message, which has the result in pounds."""
+    out = []
+    for r in res.get("positions") or []:
+        st, tr = r.get("status") or "", r.get("trail") or ""
+        if st == "stop placed":
+            out.append((m.safety_net_set(r["ticker"], r.get("placed_qty"), r.get("stop")), None))
+        elif st in ("STOP SALE FAILED", "stop failed", "unclear", "below stop"):
+            out.append((m.guard_problem(r["ticker"], st, r.get("note")), None))
+        if "SOLD HALF" in tr:
+            out.append((m.sold_half(r["ticker"]), None))
+        elif tr.startswith("RAISED"):
+            mm = re.match(r"^RAISED the stop ([\d.]+) -> ([\d.]+)", tr)
+            if mm:
+                out.append((m.safety_net_raised(r["ticker"], mm.group(1), mm.group(2)), "trail-" + r["ticker"]))
     for w in res.get("warnings") or []:
-        _phone_push(client, "GUARD WARNING (%s): %s" % (client.env, w), once_key=w)
+        out.append((m.guard_warning(w), w))
+    return out
+
+
+def guard_phone(client, res):
+    for text, once in guard_phone_texts(_m(client), res):
+        _phone_push(client, text, once_key=once)
 
 
 def _auth_failed(client, e):
@@ -2405,15 +2435,16 @@ def guard_offline(client, state_dir, every, end_ts, eod_at, began_et):
                             label="the guard")
     end = _now()
     checks = int((end - start) // every)
-    missed = ["%d guard check%s" % (checks, "" if checks == 1 else "s")] if checks else []
+    missed = ["%d safety check%s" % (checks, "" if checks == 1 else "s")] if checks else []
     if eod_at is not None:
         eod_ts = start + (eod_at - began_et).total_seconds()
         if start <= eod_ts <= end:
-            missed.append("the %s end-of-day close, which runs now that it is back" % eod_at.strftime("%H:%M"))
+            missed.append("the %s New York close (selling what was bought today), which runs now that it is back"
+                          % eod_at.strftime("%H:%M"))
     net.record(state_dir, "guard", start, end, missed, gave_up=not w["ok"])
     if w["ok"]:
-        _phone_push(client, net.back_online("The guard (%s)" % client.env, start, end, missed,
-                                            ["It is checking your positions again now."]))
+        _phone_push(client, _m(client).back_online("The safety guard", net.hm(start), net.hm(end),
+                                                   net.minutes(start, end), missed, ["It's watching again now."]))
     else:
         say("still offline at the end of the guard's day; giving up for today")
     return w

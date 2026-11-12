@@ -94,7 +94,7 @@ class Outbox(unittest.TestCase):
             self.assertFalse(self.phone_mod.push(self.dir, "GUARD ALERT: x", phone=p))
         p.send = lambda text, buttons=None: sent.append(text)
         self.assertTrue(self.phone_mod.push(self.dir, "BACK ONLINE", phone=p))
-        self.assertTrue(sent[0].startswith("DELIVERED LATE: 1 message"))
+        self.assertTrue(sent[0].startswith("📬 <b>Sent late</b>: 1 message"))
         self.assertIn("GUARD ALERT: x", sent[0])
         self.assertEqual(sent[1], "BACK ONLINE")
         self.assertEqual(self.phone_mod.flush_outbox(p, self.dir), 0)
@@ -132,10 +132,10 @@ class Guard(Base):
         code, text = self.watch("10:20")
         self.assertEqual(code, 0)
         self.assertIn(120, self.sleeps)
-        back = [p for p in self.pushed if p.startswith("BACK ONLINE")]
+        back = [p for p in self.pushed if p.startswith("✅ <b>Back online.</b>")]
         self.assertEqual(len(back), 1)
-        self.assertIn("The guard (demo) had no internet", back[0])
-        self.assertIn("Missed: 1 guard check", back[0])
+        self.assertIn("The safety guard had no internet", back[0])
+        self.assertIn("Missed: 1 safety check", back[0])
         self.assertEqual(self.router.posts(), [])
         with open(os.path.join(self.dir, "logs", "outages.jsonl")) as fh:
             self.assertEqual(json.loads(fh.readline())["what"], "guard")
@@ -145,8 +145,8 @@ class Guard(Base):
         self.drop_then(ny(10, 40))
         code, text = self.watch("11:00")
         self.assertTrue(any("GUARD OFFLINE for 30 minutes" in n[1] for n in self.notes))   # the Mac, offline too
-        self.assertTrue(any(p.startswith("BACK ONLINE") for p in self.pushed))
-        self.assertIn("It is checking your positions again now.", [p for p in self.pushed if p.startswith("BACK")][0])
+        self.assertTrue(any("No internet for 30 minutes" in p for p in self.pushed))
+        self.assertIn("It's watching again now.", [p for p in self.pushed if "Back online" in p][0])
 
     def test_a_missed_end_of_day_close_is_named_and_then_run(self):
         self.write("config.json", dict(self.cfg, eod_close={"enabled": True, "at": "15:50"}))
@@ -156,8 +156,8 @@ class Guard(Base):
         r.add("GET", "/equity/positions", urllib.error.URLError("down"), FakeResp([]))
         r.add("GET", "/equity/orders", FakeResp([]))
         code, text = self.watch("16:00")
-        back = [p for p in self.pushed if p.startswith("BACK ONLINE")][0]
-        self.assertIn("the 15:50 end-of-day close, which runs now that it is back", back)
+        back = [p for p in self.pushed if "Back online" in p][0]
+        self.assertIn("the 15:50 New York close (selling what was bought today), which runs now that it is back", back)
         self.assertIn("END-OF-DAY CLOSE", text)
 
     def test_trading_212_down_but_the_internet_up_is_a_normal_failure(self):
@@ -167,7 +167,7 @@ class Guard(Base):
         r.add("GET", "/equity/orders", FakeResp([stop_order()]))
         code, text = self.watch("10:12")
         self.assertIn("guard pass failed (1 in a row)", text)
-        self.assertFalse(any(p.startswith("BACK ONLINE") for p in self.pushed))
+        self.assertFalse(any("Back online" in p for p in self.pushed))
 
 
 class Autopilot(PilotBase):
@@ -187,16 +187,16 @@ class Autopilot(PilotBase):
         p, start, nc = self.go_offline(20)
         self.assertEqual(nc, start + ap.datetime.timedelta(minutes=30))
         back = self.phone.sent[-1][0]
-        self.assertIn("BACK ONLINE: The autopilot (demo) had no internet", back)
-        self.assertIn("2 scan cycles (10:00, 10:15 New York)", back)
+        self.assertIn("<b>Back online.</b> The autopilot had no internet", back)
+        self.assertIn("2 checks for trades (10:00, 10:15 New York)", back)
         self.assertFalse(p.state.get("paused"))
         self.assertEqual(self.router.posts(), [])
 
     def test_thirty_minutes_or_more_pauses_buying_for_the_day(self):
         p, start, nc = self.go_offline(44)
         texts = [s[0] for s in self.phone.sent]
-        self.assertTrue(any(t.startswith("AUTOPILOT OFFLINE for 30 minutes: buying is PAUSED") for t in texts))
-        self.assertIn("Buying is PAUSED for the rest of today", texts[-1])
+        self.assertTrue(any(t.startswith("⚠️ <b>No internet for 30 minutes,</b> so I've paused buying") for t in texts))
+        self.assertIn("Buying stays paused for the rest of today", texts[-1])
         self.assertTrue(p.state["paused"])
         self.assertIn("paused", p.cycle())
 
@@ -271,9 +271,9 @@ class Briefing(BriefBase):
         code, sent = self.run_main()
         self.assertEqual(code, 0)
         self.assertEqual(len(sent), 1)                  # one message: the late note, then the briefing
-        self.assertTrue(sent[0].startswith("BACK ONLINE: The morning briefing had no internet from"))
+        self.assertTrue(sent[0].startswith("✅ <b>Back online.</b> The morning briefing had no internet from"))
         self.assertIn("the briefing ran 6 minutes late", sent[0])
-        self.assertIn("\n\nMORNING BRIEFING", sent[0])
+        self.assertIn("\n\n☀️ <b>Good morning", sent[0])
 
     def test_no_internet_for_thirty_minutes_gives_up_and_leaves_a_note(self):
         self.net._connect = BackAt(self, 10 ** 12)
@@ -282,7 +282,7 @@ class Briefing(BriefBase):
         self.assertEqual(sent, [])
         self.assertEqual(self.web.urls, [])                 # nothing fetched, nothing guessed
         with open(br.phone_mod.outbox_path(self.dir)) as fh:
-            self.assertIn("MORNING BRIEFING MISSED", json.load(fh)["items"][0]["text"])
+            self.assertIn("The morning briefing didn't happen", json.load(fh)["items"][0]["text"])
 
 
 if __name__ == "__main__":
