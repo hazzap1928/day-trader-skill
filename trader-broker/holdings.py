@@ -62,6 +62,9 @@ KINDS = {
     "unknown_label": "its strategy label is not one this pack knows, so it is kept and never sold by a rule",
     "no_sell_rule": "it has no readable sell date, so it is kept until you decide",
 }
+# A mismatch of one of these kinds pauses NEW buys until the record and the broker agree again. Nothing is
+# sold or changed. "soft_stop" is left out: the holding is protected in market hours, and it is reported.
+PAUSE_KINDS = ("no_record", "not_held", "qty", "no_stop", "part_stop", "stray_stop", "unknown_label", "no_sell_rule")
 
 
 def _now():
@@ -292,6 +295,30 @@ def fresh(doc, mismatches):
     return new
 
 
+def pause_update(doc, mismatches, on=True):
+    """Pause new buys while a mismatch of a PAUSE_KINDS kind stands. Sets doc["pause"] and returns
+    ("started" | "ended" | "still" | None, the mismatches that pause). It only ever sets a flag the buy
+    steps read: nothing is sold, cancelled or fixed. `on` False (the setting is off) clears any pause."""
+    bad = [m for m in mismatches if m.get("kind") in PAUSE_KINDS] if on else []
+    was = doc.get("pause") if isinstance(doc.get("pause"), dict) else None
+    if bad:
+        doc["pause"] = {"since": (was or {}).get("since") or int(_now()), "checked": int(_now()),
+                        "kinds": sorted({m["kind"] for m in bad}), "symbols": sorted({str(m.get("symbol")) for m in bad})}
+        return ("still" if was else "started"), bad
+    doc["pause"] = None
+    return ("ended" if was else None), []
+
+
+def paused(sd):
+    """The pause on new buys from the last match, or None: {"since", "kinds", "symbols"}."""
+    p = load(sd).get("pause")
+    return p if isinstance(p, dict) and p.get("symbols") is not None else None
+
+
+def pause_words(p):
+    return "new buys are paused: the holdings record and the broker do not match (%s)" % ", ".join(p.get("symbols") or [])
+
+
 def open_risk(view):
     """Pounds that every holding could lose at its stop, together (gaps can lose more). One row each.
     The stop is the live stop order, else the guard's software stop, else the stop its buy planned;
@@ -340,7 +367,10 @@ def open_risk(view):
         total += risk
         rows.append({"symbol": w.get("symbol"), "ref": w["ref"], "qty": abs(_num(w.get("qty")) or 0), "stop": _num(b.get("stop")),
                      "how": "buy waiting to fill", "risk_gbp": round(risk, 2), "strategy": strategy_of(b)})
-    return {"rows": rows, "open_risk_gbp": round(total, 2)}
+    by = {}
+    for r in rows:
+        by[r["strategy"]] = round(by.get(r["strategy"], 0.0) + r["risk_gbp"], 2)
+    return {"rows": rows, "open_risk_gbp": round(total, 2), "by_strategy": by}
 
 
 def cost_by_strategy(view):

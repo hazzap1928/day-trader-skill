@@ -155,10 +155,12 @@ def sales_since(client, since_day, report_mod, guard_state=None):
     return out
 
 
-def daily_match(client, sd, rate, today, report_mod=None, ideas=None):
+def daily_match(client, sd, rate, today, report_mod=None, ideas=None, pause=True):
     """The daily match: read the account, bring the pages up to date, list what disagrees.
-    Returns {"view", "events", "mismatches", "new", "risk"}. Read-only at Trading 212; writes only
-    trader/state/holdings.json and holdings-log.jsonl."""
+    Returns {"view", "events", "mismatches", "new", "risk", "pause", "pausing"}. Read-only at Trading 212;
+    writes only trader/state/holdings.json and holdings-log.jsonl.
+    pause: while a real disagreement stands, new buys are paused (a flag in holdings.json that the buy steps
+    read; "pause" is "started", "ended", "still" or None). Nothing is sold, cancelled or fixed."""
     T, H = _t212(), _hold()
     v = read_view(client, sd, rate, ideas)
     doc = H.load(sd)
@@ -175,7 +177,11 @@ def daily_match(client, sd, rate, today, report_mod=None, ideas=None):
     events = H.sync(doc, v, today)
     mism = H.match(doc, v, today)
     new = H.fresh(doc, mism)
+    change, pausing = H.pause_update(doc, mism, on=pause)
     H.save(sd, doc)
+    if change in ("started", "ended"):
+        H.log(sd, "buys_paused" if change == "started" else "buys_resumed",
+              symbols=sorted({str(m.get("symbol")) for m in pausing}), kinds=sorted({m["kind"] for m in pausing}))
     for ev, page in events:
         H.log(sd, ev, id=page.get("id"), symbol=page.get("symbol"), strategy=page.get("strategy"),
               status=page.get("status"), result=page.get("result"))
@@ -185,7 +191,8 @@ def daily_match(client, sd, rate, today, report_mod=None, ideas=None):
         risk = H.open_risk(v)
     except ValueError:
         risk = None
-    return {"view": v, "events": events, "mismatches": mism, "new": new, "risk": risk}
+    return {"view": v, "events": events, "mismatches": mism, "new": new, "risk": risk, "pause": change,
+            "pausing": pausing}
 
 
 def text(res):
@@ -194,8 +201,13 @@ def text(res):
         len(res["view"]["positions"]), "" if len(res["view"]["positions"]) == 1 else "s",
         len(res["mismatches"]), "" if len(res["mismatches"]) == 1 else "s")]
     lines += ["  !!! " + H.mismatch_line(m) for m in res["mismatches"]]
+    if res.get("pausing"):
+        lines.append("  NEW BUYS ARE PAUSED until the record and the broker agree (nothing is sold or changed)")
+    elif res.get("pause") == "ended":
+        lines.append("  the record and the broker agree again: new buys are allowed")
     if res.get("risk"):
-        lines.append("  open risk at the stops: GBP %.2f" % res["risk"]["open_risk_gbp"])
+        lines.append("  open risk at the stops: GBP %.2f%s" % (res["risk"]["open_risk_gbp"], "".join(
+            "; %s GBP %.2f" % kv for kv in sorted((res["risk"].get("by_strategy") or {}).items()))))
     return "\n".join(lines)
 
 

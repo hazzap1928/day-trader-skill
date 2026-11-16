@@ -33,15 +33,39 @@ def no_target():
 
 
 class TheCap(unittest.TestCase):
-    def test_it_replaces_the_daily_loss_limit(self):
-        # three entries today: the old daily count (3 x 46.88 + this one over $150) would block
+    def test_the_daily_loss_limit_still_covers_day_trades(self):
+        # three entries today: the daily count (3 x 46.88 + this one over $150) blocks a day trade, cap or no cap
         old = check.check([R.tsla()], R.cfg(max_trades_per_day=9), state=THREE, now=R.at(R.NOW))
         self.assertIn("daily loss:", R.reasons(old))
         res = check.check([R.tsla()], R.cfg(**CAP), state=THREE, now=R.at(R.NOW), day_risk=total(0.0))
-        self.assertEqual(R.verdicts(res), ["PASS"])
-        self.assertEqual(res["today"]["daily_loss_count"], "total_risk")
+        self.assertEqual(R.verdicts(res), ["BLOCK"])
+        self.assertIn("daily loss:", R.reasons(res))
+        self.assertNotIn("total risk:", R.reasons(res))
         self.assertEqual(res["today"]["total_risk_cap"], 200.0)
+
+    def test_a_holding_is_not_stopped_by_the_daily_loss_limit(self):
+        res = check.check([no_target()], R.cfg(**CAP), state=THREE, now=R.at(R.NOW), day_risk=total(0.0), strategy="news")
+        self.assertEqual(R.verdicts(res), ["PASS"])
         self.assertNotIn("daily loss", " ".join(res["results"][0]["info"]))
+
+    def test_with_two_entries_today_a_day_trade_still_fits_and_sees_both_limits(self):
+        two = {"orders": THREE["orders"][:2]}
+        res = check.check([R.tsla()], R.cfg(**CAP), state=two, now=R.at(R.NOW), day_risk=total(0.0))
+        self.assertEqual(R.verdicts(res), ["PASS"])
+        info = " ".join(res["results"][0]["info"])
+        self.assertIn("daily loss", info)
+        self.assertIn("total risk before this", info)
+
+    def test_todays_losses_count_the_open_risk_way_beside_the_cap(self):
+        # "daily_loss_count": "open_risk": two entries stopped out for $60 each and one still open with $20 at risk
+        dr = total(20.0)
+        dr["entries"] = [{"fingerprint": "f1", "counted_usd": 60.0}, {"fingerprint": "f2", "counted_usd": 60.0},
+                         {"fingerprint": "f3", "counted_usd": 20.0}]
+        res = check.check([R.tsla()], R.cfg(daily_loss_count="open_risk", **CAP), state=THREE, now=R.at(R.NOW), day_risk=dr)
+        self.assertIn("daily loss: $140 lost or still at risk", R.reasons(res))
+        dr["entries"][0]["counted_usd"] = 0.0                           # a winner: its risk is freed
+        res = check.check([R.tsla()], R.cfg(daily_loss_count="open_risk", **CAP), state=THREE, now=R.at(R.NOW), day_risk=dr)
+        self.assertEqual(R.verdicts(res), ["PASS"])
 
     def test_a_buy_that_takes_the_total_over_the_cap_is_refused(self):
         risk = check.check([R.tsla()], R.cfg(**CAP), now=R.at(R.NOW), day_risk=total(0.0))["results"][0]["max_loss"]
@@ -89,6 +113,66 @@ class TheCap(unittest.TestCase):
         for bad in ("lots", 0, 0.1, 50):
             with self.assertRaises(ValueError, msg=bad):
                 day_risk.total_cap_pct({"max_total_risk_pct": bad})
+
+
+SPLIT = {"risk_caps_pct": {"drift": 2, "news": 2, "intraday": 1}, "max_trades_per_day": 9}
+
+
+def split(at=R.NOW, day=R.TODAY, account_usd=5000.0, **by):
+    """day-risk.json with the risk at the stops under each strategy, in dollars."""
+    return {"date": day, "built_at": RE.built_at(at),
+            "total": {"open_risk_usd": sum(by.values()), "account_usd": account_usd, "by_strategy_usd": dict(by)}}
+
+
+class ACapForEachStrategy(unittest.TestCase):
+    """"risk_caps_pct": drift 2%, news 2%, intraday 1% of the account. One strategy cannot block another."""
+
+    def test_a_full_news_or_drift_book_does_not_block_a_day_trade(self):
+        res = check.check([R.tsla()], R.cfg(**SPLIT), now=R.at(R.NOW), day_risk=split(news=100.0, drift=100.0))
+        self.assertEqual(R.verdicts(res), ["PASS"])                     # intraday: $46.88 against its own $50
+        self.assertEqual(res["today"]["total_risk_cap"], 50.0)
+        self.assertIn("the day trades held", " ".join(res["results"][0]["info"]))
+
+    def test_a_day_trade_is_held_to_intradays_one_percent(self):
+        res = check.check([R.tsla()], R.cfg(**SPLIT), now=R.at(R.NOW), day_risk=split(intraday=10.0))
+        self.assertEqual(R.verdicts(res), ["BLOCK"])
+        self.assertIn("total risk:", R.reasons(res))
+        self.assertIn("1% of the account", R.reasons(res))
+
+    def test_news_is_held_to_its_own_two_percent_whatever_the_others_hold(self):
+        full = check.check([no_target()], R.cfg(**SPLIT), now=R.at(R.NOW), day_risk=split(news=60.0), strategy="news")
+        self.assertIn("the news holdings", R.reasons(full))             # 60 + 46.88 is over 2% of 5,000
+        self.assertIn("2% of the account", R.reasons(full))
+        ok = check.check([no_target()], R.cfg(**SPLIT), now=R.at(R.NOW), strategy="news",
+                         day_risk=split(news=50.0, drift=100.0, intraday=50.0))
+        self.assertEqual(R.verdicts(ok), ["PASS"])
+        self.assertEqual(ok["today"]["total_risk_cap"], 100.0)
+
+    def test_the_overall_cap_is_not_what_decides_once_each_strategy_has_its_own(self):
+        cfg = R.cfg(max_total_risk_pct=4, **SPLIT)
+        res = check.check([R.tsla()], cfg, now=R.at(R.NOW), day_risk=split(news=100.0, drift=100.0))
+        self.assertEqual(R.verdicts(res), ["PASS"])                     # 4% is used up by the others; intraday has its own 1%
+
+    def test_unknown_blocks(self):
+        no_split = total(0.0)                                           # a total, but not by strategy
+        for doc in (None, no_split, split(day="2026-10-16")):
+            res = check.check([R.tsla()], R.cfg(**SPLIT), now=R.at(R.NOW), day_risk=doc)
+            self.assertEqual(R.verdicts(res), ["BLOCK"], doc)
+            self.assertIn("is not known", R.reasons(res))
+        cfg = R.cfg(risk_caps_pct={"drift": 2}, max_trades_per_day=9)   # no cap written for intraday
+        res = check.check([R.tsla()], cfg, now=R.at(R.NOW), day_risk=split())
+        self.assertIn("no cap for 'intraday'", R.reasons(res))
+
+    def test_the_setting_is_checked(self):
+        for bad in ("2", [], {}, {"news": "lots"}, {"news": -1}, {"news": 50}, {"news": True}):
+            with self.assertRaises(check.RiskError, msg=bad):
+                check.check([R.tsla()], R.cfg(risk_caps_pct=bad), now=R.at(R.NOW), day_risk=split())
+            with self.assertRaises(ValueError, msg=bad):
+                day_risk.caps_pct({"risk_caps_pct": bad})
+        self.assertIsNone(day_risk.caps_pct({}))
+        self.assertEqual(day_risk.caps_pct(SPLIT), {"drift": 2.0, "news": 2.0, "intraday": 1.0})
+        self.assertTrue(day_risk.caps_on(SPLIT))
+        self.assertFalse(day_risk.caps_on({}))
 
 
 class AHoldingIsNotADayTrade(unittest.TestCase):
@@ -158,6 +242,9 @@ class TotalFromTheAccount(test_eod_close.Close):
         self.assertAlmostEqual(t["open_risk_usd"], round(round(want / 1.25, 2) * 1.25, 2), places=1)
         self.assertEqual(t["account_usd"], 6250.0)
         self.assertEqual([c[0] for c in self.router.calls if c[0] != "GET"], [])     # read-only
+        self.assertEqual(sorted(t["by_strategy_usd"]), ["drift", "news"])            # each strategy's own share
+        self.assertAlmostEqual(sum(t["by_strategy_usd"].values()), t["open_risk_usd"], places=1)
+        self.assertAlmostEqual(t["by_strategy_gbp"]["drift"], round(3 * (10.0 + 0.0015 * 510.0) / 1.25, 2), places=2)
 
 
 class TheFileForTraderRisk(test_eod_close.Close):
@@ -195,6 +282,27 @@ class DriftObeysTheCap(test_drift_buy.DriftBase):
         self.assertEqual(res["bought"], [])
         self.assertIn("max_total_risk_pct", res["skipped"][0][1])
         self.assertEqual(self.router.posts(), [])
+
+    def test_with_its_own_cap_another_strategys_risk_does_not_stop_drift(self):
+        cfg = dict(self.cfg, max_total_risk_pct=4, risk_caps_pct={"drift": 2, "news": 2, "intraday": 1})
+        self.write("config.json", cfg)
+        naked = {"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 10, "quantityAvailableForTrading": 10,
+                 "currentPrice": 200.0, "averagePricePaid": 200.0}      # not a drift position: not drift's risk
+        self.account(positions=[naked])
+        res = self.buy(cfg)
+        self.assertEqual([b["symbol"] for b in res["bought"]], ["TSLA"], res)
+
+    def test_drift_is_held_to_its_own_cap(self):
+        cfg = dict(self.cfg, risk_caps_pct={"drift": 0.1, "news": 2, "intraday": 1})     # GBP 5: under one drift buy
+        self.write("config.json", cfg)
+        self.account()
+        res = self.buy(cfg)
+        self.assertEqual(res["bought"], [])
+        self.assertIn("risk_caps_pct.drift", res["skipped"][0][1])
+        self.assertEqual(self.router.posts(), [])
+        bad = dict(self.cfg, risk_caps_pct="two")
+        self.write("config.json", bad)
+        self.assertEqual(self.buy(bad)["status"], "bad risk_caps_pct")
 
     def test_inside_the_cap_it_buys_as_before(self):
         cfg = dict(self.cfg, max_total_risk_pct=4)

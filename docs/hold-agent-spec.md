@@ -18,6 +18,17 @@ the owner's approval on Telegram.
 | The S&P 500 | Shown in reports for information only. Never a pass or fail test |
 | First fix | The failing em-dash test (it read a saved news headline in the local state folder) |
 
+**Later on 16 Nov (the owner's changes after the first build):**
+
+| Topic | Decision |
+|---|---|
+| Daily loss limit | The 3% daily loss limit is back, for day trades only, until the day-trading scanner is retired |
+| Risk cap | Split by strategy so one cannot block another: drift 2%, news 2%, intraday 1% of the account (settings). They add up to 5%; the single 4% line no longer stops a buy |
+| A mismatch | Pauses new buys until the record and the broker agree. One message. Nothing is sold or fixed |
+| The daily review | Built, report only: it says what it would sell or ask about |
+| News runs | Two a day: 06:00 UK (into the 07:30 briefing) and 08:30 New York (a short update; a message only if something changed). A run that cannot finish in time is skipped, and nothing is bought from a run that did not finish |
+| News quality | Confidence (only "high" may be bought), how far the share has already moved, a sell date at most 10 trading days after the event unless a reason is given, a 5% price check at buy time, results by confidence on Fridays |
+
 ## 1. Where the drift build stood on 16 Nov
 
 | Stage | What it is | Status |
@@ -102,8 +113,8 @@ The agent reads what the broker says is held and compares it with the pages.
 | A stop order for a share that is not held | A leftover order |
 
 On a mismatch the agent sends one message naming the stock, what the record says and what the broker
-says. It does not sell, buy, or edit the page to fix it. The first version only reports. Pausing new
-buys on a mismatch comes with the daily review.
+says. It does not sell, buy, or edit the page to fix it. While the mismatch stands, new buys are paused
+(built 16 Nov); they come back by themselves when the two agree again.
 
 The one automatic repair is the safety net: the guard already puts back a missing stop.
 
@@ -183,5 +194,5 @@ All offline, with the fake broker, phone and clock.
 1. Fix the failing test. Save this spec.
 2. The holdings record and the daily match, report-only. "Keep and report" becomes the default at the close.
 3. The "news" strategy in shadow: ideas logged, nothing bought.
-4. The daily review in report-only mode, then rule sales, then approval sales.
+4. The daily review in report-only mode (done 16 Nov), then rule sales, then approval sales.
 5. Retire the day-trading scan last.

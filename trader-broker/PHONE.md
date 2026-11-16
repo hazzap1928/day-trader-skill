@@ -79,10 +79,14 @@ keep the full detail.
 | ☀️ Good morning | 07:30 UK on weekdays (`briefing.py`) |
 | 📊 Day summary | about 15:55 New York: the day and week in pounds, each trade, past trades vs today, how the US market moved (`"report": {"market_line": true}`), tomorrow's earnings watchlist |
 | 📊 Week summary | every Friday after the close while the forward test is on: on track or not (does it make money after fees), this week and since the start. The S&P 500 is shown to compare, not as a test |
-| 📰 Today's news ideas | about 12:00 UK on weekdays, a few minutes after the news run starts: each idea in a sentence, its event date, when it would be sold, and how much it would buy. "Practice only: nothing is bought" unless `news.buy_enabled` is on |
-| ⚠️ news ideas run failed | the morning Claude run did not work: no ideas that day, and nothing is bought because of it. Once a day at most |
+| 📰 News ideas (inside the ☀️ morning briefing) | 07:30 UK: the ideas from the 06:00 review, each in a sentence with its confidence, its event date, when it would be sold and how much it would buy. "practice only, nothing is bought" unless `news.buy_enabled` is on. If the review failed or has not finished, the briefing says so |
+| 📰 Today's news ideas | only when the 06:00 review ran late, after the briefing had gone |
+| 📰 News ideas: update before the US market opens | about 13:30 UK (08:30 New York), **only if something changed**: an idea dropped (with the reason) or a new one added |
+| ⚠️ news check failed / didn't run in time | a Claude run did not work or the Mac was not awake in time. If your Claude plan had hit its usage limit it says so. Nothing is bought on news that day. Once a day at most |
 | 🟢 Bought X on a news idea | only with `news.buy_enabled` on: shares, cost, the safety net, why, and the sell-by date |
 | 👀 Sell X? + Approve / Reject | a share bought on a news idea whose reason now looks broken. Approve sells it just before the US market next closes. Reject, or no answer, keeps it. Its safety net stays either way |
+| 🗂️ Daily review of what I'm holding | after the evening report, only when something is held or something is wrong: whether my records match Trading 212, whether every holding has its safety net, whether the cash and risk limits are met, each holding's result after fees, what is due to be sold, and what I'd ask you about. Report only: it sells nothing |
+| 🔎 My records and Trading 212 don't match ... ⏸️ I've paused new buys | the two disagree (a share I have no record of, a missing safety net, a different number of shares). Nothing is sold or changed; new buys wait. ✅ follows when they match again |
 | 🔎 My records and Trading 212 don't match | the daily check of the holdings record found a difference (a share with no record, no safety net, a different number of shares). Nothing is changed: it is only reported, once |
 
 The autopilot is **always on**: launchd starts `com.daytraderskill.autopilot` at login and restarts it if

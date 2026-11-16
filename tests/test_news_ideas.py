@@ -31,6 +31,7 @@ M = t212.messages()
 D = datetime.date
 DAY = D(2026, 11, 5)                                     # Thursday
 UTC_0700 = float(calendar.timegm((2026, 11, 5, 12, 0, 0)))          # 07:00 New York: the morning run
+UTC_0840 = float(calendar.timegm((2026, 11, 5, 13, 40, 0)))          # 08:40 New York: the update before the open
 UTC_0935 = float(calendar.timegm((2026, 11, 5, 14, 35, 0)))
 NY_0935 = datetime.datetime(2026, 11, 5, 9, 35)
 TICKER = "TSLA_US_EQ"
@@ -42,7 +43,15 @@ def idea(**over):
     return dict({"symbol": "TSLA", "company": "Tesla", "summary": "Robotaxi launch in two weeks.",
                  "why": "The robotaxi launch could lift sales expectations.", "event": "Robotaxi launch event",
                  "event_date": "2026-11-19", "wrong_if": "The launch is delayed or cancelled.",
-                 "sell_rule": "Sell a week after the launch.", "sell_date": "2026-11-27", "sources": list(SRC)}, **over)
+                 "sell_rule": "Sell a week after the launch.", "sell_date": "2026-11-27", "sources": list(SRC),
+                 "confidence": "high", "confidence_why": "The date is confirmed by the company.",
+                 "moved_pct": 1.0, "moved_note": "Up about 1% since the date was announced."}, **over)
+
+
+def keep(*symbols, **extra):
+    """An update answer that keeps each of these morning ideas."""
+    return json.dumps(dict({"checks": [{"symbol": x, "keep": True, "why": "nothing new against it"} for x in symbols],
+                            "ideas": [], "reviews": [], "notes": ""}, **extra))
 
 
 def answer(*ideas, **extra):
@@ -82,12 +91,16 @@ class NewsBase(DriftBase):
             return text
         return fake
 
-    def run_news(self, text, cfg=None, client="demo", today=DAY, force=False, bars_fn=None):
+    def run_news(self, text, cfg=None, client="demo", today=DAY, force=False, bars_fn=None, kind="main"):
         return news.run(self.dir, cfg or self.cfg, client=self.client if client == "demo" else client, today=today,
                         now_utc=datetime.datetime.utcfromtimestamp(self.clock[0]), claude=self.claude(text),
                         bars_fn=bars_fn or (lambda sym, a, b: bars()),
                         push=lambda t, once_key=None: self.pushed_news.append((t, once_key)),
-                        say=self.said_news.append, force=force, rate=RATE)
+                        say=self.said_news.append, force=force, rate=RATE, kind=kind)
+
+    def briefing_gone(self, day="2026-11-05"):
+        """The 07:30 briefing has already started, so a main run's ideas get a message of their own."""
+        self.write("state/briefing.json", {"started": day})
 
     def writes(self):
         return [c for c in self.router.calls if c[0] != "GET"]
@@ -215,7 +228,7 @@ class Words(unittest.TestCase):
 
     def test_it_must_look_forward(self):
         self.assertIn("in the past", self.why(event_date="2026-11-04"))
-        self.assertIsNone(self.why(event_date="2026-11-05"))
+        self.assertIsNone(self.why(event_date="2026-11-05", sell_date="2026-11-12"))
         self.assertIn("after today", self.why(sell_date="2026-11-05"))
         self.assertIn("over 120 days", self.why(sell_date="2027-06-01"))
 
@@ -235,6 +248,7 @@ class Words(unittest.TestCase):
 class ShadowRun(NewsBase):
     def test_an_idea_is_logged_checked_and_told_and_nothing_is_bought(self):
         self.reads()
+        self.briefing_gone()
         doc = self.run_news(answer(idea(), idea(symbol="NVDA"), idea(symbol="AAPL", sources=[])))
         self.assertEqual(doc["status"], "ok")
         self.assertEqual([r["symbol"] for r in doc["ideas"]], ["TSLA"])
@@ -270,6 +284,7 @@ class ShadowRun(NewsBase):
         self.assertEqual(news.load_ideas(self.dir), [])                 # a forced re-run replaces today's rows
 
     def test_a_failed_claude_run_is_logged_told_once_and_leaves_nothing_to_buy(self):
+        self.briefing_gone()
         for failure in (news.NewsError("the Claude run ended with code 1: not logged in"), "I could not do that."):
             self.pushed_news[:] = []
             doc = self.run_news(failure, force=True)
@@ -321,7 +336,7 @@ class ShadowRun(NewsBase):
         doc = self.run_news(answer(idea(), idea(), idea(symbol="AAPL")), cfg=cfg)
         self.assertEqual([r["symbol"] for r in doc["ideas"]], ["TSLA"])
         self.assertEqual(sorted(r["why_not"] for r in doc["rejected"]),
-                         ["a second idea for the same company today", "over news.max_ideas (1) for one day"])
+                         ["a second idea for the same company today", "over news.max_ideas (1) for one run"])
 
     def test_an_idea_over_the_total_risk_cap_is_rejected(self):
         naked = {"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 5, "currentPrice": 200.0, "averagePricePaid": 200.0}
@@ -378,6 +393,7 @@ class ShadowRun(NewsBase):
 
     def test_the_phone_message_is_plain_english(self):
         self.reads()
+        self.briefing_gone()
         self.run_news(answer(idea(why="Margins & sales <up>")))
         text = self.pushed_news[0][0]
         for jargon in ("SHADOW", "Time Machine", "_US_EQ", "trader-risk", "ATR", "EVIDENCE", " R ", "fingerprint"):
@@ -387,6 +403,7 @@ class ShadowRun(NewsBase):
         empty = M.news_ideas({"ideas": [], "rejected": [{}], "buying": False})
         self.assertIn("No idea passed the checks today", empty)
         self.assertIn("&lt;up&gt;", M.news_ideas({"ideas": [dict(idea(summary="", why="Sales <up>"), cost_gbp=1.0)]}))
+        self.assertIn("high confidence", text)
 
 
 class VirtualResults(unittest.TestCase):
@@ -462,9 +479,14 @@ class Buying(NewsBase):
         self.on = dict(self.cfg, news={"buy_enabled": True})
         self.write("config.json", self.on)
 
-    def morning(self, *ideas, **kw):
+    def morning(self, *ideas, update=True, **kw):
+        """The main review at 07:00 New York, then (unless update is False) the update at 08:40 that keeps it all."""
         self.reads()
         doc = self.run_news(answer(*(ideas or (idea(),))), cfg=self.on, **kw)
+        if update is not False:
+            self.clock[0] = UTC_0840
+            doc = self.run_news(update if isinstance(update, str) else keep(*[r["symbol"] for r in doc["ideas"]]),
+                                cfg=self.on, kind="update")
         self.router.routes.clear()
         self.router.calls.clear()
         self.clock[0] = UTC_0935

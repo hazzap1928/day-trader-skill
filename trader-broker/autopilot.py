@@ -368,6 +368,9 @@ class Pilot(object):
         self.s = settings(self.cfg)
         if self.state.get("paused"):
             return "paused from your phone: no scan"
+        why = self.hold_pause()
+        if why:
+            return why + ": no scan"
         if self.pending():
             return "a ticket is waiting for your answer: no new scan"
         if self.cap_reached():
@@ -713,7 +716,7 @@ class Pilot(object):
         is removed, so trader-risk counts the old, stricter way (full risk of every entry today)."""
         dr = mod("trader-broker", "day_risk")
         try:
-            cap = dr.total_cap_pct(self.cfg)     # the cap on total risk across all holdings, when it is set
+            cap = dr.caps_on(self.cfg)           # a cap on risk at the stops (per strategy, or one total)
             if dr.count_of(self.cfg) != "open_risk" and not cap:
                 return
         except ValueError:
@@ -1224,9 +1227,17 @@ class Pilot(object):
         day = f.get("max_daily_loss_gbp", c.get("max_daily_loss_gbp"))
         n = len(t212.allowed_tickers(self.cfg) or [])
         cap = t212._num(c.get("max_total_risk_pct"))
-        if cap and t212._num(c.get("budget_gbp")):
-            return "Most I'll risk: %s a trade, %s across everything held. Choosing from %d companies" % (
-                M.gbp(per), M.gbp(float(c["budget_gbp"]) * cap / 100.0), n)
+        caps = c.get("risk_caps_pct") if isinstance(c.get("risk_caps_pct"), dict) else None
+        budget = t212._num(c.get("budget_gbp"))
+        if caps and budget:
+            words = {"drift": "earnings trades", "news": "news ideas", "intraday": "day trades"}
+            parts = ["%s on %s" % (M.gbp(budget * float(v) / 100.0), words.get(k, k)) for k, v in caps.items()
+                     if t212._num(v)]
+            return "Most I'll risk: %s a trade; at most %s at once; %s lost in a day on day trades. Choosing from %d companies" % (
+                M.gbp(per), ", ".join(parts), M.gbp(day), n)
+        if cap and budget:
+            return "Most I'll risk: %s a trade, %s across everything held, %s lost in a day on day trades. Choosing from %d companies" % (
+                M.gbp(per), M.gbp(budget * cap / 100.0), M.gbp(day), n)
         return "Most I'll risk: %s a trade, %s a day. Choosing from %d companies" % (M.gbp(per), M.gbp(day), n)
 
     def holdings(self):
@@ -1311,7 +1322,7 @@ class Pilot(object):
             self.evidence_close(report)
         self.drift_resolve()
         self.drift_sells()
-        self.holdings_match()
+        self.daily_review(self.holdings_match())
 
     # ------------------------------------------------------------ the holdings record and the news strategy
 
@@ -1323,9 +1334,29 @@ class Pilot(object):
         nw.t212, nw.drift, nw.allocation, nw.holdings, nw.holdings_t212 = t212, mod("trader-broker", "drift"), allocation, h, ht
         return nw
 
+    def pause_on_mismatch(self):
+        h = self.cfg.get("holdings") if isinstance(self.cfg.get("holdings"), dict) else {}
+        return h.get("pause_on_mismatch", True) is not False
+
+    def hold_pause(self, recheck=True):
+        """Why new buys are paused by the holdings match, or None. While paused, the match is run again (at
+        most every 10 minutes, read-only) so buying comes back by itself once the record and Trading 212 agree."""
+        try:
+            h = mod("trader-broker", "holdings")
+            p = h.paused(self.sd) if self.pause_on_mismatch() else None
+            if p and recheck and _now() - getattr(self, "_pause_checked", 0) >= 600:
+                self._pause_checked = _now()
+                self.holdings_match()
+                p = h.paused(self.sd)
+            return h.pause_words(p) if p else None
+        except Exception as e:
+            self.say("holdings pause: could not be read (%s)" % t212.scrub(e, self.client._secrets))
+            return None
+
     def holdings_match(self):
         """The daily match of the holdings record against Trading 212 (report only: it never places, cancels
-        or fixes anything). New disagreements go to the phone once. Never stops the day."""
+        or fixes anything). New disagreements go to the phone once; a real disagreement pauses new buys until
+        it is gone (one message when it starts, one when it ends). Never stops the day. Returns the result."""
         try:
             nw = self.news()
             rate = self.rate()
@@ -1337,15 +1368,36 @@ class Pilot(object):
             report = mod("trader-broker", "report")
             report.t212, report.tk = t212, tk
             res = nw.holdings_t212.daily_match(self.client, self.sd, rate, _ny().date().isoformat(), report,
-                                               ideas=nw.ideas_by_id(self.sd))
+                                               ideas=nw.ideas_by_id(self.sd), pause=self.pause_on_mismatch())
             self.say(nw.holdings_t212.text(res))
-            if res["new"]:
-                phone_mod.push(self.sd, M.holdings_mismatch(res["new"]), phone=self.phone)
+            if res["pause"] == "started":         # one message: what disagrees, and that buying is paused
+                keys = {m["key"] for m in res["pausing"]}
+                rows = res["pausing"] + [m for m in res["new"] if m["key"] not in keys]
+                phone_mod.push(self.sd, M.holdings_mismatch(rows, paused=True), phone=self.phone)
+            elif res["new"]:
+                phone_mod.push(self.sd, M.holdings_mismatch(res["new"], paused=bool(res["pausing"])), phone=self.phone)
+            if res["pause"] == "ended":
+                phone_mod.push(self.sd, M.holdings_match_again(), phone=self.phone)
             for ev, page in res["events"]:
                 if ev == "closed" and page.get("strategy") == "news":
                     phone_mod.push(self.sd, M.news_sold(page), phone=self.phone)
+            return res
         except Exception as e:
             self.say("holdings match: could not check today (%s)" % t212.scrub(e, self.client._secrets))
+            return None
+
+    def daily_review(self, res):
+        """The daily review of what is held (trader-broker/review.py), after the closing report and the match.
+        REPORT ONLY: it says what it would sell or ask about. Never stops the day."""
+        try:
+            nw = self.news()
+            rv = mod("trader-broker", "review")
+            rv.t212, rv.drift, rv.holdings, rv.holdings_t212 = t212, nw.drift, nw.holdings, nw.holdings_t212
+            rv.run(self.sd, self.drift_cfg(), res, _ny().date(), bars_fn=nw.drift.daily_bars, say=self.say,
+                   push=lambda text: phone_mod.push(self.sd, text, phone=self.phone),
+                   asks=nw.load_asks(self.sd)["asks"])
+        except Exception as e:
+            self.say("daily review: could not be done (%s)" % t212.scrub(e, self.client._secrets))
 
     def news_buy_due(self, ny):
         if self.state.get("news_buy") == self.state.get("day"):
@@ -1375,7 +1427,8 @@ class Pilot(object):
                 rate = self.rate()
             if not rate:
                 raise PilotError("no GBP/USD rate in trader/fx.json")
-            res = nw.buy_today(self.client, self.sd, cfg, _ny(), rate, self.drift_quote, bool(self.state.get("paused")),
+            res = nw.buy_today(self.client, self.sd, cfg, _ny(), rate, self.drift_quote,
+                               bool(self.state.get("paused")) or self.hold_pause() or False,
                                self.say, lambda text: phone_mod.push(self.sd, text, phone=self.phone))
             self.say("news buy: %s; bought %s; skipped %s" % (
                 res["status"], ", ".join(b["symbol"] for b in res["bought"]) or "none",
@@ -1495,7 +1548,8 @@ class Pilot(object):
                 rate = self.rate()
             if not rate:
                 raise PilotError("no GBP/USD rate in trader/fx.json")
-            res = db.buy_today(self.client, self.sd, cfg, _ny(), rate, self.drift_quote, bool(self.state.get("paused")),
+            res = db.buy_today(self.client, self.sd, cfg, _ny(), rate, self.drift_quote,
+                               bool(self.state.get("paused")) or self.hold_pause() or False,
                                self.say, lambda text: phone_mod.push(self.sd, text, phone=self.phone))
             self.say("drift buy: %s; bought %s; skipped %s" % (
                 res["status"], ", ".join(b["symbol"] for b in res["bought"]) or "none",
@@ -1638,6 +1692,28 @@ class Pilot(object):
                os.path.join(self.sd, "logs", "briefing.log"))
         self.say("the morning briefing had not reached the phone: started it again")
 
+    def catch_up_news(self):
+        """A news run this Mac slept through (the 06:00 UK review, or the 08:30 New York update): start it now
+        if it can still finish in time, else write it down as skipped. Each at most once a day. A run that did
+        not finish is never bought on."""
+        try:
+            nw = self.news()
+            cfg = self.drift_cfg()
+            today = _ny().date().isoformat()
+            for kind, what, why in nw.catch_up(self.sd, cfg, _utc(), _local(_now())):
+                key = "news_catchup_" + kind
+                if self.state.get(key) == today:
+                    continue
+                self.state[key] = today
+                self.save()
+                # started as its own process either way: it marks a late run as skipped and tells the phone
+                _spawn([sys.executable, os.path.join(HERE, "news_ideas.py"), "run", "--kind", kind, "--state-dir", self.sd],
+                       os.path.join(self.sd, "logs", "news.log"))
+                self.say("news %s run: %s (%s)" % (kind, "had not started, so it was started now" if what == "run"
+                                                   else "missed, and too late to finish in time", why))
+        except Exception as e:
+            self.say("news catch-up: %s" % t212.scrub(e, self.client._secrets))
+
     def universe_refresh(self):
         """The weekly universe build (trader-scanner/universe.py), in the background so the phone keeps
         answering. Due every universe.refresh_day after refresh_at (UK time on this Mac), or at the next
@@ -1729,6 +1805,7 @@ class Pilot(object):
                 self.roll_day()
                 self.flush_phone()
                 self.catch_up_briefing()
+                self.catch_up_news()
                 self.universe_refresh()
                 self.news_asks()
                 st = alerts.market_status(_utc())
@@ -1774,6 +1851,7 @@ class Pilot(object):
             while _ny() < open_at:
                 self.flush_phone()
                 self.catch_up_briefing()
+                self.catch_up_news()
                 if getattr(self, "net_down", False):
                     self.net_down = False
                     _sleep(min(60.0, max(1.0, (open_at - _ny()).total_seconds())))

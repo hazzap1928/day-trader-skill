@@ -390,7 +390,19 @@ def build(client, state_dir):
     b["allocation"] = allocation_line(cfg, state_dir, session, prev, held, b["drift_rows"])
     b["todo"] = todo(b)
     b["drift"] = drift_line(state_dir, session, "briefing")
+    b["ideas"] = news_ideas_data(state_dir, session)
     return b
+
+
+def news_ideas_data(state_dir, session):
+    """This morning's news ideas (the 06:00 review, trader-broker/news_ideas.py) for the briefing, or None
+    when the strategy is off or cannot be read. Read-only: the briefing never runs or changes anything."""
+    try:
+        nw = _load("trader-broker", "news_ideas")
+        nw.t212 = t212
+        return nw.briefing_data(state_dir, session.isoformat())
+    except Exception:
+        return None
 
 
 def all_earnings(day):
@@ -552,6 +564,18 @@ def full_text(b):
             L.append("- %s: %s (%s), %s%s" % (label, e["symbol"], e["name"], e["when"], ", YOU HOLD IT" if e["held"] else ""))
     if b.get("drift"):
         L += ["", "## Post-earnings drift shortlist", "- " + b["drift"]]
+    d = b.get("ideas")
+    if d:
+        L += ["", "## News ideas (%s)" % ("buying ON" if d.get("buying") else "practice only: nothing is bought"),
+              "- this morning's review: %s" % {"ok": "done", "none": "not run yet", "running": "still running"}.get(
+                  d.get("state"), d.get("state"))]
+        for r in d.get("ideas") or []:
+            L.append("- %s (confidence %s: %s; already moved %s%%): %s Event: %s on %s. Wrong if: %s Sell by %s."
+                     % (r.get("symbol"), r.get("confidence"), r.get("confidence_why") or "no reason given",
+                        "?" if r.get("moved_pct") is None else "%g" % r["moved_pct"], r.get("why"), r.get("event"),
+                        r.get("event_date"), r.get("wrong_if"), r.get("sell_date")))
+        if d.get("rejected"):
+            L.append("- %d other idea(s) did not pass the checks (python3 trader-broker/news_ideas.py show)" % d["rejected"])
     if b.get("drift_rows"):
         L += ["", "## Drift positions (demo, held up to 20 trading days; expected overnight)"]
         L += ["- " + _drift_buy().holding_line(r) for r in b["drift_rows"]]
@@ -658,6 +682,9 @@ def phone_text(b, path, state_dir):
         watch = []
     if b.get("drift_rows"):
         watch = M.drift_holdings(b["drift_rows"]) + ([""] if watch else []) + watch
+    ideas = M.news_briefing(b.get("ideas"))
+    if ideas:
+        watch = list(watch) + ([""] if watch else []) + ideas
     return M.briefing(b, os.path.relpath(path, ROOT), watch=watch, held=held,
                       futures_pct=(sum(got) / len(got)) if got else None, problems=problems, news=news,
                       earnings_held=ear, reserved=reserved)

@@ -739,10 +739,24 @@ def drift_lines(sd, cfg, today):
         return ["", "## Post-earnings drift (demo)", "- no data (%s)" % str(e)[:120]]
 
 
+def _news():
+    nw = _load("trader-broker", "news_ideas")
+    nw.t212 = t212()
+    return nw
+
+
+def news_lines(sd, cfg):
+    """The Friday report's news-ideas section: virtual results by confidence. [] when it is off or unreadable."""
+    try:
+        return _news().friday_lines(sd, cfg) or []
+    except Exception as e:
+        return ["", "## News ideas (demo)", "- no data (%s)" % str(e)[:120]]
+
+
 def send_report(client, sd, cfg, report_mod, phone=None, environ=None):
     r = build_report(client, sd, cfg, report_mod)
     text = report_text(r)
-    extra = drift_lines(sd, cfg, r["today"])
+    extra = drift_lines(sd, cfg, r["today"]) + news_lines(sd, cfg)
     if extra:
         text = text + "\n" + "\n".join(extra)
     d = os.path.join(sd, "reports")
@@ -764,6 +778,12 @@ def phone_text(sd, cfg, r):
         drift = db.friday_phone(sd, cfg, r["today"])
     except Exception:
         drift = ["\u26a0\ufe0f The earnings-trades figures couldn't be read this week."]
+    try:
+        news = _news().friday_phone(sd, cfg)
+    except Exception:
+        news = None
+    if news:
+        drift = list(drift or []) + ([""] if drift else []) + list(news)
     return M.friday(r, drift)
 
 

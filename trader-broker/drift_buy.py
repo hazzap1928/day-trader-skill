@@ -445,7 +445,7 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
         return out
     if paused:
         for sym in names:
-            skip(sym, "paused from your phone (/pause)")
+            skip(sym, paused if isinstance(paused, str) else "paused from your phone (/pause)")
         out["status"] = "paused"
         return out
     try:
@@ -491,15 +491,26 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
         push(_msgs(sd).drift_none(err))
         return out
     risk_now = sum(r["risk_gbp"] for r in rows)
-    total_cap, total_now = None, 0.0
+    total_cap, total_now, cap_name = None, 0.0, "max_total_risk_pct"
     cap_pct = _num(cfg.get("max_total_risk_pct"))
-    if cap_pct:
-        # the cap on what ALL holdings (any strategy) could lose at their stops together: drift obeys it too
+    try:
+        caps = mod("trader-broker", "day_risk").caps_pct(cfg)
+    except ValueError as e:
+        for sym in ok:
+            skip(sym, str(e))
+        out["status"] = "bad risk_caps_pct"
+        release_all(sd, dayi, "bad risk_caps_pct")
+        return out
+    if caps is not None:
+        cap_pct, cap_name = caps.get("drift", 0.0), "risk_caps_pct.drift"
+    if cap_pct or caps is not None:
+        # the cap on risk at the stops: drift's own share (risk_caps_pct), else what ALL holdings could lose
         try:
             ht = mod("trader-broker", "holdings_t212")
             hh = mod("trader-broker", "holdings")
             ht.t212, ht.holdings = T, hh
-            total_now = hh.open_risk(ht.view(positions, pending, {}, state, guard, client.env, rate))["open_risk_gbp"]
+            risk = hh.open_risk(ht.view(positions, pending, {}, state, guard, client.env, rate))
+            total_now = risk["by_strategy"].get("drift", 0.0) if caps is not None else risk["open_risk_gbp"]
             total_cap = round(f["budget_gbp"] * cap_pct / 100.0, 2)
         except Exception as e:
             for sym in ok:
@@ -550,8 +561,9 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
             continue
         if total_cap is not None and total_now + sz["max_loss_gbp"] > total_cap + 0.005:
             settle(sd, dayi, sym, "released", "total-risk cap")
-            skip(sym, "the risk across all holdings would be GBP %.2f + GBP %.2f, over the GBP %.2f cap "
-                      "(max_total_risk_pct)" % (total_now, sz["max_loss_gbp"], total_cap))
+            skip(sym, "the risk across %s would be GBP %.2f + GBP %.2f, over the GBP %.2f cap "
+                      "(%s)" % ("drift's holdings" if caps is not None else "all holdings", total_now,
+                                sz["max_loss_gbp"], total_cap, cap_name))
             continue
         try:
             sell_date = T.drift_sell_date(day, s["hold_days"] - 1)

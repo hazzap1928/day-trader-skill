@@ -48,8 +48,18 @@ ROOT = os.path.dirname(HERE)
 
 DEFAULTS = {"enabled": True, "buy_enabled": False, "buy_at": "09:35", "max_ideas": 5, "max_positions": 5,
             "atr_mult": 3.0, "atr_days": 14, "max_hold_days": 120, "model": None, "timeout_min": 25,
-            "fx_fee": 0.0015, "slippage": 0.0005, "tracker": "SPY", "kronos_minutes": 10, "min_buy_gbp": 100.0}
+            "fx_fee": 0.0015, "slippage": 0.0005, "tracker": "SPY", "kronos_minutes": 10, "min_buy_gbp": 100.0,
+            "main_at": "06:00",              # UK time on this Mac: the main review (launchd starts it)
+            "update_at": "08:30",            # New York time: the shorter update before the US open
+            "update_timeout_min": 15, "update_model": None,
+            "max_move_pct": 5.0,             # at buy time: skip an idea that has moved more than this since proposed
+            "buy_confidence": "high",        # only ideas Claude marks with this confidence may be bought
+            "max_days_after_event": 10}      # trading days from the event to the sell date, unless a reason is given
 LAST_BUY = "15:30"               # New York: no news buy after this
+KINDS = ("main", "update")
+LEVELS = ("high", "medium", "low")
+MAIN_FROM = "00:00"              # New York: the main run belongs to the day that has begun there
+STALE_AFTER = 20 * 60            # seconds past its time limit before a run marked "running" counts as dead
 TEXT_MAX = 700
 CLAUDE_TOOLS = "WebSearch,WebFetch"
 
@@ -146,8 +156,21 @@ def settings(cfg):
     s.update({k: v for k, v in raw.items() if k in DEFAULTS})
     s["buy_enabled"] = raw.get("buy_enabled") is True
     s["enabled"] = raw.get("enabled", True) is not False
-    for k in ("max_ideas", "max_positions", "atr_days", "max_hold_days", "timeout_min", "kronos_minutes"):
+    for k in ("max_ideas", "max_positions", "atr_days", "max_hold_days", "timeout_min", "kronos_minutes",
+              "update_timeout_min", "max_days_after_event"):
         s[k] = int(s[k])
+    for k in ("buy_at", "main_at", "update_at"):
+        if not re.match(r"^\d{1,2}:\d{2}$", str(s[k])):
+            raise NewsError("news.%s must be a time like 09:35" % k)
+    if not 1 <= s["timeout_min"] <= 60 or not 1 <= s["update_timeout_min"] <= 60:
+        raise NewsError("news.timeout_min and news.update_timeout_min must be 1 to 60")
+    if not 0.5 <= float(s["max_move_pct"]) <= 50:
+        raise NewsError("news.max_move_pct must be 0.5 to 50")
+    if str(s["buy_confidence"]).lower() not in LEVELS:
+        raise NewsError("news.buy_confidence must be high, medium or low")
+    s["buy_confidence"] = str(s["buy_confidence"]).lower()
+    if not 1 <= s["max_days_after_event"] <= 250:
+        raise NewsError("news.max_days_after_event must be 1 to 250")
     if not 1 <= s["max_ideas"] <= 20 or not 1 <= s["max_positions"] <= 20:
         raise NewsError("news.max_ideas and news.max_positions must be 1 to 20")
     if not 0.5 <= float(s["atr_mult"]) <= 10:
@@ -248,11 +271,97 @@ def log_buy(sd, **fields):
 
 
 def read_today(sd, day):
-    """Today's ideas file, only when it is for `day` and the run was good. Else None."""
+    """Today's ideas file, only when it is for `day` and a run finished well. Else None."""
     doc = _read(today_path(sd), None)
     if not isinstance(doc, dict) or doc.get("day") != str(day) or doc.get("status") != "ok":
         return None
     return doc
+
+
+def day_doc(sd, day):
+    """Today's document whatever its state (a new, empty one when there is none for `day`)."""
+    doc = _read(today_path(sd), None)
+    if not isinstance(doc, dict) or doc.get("day") != str(day):
+        doc = {"day": str(day), "status": "failed", "ideas": [], "rejected": [], "runs": {}}
+    if not isinstance(doc.get("runs"), dict):
+        doc["runs"] = {}
+    return doc
+
+
+def run_state(doc, kind, s=None, now=None):
+    """A run's entry in today's document, or None. A run marked "running" for longer than its time limit
+    plus STALE_AFTER is dead (the Mac slept or it was killed): None, so it can be started again."""
+    r = (doc.get("runs") or {}).get(kind)
+    if not isinstance(r, dict):
+        return None
+    if r.get("status") == "running":
+        limit = (int((s or DEFAULTS)["timeout_min" if kind == "main" else "update_timeout_min"]) * 60) + STALE_AFTER
+        if (now if now is not None else _now()) - float(r.get("started") or 0) > limit:
+            return None
+    return r
+
+
+def _hm(text):
+    h, m = str(text).split(":")
+    return int(h), int(m)
+
+
+def _ny(now_utc):
+    return _t212().ticket_module().to_eastern(now_utc)
+
+
+def timing(kind, s, now_utc):
+    """("ok" | "early" | "late", why) for starting this run now. New York time decides.
+    main:   from midnight New York (06:00 UK is 01:00 or 02:00 there) until it can no longer finish before
+            the update starts. After that the update works alone.
+    update: from news.update_at (08:30 New York) until it can no longer finish before the buy step
+            (news.buy_at). A run that cannot finish in time is not started: nothing is bought on it."""
+    ny = _ny(now_utc)
+    at = lambda hm: ny.replace(hour=_hm(hm)[0], minute=_hm(hm)[1], second=0, microsecond=0)
+    if kind == "main":
+        last = at(s["update_at"]) - datetime.timedelta(minutes=s["timeout_min"])
+        if ny > last:
+            return "late", "it is %s in New York: the main review could not finish before the %s update" % (
+                ny.strftime("%H:%M"), s["update_at"])
+        return "ok", ""
+    if ny < at(s["update_at"]):
+        return "early", "it is %s in New York, before the %s update time" % (ny.strftime("%H:%M"), s["update_at"])
+    last = at(s["buy_at"]) - datetime.timedelta(minutes=s["update_timeout_min"])
+    if ny > last:
+        return "late", "it is %s in New York: the update could not finish before the %s buy step" % (
+            ny.strftime("%H:%M"), s["buy_at"])
+    return "ok", ""
+
+
+def briefing_started(sd, day):
+    """True when today's 07:30 briefing has already started (so it can no longer carry the ideas)."""
+    mark = _read(os.path.join(sd, "state", "briefing.json"), {}) or {}
+    return mark.get("started") == str(day) or mark.get("sent") == str(day)
+
+
+def todays(rows, day):
+    return [r for r in rows if r.get("day") == str(day)]
+
+
+def in_book(row, s):
+    """Would this passed idea be bought with buying on? Only those count toward the pretend book and the
+    caps: the right confidence, and not dropped by the update."""
+    return (row.get("verdict") == "passed" and row.get("confidence") == s["buy_confidence"]
+            and row.get("state") not in ("dropped", "unconfirmed"))
+
+
+def buyable(doc, s):
+    """(ideas that may be bought today, why none) from today's document. Only ideas the pre-open update
+    FINISHED and kept or added, with the confidence news.buy_confidence asks for. A run that failed, was
+    skipped, is still going, or finished after the buy time gives nothing."""
+    up = (doc.get("runs") or {}).get("update") or {}
+    if up.get("status") != "ok":
+        return [], "the update before the open did not finish (%s), so nothing is bought on news today" % (
+            up.get("status") or "it did not run")
+    if up.get("late"):
+        return [], "the update finished after the buy time, so nothing is bought on news today"
+    return [r for r in doc.get("ideas") or [] if r.get("state") in ("kept", "new")
+            and r.get("confidence") == s["buy_confidence"]], None
 
 
 # ---------------------------------------------------------------- the question for Claude
@@ -288,6 +397,13 @@ def prompt(day, names, s, held=()):
         "withdrawn, and so on).",
         "- \"sell_rule\" says in words when to sell; \"sell_date\" is the last day to hold, a weekday after today "
         "and at most %d days from today." % s["max_hold_days"],
+        "- The sell date should be within %d trading days after the event. If you want to hold longer, say why "
+        "in \"long_hold_reason\"; without a reason a longer hold is turned down." % s["max_days_after_event"],
+        "- \"confidence\" is low, medium or high: how sure you are that the event happens as dated AND that it "
+        "is not already in the price. \"confidence_why\" is one line. Be strict: high should be rare.",
+        "- \"moved_pct\" is your best estimate of how far the share price has ALREADY moved because of this news "
+        "(a number, percent, negative for a fall; 0 if not at all), with one line in \"moved_note\" saying since "
+        "when and where you saw it.",
         "- Do not give price targets or promises. Say plainly what is uncertain.",
         "- \"summary\" is one plain sentence a non-investor can read on a phone, under 140 characters. Keep "
         "every other text under 500 characters.",
@@ -308,7 +424,9 @@ def prompt(day, names, s, held=()):
                                "why": "why the price should rise",
                                "event": "what happens", "event_date": "YYYY-MM-DD",
                                "wrong_if": "what would prove it wrong", "sell_rule": "when to sell, in words",
-                               "sell_date": "YYYY-MM-DD",
+                               "sell_date": "YYYY-MM-DD", "long_hold_reason": "",
+                               "confidence": "low | medium | high", "confidence_why": "one line",
+                               "moved_pct": 0.0, "moved_note": "one line",
                                "sources": [{"title": "...", "url": "https://...", "date": "YYYY-MM-DD"}]}],
                     "reviews": [{"symbol": "TICK", "broken": False, "why": "one sentence",
                                  "sources": [{"title": "...", "url": "https://...", "date": "YYYY-MM-DD"}]}],
@@ -318,6 +436,64 @@ def prompt(day, names, s, held=()):
         "; ".join("%s: %s" % (k, v) if v else k for k, v in names.items()),
     ]
     return "\n".join(lines)
+
+
+def update_prompt(day, names, s, held=(), morning=(), since="06:00 UK time"):
+    """The shorter question before the US open: keep or drop each morning idea, add any new one, and
+    review what is held. The answer must be one JSON object and nothing else."""
+    base = prompt(day, names, s, held).split("\n")
+    cut = next(i for i, line in enumerate(base) if line.startswith("ANSWER with exactly one JSON object"))
+    shape = json.loads(base[cut + 1])
+    shape = {"checks": [{"symbol": "TICK", "keep": True, "why": "one line"}], "ideas": shape["ideas"],
+             "reviews": shape["reviews"], "notes": shape["notes"]}
+    lines = [
+        "UPDATE BEFORE THE US OPEN. This is a short second look, about an hour before the US market opens. Be "
+        "quick: a few searches, not a long study. Look only for what is NEW since %s today: overnight and "
+        "pre-market news, and company results released before the open." % since,
+        "",
+    ]
+    if morning:
+        lines += ["CHECKS. These ideas were written down this morning. For EACH one answer in \"checks\": keep "
+                  "true or false, with a one-line reason. Drop it (keep false) if the news since then weakens it, "
+                  "the event moved or was cancelled, or the price has already jumped on it before the open:"]
+        for r in morning:
+            lines.append("- %s: %s | event: %s on %s | wrong if: %s" % (
+                r.get("symbol"), r.get("why"), r.get("event"), r.get("event_date"), r.get("wrong_if")))
+        lines += ["", "NEW IDEAS. Add an idea to \"ideas\" only if something new since this morning makes one; an "
+                      "empty list is the usual answer. Do not repeat a morning idea there.", ""]
+    else:
+        lines += ["There are no morning ideas to check today, so \"checks\" is an empty list.", ""]
+    lines.append("What an idea is, and the rules every idea and every source must meet, are as follows. In this "
+                 "update the checks come first and new ideas are optional.")
+    return "\n".join(base[:2] + lines + base[2:cut] + [base[cut], json.dumps(shape)] + base[cut + 2:])
+
+
+class Answer(str):
+    """Claude's answer text, with what the run used in .meta (time, turns, tokens, what it would have cost)."""
+    meta = None
+
+
+def _is_limit(text):
+    return bool(re.search(r"usage limit|limit reached|hit your .{0,20}limit|rate.?limit|out of (extra )?usage|"
+                          r"resets? at|quota", str(text or ""), re.I))
+
+
+def run_meta(doc):
+    """What one Claude run used, from its JSON envelope. Tokens are the plan's real currency; the dollar
+    figure is what the same run would cost on the paid API, a yardstick only (the plan is not billed by it)."""
+    u = doc.get("usage") if isinstance(doc.get("usage"), dict) else {}
+    out = {"seconds": round((_num(doc.get("duration_ms")) or 0) / 1000.0), "turns": doc.get("num_turns"),
+           "cost_usd_if_api": _num(doc.get("total_cost_usd")),
+           "tokens_in": int(sum(_num(u.get(k)) or 0 for k in ("input_tokens", "cache_creation_input_tokens",
+                                                                "cache_read_input_tokens"))),
+           "tokens_out": int(_num(u.get("output_tokens")) or 0)}
+    mu = doc.get("modelUsage")
+    if isinstance(mu, dict) and mu:
+        out["models"] = sorted(mu)
+    st = u.get("server_tool_use") if isinstance(u.get("server_tool_use"), dict) else {}
+    if st:
+        out["web_searches"], out["web_fetches"] = st.get("web_search_requests"), st.get("web_fetch_requests")
+    return out
 
 
 def claude_command(s):
@@ -338,12 +514,18 @@ def run_claude(text, s):
         raise NewsError("the claude command was not found at %s" % cmd[0])
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("T212_", "TELEGRAM_", "CLAUDECODE", "CLAUDE_CODE_"))}
+    if not env.get("USER"):                   # the Claude login is in the Keychain, which needs to know the user
+        try:
+            import pwd
+            env["USER"] = env["LOGNAME"] = pwd.getpwuid(os.getuid()).pw_name
+        except Exception:
+            pass
     work = tempfile.mkdtemp(prefix="news-run-")
     try:
         p = subprocess.run(cmd, input=text, capture_output=True, text=True, cwd=work, env=env,
                            timeout=int(s["timeout_min"]) * 60)
     except subprocess.TimeoutExpired:
-        raise NewsError("the Claude run took over %d minutes and was stopped" % s["timeout_min"])
+        raise NewsError("the Claude run took over %d minutes and was stopped" % int(s["timeout_min"]))
     except OSError as e:
         raise NewsError("the Claude run could not start (%s)" % e)
     finally:
@@ -351,15 +533,24 @@ def run_claude(text, s):
             os.rmdir(work)
         except OSError:
             pass
-    if p.returncode != 0:
-        raise NewsError("the Claude run ended with code %d: %s" % (p.returncode, (p.stderr or p.stdout).strip()[-300:]))
     try:
         doc = json.loads(p.stdout)
     except ValueError:
-        raise NewsError("the Claude run did not answer in JSON: %s" % p.stdout.strip()[:200])
-    if doc.get("is_error") or not isinstance(doc.get("result"), str):
-        raise NewsError("the Claude run reported an error: %s" % str(doc.get("result") or doc.get("subtype"))[:300])
-    return doc["result"]
+        doc = None
+    if p.returncode != 0 or not isinstance(doc, dict) or doc.get("is_error") or not isinstance(doc.get("result"), str):
+        said = str((doc or {}).get("result") or (doc or {}).get("subtype") or "") if isinstance(doc, dict) else ""
+        detail = (said or p.stderr or p.stdout or "").strip()
+        if p.returncode != 0:
+            e = NewsError("the Claude run ended with code %d: %s" % (p.returncode, detail[-300:]))
+        elif not isinstance(doc, dict):
+            e = NewsError("the Claude run did not answer in JSON: %s" % p.stdout.strip()[:200])
+        else:
+            e = NewsError("the Claude run reported an error: %s" % detail[:300])
+        e.limit = _is_limit(detail)            # the plan's usage limit: said plainly on the phone
+        raise e
+    out = Answer(doc["result"])
+    out.meta = run_meta(doc)
+    return out
 
 
 def parse(text):
@@ -381,6 +572,8 @@ def parse(text):
         raise NewsError("the answer has no \"ideas\" list")
     if not isinstance(doc.get("reviews", []), list):
         raise NewsError("the answer's \"reviews\" is not a list")
+    if not isinstance(doc.get("checks", []), list):
+        raise NewsError("the answer's \"checks\" is not a list")
     return doc
 
 
@@ -443,8 +636,26 @@ def validate(raw, today, s, allowed, blocked):
     src = clean_sources(raw.get("sources"), today)
     if not src:
         return None, "no dated source"
-    idea.update(event_date=ev.isoformat(), sell_date=sell.isoformat(), sources=src[:6])
+    after = trading_days_after(ev, sell)
+    idea["long_hold_reason"] = _text(raw.get("long_hold_reason"))
+    if after > s["max_days_after_event"] and len(idea["long_hold_reason"]) < 8:
+        return None, ("the sell date %s is %d trading days after the event, over the %d allowed, and no reason "
+                      "was given for holding longer" % (sell.isoformat(), after, s["max_days_after_event"]))
+    conf = _text(raw.get("confidence")).lower()
+    idea.update(event_date=ev.isoformat(), sell_date=sell.isoformat(), sources=src[:6], days_after_event=after,
+                confidence=conf if conf in LEVELS else "unknown", confidence_why=_text(raw.get("confidence_why"))[:240],
+                moved_pct=_num(raw.get("moved_pct")), moved_note=_text(raw.get("moved_note"))[:240])
     return idea, None
+
+
+def trading_days_after(event, sell):
+    """How many trading days the sell date is after the event (0 when it is on or before it)."""
+    D, n, d = _drift(), 0, event
+    while d < sell and n < 1000:
+        d += datetime.timedelta(days=1)
+        if D.is_trading_day(d):
+            n += 1
+    return n
 
 
 # ---------------------------------------------------------------- the account, the stop, the size
@@ -468,7 +679,10 @@ def _count(acct, row):
     """Add an idea that would be held to the account figures the next check uses (never to Trading 212)."""
     if acct is None:
         return
-    acct["risk"]["open_risk_gbp"] = round(acct["risk"]["open_risk_gbp"] + (_num(row.get("max_loss_gbp")) or 0.0), 2)
+    loss = _num(row.get("max_loss_gbp")) or 0.0
+    acct["risk"]["open_risk_gbp"] = round(acct["risk"]["open_risk_gbp"] + loss, 2)
+    by = acct["risk"].setdefault("by_strategy", {})
+    by["news"] = round(by.get("news", 0.0) + loss, 2)
     acct["cost"]["news"] = round(acct["cost"].get("news", 0.0) + (_num(row.get("cost_gbp")) or 0.0), 2)
 
 
@@ -487,6 +701,9 @@ def figures(cfg, acct=None):
     used = sum(v for k, v in cost.items() if k != "drift")
     room = investable - drift_used - used                  # what drift does not use, less what is already out
     cap_pct = _num(cfg.get("max_total_risk_pct"))
+    caps = cfg.get("risk_caps_pct") if isinstance(cfg.get("risk_caps_pct"), dict) else None
+    if caps is not None:
+        cap_pct = _num(caps.get("news"))          # news has its own cap: other strategies cannot use it up
     return {"budget_gbp": round(budget, 2), "investable_gbp": round(investable, 2),
             "drift_pool_gbp": round(drift_pool, 2), "drift_used_gbp": round(drift_used, 2),
             "room_gbp": round(max(room, 0.0), 2),
@@ -516,6 +733,7 @@ def risk_doc(acct, rate, now):
     v = acct["view"]
     return {"date": None, "built_at": now, "usd_per_gbp": rate,
             "total": {"open_risk_usd": round(acct["risk"]["open_risk_gbp"] * rate, 2),
+                      "by_strategy_usd": {k: round(x * rate, 2) for k, x in (acct["risk"].get("by_strategy") or {}).items()},
                       "account_usd": round((v.get("account_gbp") or 0.0) * rate, 2)}}
 
 
@@ -584,6 +802,11 @@ def virtual(row, bars, today, s, spy=None):
     if entry <= stop:
         return {"status": "not bought", "how": "opened at or under its stop", "entry": round(entry, 4), "pl_gbp": 0.0,
                 "as_of": days[-1].isoformat()}
+    prop = _num(row.get("price"))
+    if prop and abs(entry / prop - 1) * 100 > float(s["max_move_pct"]) + 1e-9:
+        return {"status": "not bought", "how": "opened %+.1f%% from the price when proposed, over %g%%" % (
+            100 * (entry / prop - 1), float(s["max_move_pct"])), "entry": round(entry, 4), "pl_gbp": 0.0,
+            "as_of": days[-1].isoformat()}
     exit_, how, last = None, None, days[-1]
     for d in days:
         o, h, l, c, _v = bars[d]
@@ -641,6 +864,71 @@ def tally(sd):
             "closed": len(done), "pl_gbp": round(sum(_num(r["virtual"].get("pl_gbp")) or 0.0 for r in rows), 2)}
 
 
+def by_confidence(sd):
+    """Virtual results of every passed idea, grouped by the confidence Claude gave it: does confidence mean
+    anything? {level: {"n", "closed", "wins", "pl_gbp", "avg_gbp"}}; an idea not bought (it opened under its
+    stop or too far from its proposed price) is left out."""
+    out = {}
+    for r in load_ideas(sd):
+        v = r.get("virtual") or {}
+        if r.get("verdict") != "passed" or v.get("status") not in ("open", "closed"):
+            continue
+        g = out.setdefault(r.get("confidence") or "unknown", {"n": 0, "closed": 0, "wins": 0, "pl_gbp": 0.0})
+        pl = _num(v.get("pl_gbp")) or 0.0
+        g["n"] += 1
+        g["closed"] += 1 if v.get("status") == "closed" else 0
+        g["wins"] += 1 if pl > 0 else 0
+        g["pl_gbp"] = round(g["pl_gbp"] + pl, 2)
+    for g in out.values():
+        g["avg_gbp"] = round(g["pl_gbp"] / g["n"], 2) if g["n"] else None
+    return out
+
+
+def friday_lines(sd, cfg):
+    """The news section of the Friday report file. None when the strategy is off."""
+    if not settings(cfg)["enabled"]:
+        return None
+    by, t = by_confidence(sd), tally(sd)
+    L = ["", "## News ideas (demo, %s)" % ("buying ON" if active(cfg) else "practice only: nothing is bought"),
+         "Virtual results in pounds after fees of every idea that passed the checks, by the confidence Claude gave "
+         "it. Only \"%s\" ideas may be bought; the rest are kept to compare. Untested: a few ideas prove nothing."
+         % settings(cfg)["buy_confidence"]]
+    for level in LEVELS + ("unknown",):
+        g = by.get(level)
+        if g:
+            L.append("- %s confidence: %d idea%s (%d finished), %d made money, total GBP %+.2f, average GBP %+.2f each"
+                     % (level, g["n"], "" if g["n"] == 1 else "s", g["closed"], g["wins"], g["pl_gbp"], g["avg_gbp"]))
+    if not by:
+        L.append("- no idea has a result yet")
+    L.append("- all passed ideas: %d, total GBP %+.2f" % (t["ideas"], t["pl_gbp"]))
+    return L
+
+
+def friday_phone(sd, cfg):
+    """The news part of the Friday phone message, or None when the strategy is off."""
+    if not settings(cfg)["enabled"]:
+        return None
+    return _msgs(sd).friday_news(by_confidence(sd), settings(cfg)["buy_confidence"], active(cfg))
+
+
+def briefing_data(sd, day):
+    """What the 07:30 briefing shows about news ideas: the main review's ideas, or that it failed or is
+    not finished. Never raises."""
+    try:
+        doc = day_doc(sd, day)
+        cfg = _read(os.path.join(sd, "config.json"), {}) or {}
+        s = settings(cfg)
+        if not s["enabled"] or cfg.get("paper") is not True:
+            return None
+        m = run_state(doc, "main", s) or {}
+        return {"state": m.get("status") or "none", "limit": bool(m.get("limit")), "why": m.get("why"),
+                "ideas": [r for r in doc.get("ideas") or [] if r.get("from", "main") == "main"],
+                "rejected": len([r for r in doc.get("rejected") or [] if r.get("from", "main") == "main"]),
+                "buying": active(cfg), "buy_confidence": s["buy_confidence"], "tally": tally(sd)}
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- extra information (never blocks)
 
 def _tool(args, timeout):
@@ -673,8 +961,9 @@ def kronos_for(row, timeout):
     return dict(v, note="Kronos looks hours ahead, an idea is held for weeks: information only")
 
 
-def add_info(sd, s, info_fn=None, kronos_fn=None, day=None):
-    """After the phone message: extra information on today's passing ideas, inside a time budget."""
+def add_info(sd, s, info_fn=None, kronos_fn=None, day=None, kronos=True):
+    """After the run: extra information on today's passing ideas, inside a time budget. kronos False (the
+    update, close to the open) leaves the slow Kronos verdict out."""
     rows = load_ideas(sd)
     mine = [r for r in rows if r.get("verdict") == "passed" and r.get("day") == str(day) and not r.get("info")]
     start, budget = _now(), s["kronos_minutes"] * 60
@@ -684,7 +973,7 @@ def add_info(sd, s, info_fn=None, kronos_fn=None, day=None):
         except Exception as e:
             r["info"] = {"error": str(e)[:120]}
     for r in mine:
-        left = budget - (_now() - start)
+        left = budget - (_now() - start) if kronos else 0
         if left < 240:
             r["kronos"] = {"verdict": "skipped", "why": "time budget"}
             continue
@@ -785,19 +1074,112 @@ def answer(sd, ask_id, nonce, approve):
     return ask["status"], ask
 
 
-# ---------------------------------------------------------------- the morning run
+# ---------------------------------------------------------------- the two runs of the day
+
+def begin(sd, kind, day, s, force=False):
+    """Mark this run as started in today's document, unless it has already run (or is running) today.
+    Returns (document, None) when it may go on, else (document, why not). One run of each kind a day."""
+    doc = day_doc(sd, day)
+    r = run_state(doc, kind, s)
+    if r and not force:
+        if r.get("status") == "running" and r.get("pid") == os.getpid():
+            return doc, None
+        return doc, "today's %s run %s" % (kind, {"ok": "is already done", "running": "is already running",
+                                                  "failed": "already failed (run --force to try again)",
+                                                  "skipped": "was skipped (run --force to run it anyway)"}
+                                           .get(r.get("status"), "has status %s" % r.get("status")))
+    if kind == "main" and not force and (run_state(doc, "update", s) or {}).get("status") in ("ok", "running"):
+        return doc, "the update before the open has already run, so the main review is not run after it"
+    doc["runs"][kind] = {"status": "running", "started": int(_now()), "pid": os.getpid()}
+    _write(today_path(sd), doc)
+    return doc, None
+
+
+def mark_skipped(sd, kind, day, why, s=None):
+    """Write down that a run was skipped (it could no longer finish in time). Returns today's document, or
+    None when that run already has an entry. Nothing is ever bought on a skipped run."""
+    doc = day_doc(sd, day)
+    r = run_state(doc, kind, s)
+    if r and not (r.get("status") == "running" and r.get("pid") == os.getpid()):
+        return None                               # (our own "running" mark, set before a wait, is replaced)
+    doc["runs"][kind] = {"status": "skipped", "at": int(_now()), "why": why}
+    _write(today_path(sd), doc)
+    log_run(sd, day=str(day), kind=kind, status="skipped", why=why)
+    return doc
+
+
+def catch_up(sd, cfg, now_utc, local, today=None):
+    """For the always-on autopilot: [(kind, "run" | "skip", why)] for a run the Mac slept through.
+    "run": start it now (it can still finish in time). "skip": it cannot, so it is written down as skipped.
+    A run gets 10 minutes of grace after its time before it counts as missed. `local` is this Mac's clock."""
+    D = _drift()
+    s = settings(cfg)
+    if not s["enabled"] or (cfg or {}).get("paper") is not True or (cfg or {}).get("live_enabled"):
+        return []
+    today = today or _ny(now_utc).date()
+    if not D.is_trading_day(today):
+        return []
+    doc = day_doc(sd, today)
+    ny, out = _ny(now_utc), []
+    grace = datetime.timedelta(minutes=10)
+    for kind in KINDS:
+        if run_state(doc, kind, s):
+            continue
+        if kind == "main":
+            h, m = _hm(s["main_at"])
+            if (local.hour, local.minute) < (h, m) or local < local.replace(hour=h, minute=m, second=0) + grace:
+                continue
+            if (run_state(doc, "update", s) or {}).get("status") in ("ok", "running", "failed", "skipped"):
+                continue
+        else:
+            h, m = _hm(s["update_at"])
+            if ny < ny.replace(hour=h, minute=m, second=0, microsecond=0) + grace:
+                continue
+        when, why = timing(kind, s, now_utc)
+        if when == "ok":
+            out.append((kind, "run", "it had not started"))
+        elif when == "late":
+            out.append((kind, "skip", why))
+    return out
+
+
+def _fail(sd, doc, kind, e, client, say, push, M, s):
+    T = _t212()
+    why = T.scrub(str(e), getattr(client, "_secrets", ()))[:300] if client is not None else str(e)[:300]
+    limit = bool(getattr(e, "limit", False))
+    doc["runs"][kind] = {"status": "failed", "at": int(_now()), "error": why, "limit": limit}
+    if kind == "main" or not any(r.get("status") == "ok" for r in doc["runs"].values()):
+        doc["error"] = why
+    doc["status"] = "ok" if any(r.get("status") == "ok" for r in doc["runs"].values()) else "failed"
+    _write(today_path(sd), doc)
+    log_run(sd, day=doc["day"], kind=kind, status="failed", error=why, limit=limit)
+    say("NEWS %s RUN FAILED (%s)%s: nothing is bought on a run that did not finish" % (
+        kind.upper(), why, " [the Claude plan's usage limit]" if limit else ""))
+    if kind == "update":
+        had = [r for r in doc.get("ideas") or [] if r.get("from", "main") == "main"]
+        push(M.news_update_failed(limit, len(had), s["buy_enabled"]), once_key="news-update-failed-" + doc["day"])
+    elif briefing_started(sd, doc["day"]):       # else the 07:30 briefing says it
+        push(M.news_failed(limit), once_key="news-failed-" + doc["day"])
+    return doc
+
 
 def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=None, push=None, say=None,
-        force=False, rate=None):
-    """The morning run. Returns today's document. Never raises for a failed Claude run: that is logged,
-    told once, and leaves today with no ideas, so nothing can be bought on it."""
+        force=False, rate=None, kind="main"):
+    """One of the day's two runs. kind "main": the 06:00 UK review, whose ideas go into the 07:30 briefing.
+    kind "update": the shorter look at 08:30 New York, which keeps or drops each morning idea, may add new
+    ones, and sends one short message only if something changed.
+
+    Returns today's document, or None when nothing was done (switched off, a holiday, too early). Never
+    raises for a failed Claude run: that is logged and told, and nothing can be bought on it."""
     D, T = _drift(), _t212()
     require_demo(cfg)
     s = settings(cfg)
+    if kind not in KINDS:
+        raise NewsError("kind must be main or update, not %r" % kind)
     say = say or (lambda text: print(text, flush=True))
     push = push or (lambda text, once_key=None: None)
-    today = today or D._today_ny()
     now_utc = now_utc or datetime.datetime.utcfromtimestamp(_now())
+    today = today or _ny(now_utc).date()
     bars_fn = bars_fn or D.daily_bars
     M = _msgs(sd)
     if not s["enabled"]:
@@ -806,15 +1188,34 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
     if not D.is_trading_day(today):
         say("news: the US market is closed today (%s): no run" % today.isoformat())
         return None
-    if read_today(sd, today) and not force:
-        say("news: today's run is already done")
-        return read_today(sd, today)
-    try:
-        say("news: %d virtual results updated" % resolve(sd, cfg, today, bars_fn))
-    except Exception as e:
-        say("news: virtual results not updated (%s)" % str(e)[:120])
+    if not force:
+        when, why = timing(kind, s, now_utc)
+        if when == "early":
+            say("news %s: not yet (%s)" % (kind, why))
+            return None
+        if when == "late":
+            doc = mark_skipped(sd, kind, today, why, s)
+            if doc is None:
+                say("news %s: %s; today's %s run already has an entry" % (kind, why, kind))
+                return day_doc(sd, today)
+            say("NEWS %s RUN SKIPPED: %s. Nothing is bought on a run that did not happen." % (kind.upper(), why))
+            had = [r for r in doc.get("ideas") or [] if r.get("from", "main") == "main"]
+            if kind == "update" and had:
+                push(M.news_update_missed(len(had), s["buy_enabled"]), once_key="news-update-missed-" + doc["day"])
+            return doc
+    doc, why = begin(sd, kind, today, s, force)
+    if why:
+        say("news %s: %s" % (kind, why))
+        return doc
+    doc.update(buying=s["buy_enabled"])
+    if kind == "main":
+        try:
+            say("news: %d virtual results updated" % resolve(sd, cfg, today, bars_fn))
+        except Exception as e:
+            say("news: virtual results not updated (%s)" % str(e)[:120])
     allowed, blocked, src = D.universe(cfg, sd)
     if not allowed:
+        _fail(sd, doc, kind, NewsError("no tradable universe or allowed_tickers to pick from"), client, say, push, M, s)
         raise NewsError("no tradable universe or allowed_tickers to pick from")
     sym_of = {}
     ucfg = _load("trader-scanner", "universe").apply(cfg, sd)[0]     # trader-risk checks the same list ideas come from
@@ -823,19 +1224,25 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
             sym_of[D.key(x)] = str(x).upper()
     held = [{"symbol": p["symbol"], "reason": p.get("reason"), "event": p.get("event"),
              "event_date": p.get("event_date"), "wrong_if": p.get("wrong_if")} for p in held_news(sd)]
-    doc = {"day": today.isoformat(), "status": "failed", "ideas": [], "rejected": [], "list_from": src,
-           "buying": s["buy_enabled"], "generated_utc": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    rows = load_ideas(sd)
+    # a re-run of this kind replaces its own rows of today; the other run's rows stay
+    rows = [r for r in rows if not (r.get("day") == doc["day"] and r.get("from", "main") == kind)]
+    morning = [r for r in todays(rows, doc["day"]) if r.get("from", "main") == "main" and r.get("verdict") == "passed"]
+    ks = dict(s)
+    if kind == "update":
+        left = int(((_ny(now_utc).replace(hour=_hm(s["buy_at"])[0], minute=_hm(s["buy_at"])[1], second=0, microsecond=0)
+                     - _ny(now_utc)).total_seconds()) // 60) - 1
+        ks.update(timeout_min=max(1, min(s["update_timeout_min"], left)) if not force else s["update_timeout_min"],
+                  model=s.get("update_model") or s.get("model"))
     try:
-        answer_text = (claude or run_claude)(prompt(today, names_for(sd, sym_of.values()), s, held), s)
+        names = names_for(sd, sym_of.values())
+        question = prompt(today, names, s, held) if kind == "main" else \
+            update_prompt(today, names, s, held, morning, "%s UK time" % s["main_at"])
+        answer_text = (claude or run_claude)(question, ks)
         got = parse(answer_text)
     except Exception as e:
-        why = T.scrub(str(e), getattr(client, "_secrets", ()))[:300] if client is not None else str(e)[:300]
-        doc["error"] = why
-        _write(today_path(sd), doc)
-        log_run(sd, day=doc["day"], status="failed", error=why)
-        say("NEWS RUN FAILED (%s): no ideas today, and nothing is bought on a failed run" % why)
-        push(M.news_failed(), once_key="news-failed-" + doc["day"])
-        return doc
+        return _fail(sd, doc, kind, e, client, say, push, M, s)
+    meta = getattr(answer_text, "meta", None)
     if rate is None:
         rate = _num((T._read_json(os.path.join(sd, "fx.json"), {}) or {}).get("usd_per_gbp"))
         if not rate:
@@ -852,28 +1259,50 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
             acct_note = T.scrub(str(e), client._secrets)[:120]
     if acct_note:
         say("news: the account could not be read (%s): no idea can pass the cash rules or the total-risk cap" % acct_note)
-    rows, seen = load_ideas(sd), set()
-    rows = [r for r in rows if r.get("day") != doc["day"]]            # a forced re-run replaces today's rows
-    held_n = len(held)
-    if acct is not None and not s["buy_enabled"]:
-        # SHADOW keeps a pretend book, so the caps bite as they would for real: earlier ideas that would
-        # still be held count toward the room, the total-risk cap and max_positions
+    changes = {"dropped": [], "new": []}
+    if kind == "update":
+        checks = {}
+        for c in got.get("checks") or []:
+            if isinstance(c, dict) and _text(c.get("symbol")):
+                checks[_text(c.get("symbol")).upper()] = c
+        for r in morning:
+            c = checks.get(r["symbol"])
+            if c is None:
+                r.update(state="unconfirmed", update_why="the update did not mention it, so it is not confirmed")
+            elif c.get("keep") is True:
+                r.update(state="kept", update_why=_text(c.get("why"))[:240])
+            else:
+                r.update(state="dropped", update_why=_text(c.get("why"))[:240] or "dropped without a reason")
+            if r["state"] != "kept":
+                changes["dropped"].append(r)
+    book_n = len(held)
+    if acct is not None:
+        # The pretend book: ideas that would be held count toward the room, the risk cap and max_positions,
+        # so the caps bite as they would for real. Only ideas that would actually be bought count (the
+        # confidence news.buy_confidence asks for, not dropped). In shadow that is earlier days' ideas still
+        # inside their sell date; with buying on, earlier days are in the real account already.
         for r in rows:
-            if (r.get("verdict") == "passed" and (r.get("virtual") or {}).get("status") in (None, "open")
-                    and (_date(r.get("sell_date")) or today) >= today):
+            mine = r.get("day") == doc["day"]
+            if not in_book(r, s) or (not mine and s["buy_enabled"]):
+                continue
+            if mine or ((r.get("virtual") or {}).get("status") in (None, "open")
+                        and (_date(r.get("sell_date")) or today) >= today):
                 _count(acct, r)
-                held_n += 1
+                book_n += 1
+    seen = {r["symbol"] for r in todays(rows, doc["day"]) if r.get("verdict") == "passed"}
+    passed_n = 0
     for raw in got["ideas"]:
         idea, why = validate(raw, today, s, allowed, blocked)
         sym = (idea or {}).get("symbol") or _text((raw or {}).get("symbol") if isinstance(raw, dict) else "").upper() or "?"
         row = dict(idea or {"symbol": sym}, id="%s-%s" % (doc["day"], sym), day=doc["day"], list_from=src,
-                   logged_at=int(_now()), shadow=not s["buy_enabled"])
+                   logged_at=int(_now()), shadow=not s["buy_enabled"], state="proposed" if kind == "main" else "new")
+        row["from"] = kind
         if idea is None:
             row.update(verdict="rejected", why_not=why)
         elif sym in seen:
             row.update(verdict="rejected", why_not="a second idea for the same company today")
-        elif len(doc["ideas"]) >= s["max_ideas"]:
-            row.update(verdict="rejected", why_not="over news.max_ideas (%d) for one day" % s["max_ideas"])
+        elif passed_n >= s["max_ideas"]:
+            row.update(verdict="rejected", why_not="over news.max_ideas (%d) for one run" % s["max_ideas"])
         elif not rate:
             row.update(verdict="rejected", why_not="no GBP/USD rate to size it with")
         elif acct is None:
@@ -884,28 +1313,57 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
                 bars = bars_fn(sym, today - datetime.timedelta(days=45), today)
                 before = [d for d in sorted(bars) if d < today]
                 price = bars[before[-1]][3]
-                row.update(vet(dict(idea, id=row["id"]), ucfg, s, rate, round(price, 2), bars, today, acct, now_utc,
-                               held_n + len(doc["ideas"])))
+                row.update(vet(dict(idea, id=row["id"]), ucfg, s, rate, round(price, 2), bars, today, acct, now_utc, book_n))
                 if row.get("verdict") == "passed":
-                    _count(acct, row)                 # the next idea today sees this one's cost and risk
+                    passed_n += 1
+                    if in_book(row, s):               # the next idea today sees this one's cost and risk
+                        _count(acct, row)
+                        book_n += 1
             except Exception as e:
                 row.update(verdict="rejected", why_not="no price or daily bars (%s)" % str(e)[:120])
+        if row["verdict"] == "rejected" and row["id"] in {r.get("id") for r in rows}:
+            row["id"] += "-" + kind                   # never two rows with one id
         seen.add(sym)
         rows.append(row)
-        (doc["ideas"] if row["verdict"] == "passed" else doc["rejected"]).append(row)
+        if kind == "update" and row["verdict"] == "passed":
+            changes["new"].append(row)
     save_ideas(sd, rows)
     asks = []
     try:
         asks = make_asks(sd, got.get("reviews") or [], today)
     except Exception as e:
         say("news: the review of what is held could not be saved (%s)" % str(e)[:120])
-    doc.update(status="ok", notes=_text(got.get("notes")), asks=[a["id"] for a in asks])
+    mine = todays(rows, doc["day"])
+    done = int(_now())
+    entry = {"status": "ok", "at": done, "started": doc["runs"][kind].get("started"), "usage": meta}
+    if kind == "update":
+        h, m = _hm(s["buy_at"])
+        fin = _ny(datetime.datetime.utcfromtimestamp(done))
+        entry["late"] = fin > fin.replace(hour=h, minute=m, second=0, microsecond=0)
+    doc["runs"][kind] = entry
+    doc.update(status="ok", list_from=src, ideas=[r for r in mine if r["verdict"] == "passed"],
+               rejected=[r for r in mine if r["verdict"] != "passed"], buying=s["buy_enabled"],
+               generated_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), asks=sorted(set((doc.get("asks") or []) + [a["id"] for a in asks])))
+    doc["notes" if kind == "main" else "update_notes"] = _text(got.get("notes"))
+    doc.pop("error", None)
     _write(today_path(sd), doc)
-    log_run(sd, day=doc["day"], status="ok", ideas=len(doc["ideas"]), rejected=len(doc["rejected"]), asks=len(asks))
-    say("news: %d idea%s passed the checks (%s), %d rejected%s" % (
-        len(doc["ideas"]), "" if len(doc["ideas"]) == 1 else "s", ", ".join(r["symbol"] for r in doc["ideas"]) or "none",
-        len(doc["rejected"]), "".join("; %s: %s" % (r["symbol"], r["why_not"]) for r in doc["rejected"])))
-    push(M.news_ideas(doc, tally(sd)), once_key="news-ideas-" + doc["day"])
+    got_n = [r for r in mine if r.get("from", "main") == kind]
+    log_run(sd, day=doc["day"], kind=kind, status="ok", ideas=len([r for r in got_n if r["verdict"] == "passed"]),
+            rejected=len([r for r in got_n if r["verdict"] != "passed"]), asks=len(asks),
+            dropped=len(changes["dropped"]), usage=meta)
+    say("news %s: %d idea%s passed the checks (%s), %d rejected%s%s%s" % (
+        kind, len([r for r in got_n if r["verdict"] == "passed"]), "" if len([r for r in got_n if r["verdict"] == "passed"]) == 1 else "s",
+        ", ".join("%s [%s]" % (r["symbol"], r.get("confidence")) for r in got_n if r["verdict"] == "passed") or "none",
+        len([r for r in got_n if r["verdict"] != "passed"]),
+        "".join("; %s: %s" % (r["symbol"], r["why_not"]) for r in got_n if r["verdict"] != "passed"),
+        "".join("; %s %s: %s" % (r["symbol"], r["state"], r.get("update_why")) for r in morning) if kind == "update" else "",
+        "" if not meta else "; the run took %ss, %s turns, %s tokens in and %s out" % (
+            meta.get("seconds"), meta.get("turns"), meta.get("tokens_in"), meta.get("tokens_out"))))
+    if kind == "main":
+        if briefing_started(sd, doc["day"]):          # the briefing has gone: a message of its own, once
+            push(M.news_ideas(doc, tally(sd)), once_key="news-ideas-" + doc["day"])
+    elif changes["dropped"] or changes["new"]:        # the update speaks only when something changed
+        push(M.news_update(doc, changes), once_key="news-update-" + doc["day"])
     return doc
 
 
@@ -946,12 +1404,28 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None, b
         out["status"] = "no good ideas run for today, so nothing is bought"
         say("news buy: " + out["status"])
         return out
-    todo = [r for r in doc.get("ideas") or [] if r.get("id") not in bought_ids(sd)]
     M = _msgs(sd)
 
-    def skip(row, why):
+    def skip(row, why, **kw):
         out["skipped"].append((row["symbol"], why))
-        log_buy(sd, idea=row.get("id"), symbol=row["symbol"], day=day.isoformat(), status="skipped", why=why)
+        log_buy(sd, idea=row.get("id"), symbol=row["symbol"], day=day.isoformat(), status="skipped", why=why,
+                confidence=row.get("confidence"), **kw)
+
+    done = bought_ids(sd)
+    ok, why_none = buyable(doc, s)
+    if why_none:
+        out["status"] = why_none
+        say("news buy: " + why_none)
+        return out
+    okay = {r.get("id") for r in ok}
+    for r in doc.get("ideas") or []:                  # logged, so the ideas left out can be compared later
+        if r.get("id") in okay or r.get("id") in done:
+            continue
+        if r.get("state") not in ("kept", "new"):
+            skip(r, "not kept by the update before the open (%s): %s" % (r.get("state"), r.get("update_why") or "no reason"))
+        else:
+            skip(r, "its confidence is %s: only %s ideas are bought" % (r.get("confidence") or "unknown", s["buy_confidence"]))
+    todo = [r for r in ok if r.get("id") not in done]
 
     if not todo:
         out["status"] = "nothing to buy today"
@@ -963,7 +1437,7 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None, b
         return out
     if paused:
         for r in todo:
-            skip(r, "paused from your phone (/pause)")
+            skip(r, paused if isinstance(paused, str) else "paused from your phone (/pause)")
         out["status"] = "paused"
         return out
     bars_fn = bars_fn or D.daily_bars
@@ -990,8 +1464,19 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None, b
         except Exception as e:
             skip(row, "no price or daily bars (%s)" % str(e)[:100])
             continue
-        if float(px) <= float(row.get("stop") or 0):
-            skip(row, "already at or under the stop planned this morning ($%.2f against $%.2f)" % (px, row["stop"]))
+        px = float(px)
+        if px <= float(row.get("stop") or 0):
+            skip(row, "already at or under the stop planned this morning ($%.2f against $%.2f)" % (px, row["stop"]),
+                 price=px)
+            continue
+        prop = _num(row.get("price"))
+        if not prop:
+            skip(row, "no price from when it was proposed to compare with", price=px)
+            continue
+        move = 100.0 * (px / prop - 1)
+        if abs(move) > float(s["max_move_pct"]) + 1e-9:
+            skip(row, "it has moved %+.1f%% since it was proposed ($%.2f then, $%.2f now), over the %g%% allowed "
+                      "(news.max_move_pct)" % (move, prop, px, float(s["max_move_pct"])), price=px, move_pct=round(move, 2))
             continue
         got = vet(row, ucfg, s, rate, float(px), bars, day, acct, now_utc, held_n)
         if got["verdict"] != "passed":
@@ -1065,12 +1550,23 @@ def show(sd):
         return "no news run yet"
     lines = ["News ideas for %s (%s): %s" % (doc.get("day"), "buying ON" if doc.get("buying") else "practice only, nothing bought",
                                             doc.get("status"))]
-    if doc.get("error"):
-        lines.append("  run failed: %s" % doc["error"])
+    for kind in KINDS:
+        r = (doc.get("runs") or {}).get(kind)
+        if r:
+            u = r.get("usage") or {}
+            lines.append("  %s run: %s%s%s" % (kind, r.get("status"), "" if not (r.get("error") or r.get("why")) else
+                                               " (%s)" % (r.get("error") or r.get("why")),
+                                               "" if not u else "; %ss, %s turns, %s tokens in, %s out" % (
+                                                   u.get("seconds"), u.get("turns"), u.get("tokens_in"), u.get("tokens_out"))))
     for r in doc.get("ideas") or []:
-        lines.append("  PASSED %s: %s | event: %s on %s | wrong if: %s | sell: %s (%s) | stop $%.2f, %s shares, cost GBP %.2f"
-                     % (r["symbol"], r["why"], r["event"], r["event_date"], r["wrong_if"], r["sell_rule"],
+        lines.append("  PASSED %s [%s run, %s, confidence %s: %s; already moved %s%%]: %s | event: %s on %s | wrong if: %s "
+                     "| sell: %s (%s) | stop $%.2f, %s shares, cost GBP %.2f"
+                     % (r["symbol"], r.get("from", "main"), r.get("state") or "proposed", r.get("confidence"),
+                        r.get("confidence_why") or "no reason", "?" if r.get("moved_pct") is None else "%g" % r["moved_pct"],
+                        r["why"], r["event"], r["event_date"], r["wrong_if"], r["sell_rule"],
                         r["sell_date"], r.get("stop") or 0, r.get("qty"), r.get("cost_gbp") or 0))
+        if r.get("update_why"):
+            lines.append("      update: %s" % r["update_why"])
         for x in r.get("sources") or []:
             lines.append("      source %s: %s (%s)" % (x["date"], x["title"], x["url"]))
     for r in doc.get("rejected") or []:
@@ -1082,7 +1578,9 @@ def main(argv=None, environ=None):
     ap = argparse.ArgumentParser(description="The news strategy (demo; shadow unless news.buy_enabled).")
     ap.add_argument("cmd", choices=["run", "resolve", "show", "selftest"])
     ap.add_argument("--state-dir", default="trader")
-    ap.add_argument("--force", action="store_true", help="run again although today's run is done")
+    ap.add_argument("--kind", choices=KINDS, default="main",
+                    help="main: the 06:00 UK review; update: the shorter look at 08:30 New York")
+    ap.add_argument("--force", action="store_true", help="run again although today's run is done, at any hour")
     ap.add_argument("--no-info", action="store_true", help="skip the extra information step")
     a = ap.parse_args(argv)
     sd = a.state_dir
@@ -1114,15 +1612,37 @@ def main(argv=None, environ=None):
         def push(text, once_key=None):
             phone_mod.push(sd, text, environ=env, once_key=once_key)
 
-        doc = run(sd, cfg, client=client, push=push, force=a.force)
-        if doc and doc.get("status") == "ok" and not a.no_info:
-            n = add_info(sd, settings(cfg), day=doc["day"])
+        s = settings(cfg)
+        now_utc = datetime.datetime.utcfromtimestamp(_now())
+        day = _ny(now_utc).date()
+        if s["enabled"] and _drift().is_trading_day(day) and (a.force or timing(a.kind, s, now_utc)[0] == "ok"):
+            _doc, why = begin(sd, a.kind, day, s, a.force)        # marked first, so a second start stands down
+            if why:
+                print("news %s: %s" % (a.kind, why))
+                return 0
+            net = _load("trader-broker", "netwait")
+            if not net.online():                      # just woken: give the internet a little time
+                w = net.wait_online(time.sleep, _now, limit=10 * 60, log=lambda t: print("news: " + t), label="the news run")
+                if not w["ok"]:
+                    print("news %s: no internet after %d minutes" % (a.kind, net.minutes(w["start"], w["end"])))
+        doc = run(sd, cfg, client=client, push=push, force=a.force, kind=a.kind)
+        ran = ((doc or {}).get("runs") or {}).get(a.kind) or {}
+        if doc and ran.get("status") == "ok" and not a.no_info:
+            n = add_info(sd, s, day=doc["day"], kronos=a.kind == "main")
             print("news: extra information added to %d idea%s" % (n, "" if n == 1 else "s"))
-        return 0 if (doc is None or doc.get("status") == "ok") else 1
+        return 0 if (doc is None or ran.get("status") in ("ok", "skipped", None)) else 1
     except NewsError as e:
         print("news: %s" % e, file=sys.stderr)
+        try:                                          # never leave today's run marked "running"
+            doc = _read(today_path(sd), None)
+            mine = ((doc or {}).get("runs") or {}).get(a.kind) or {}
+            if mine.get("status") == "running" and mine.get("pid") == os.getpid():
+                doc["runs"][a.kind] = {"status": "failed", "at": int(_now()), "error": str(e)[:300]}
+                _write(today_path(sd), doc)
+        except Exception:
+            pass
         try:
-            T.phone_module().push(sd, _msgs(sd).news_failed(), environ=env,
+            T.phone_module().push(sd, _msgs(sd).news_failed(False), environ=env,
                                   once_key="news-failed-" + datetime.date.today().isoformat())
         except Exception:
             pass

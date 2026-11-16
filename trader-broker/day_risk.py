@@ -73,6 +73,38 @@ def total_cap_pct(cfg):
     return v
 
 
+STRATEGY_CAPS = ("drift", "news", "intraday")
+
+
+def caps_pct(cfg):
+    """"risk_caps_pct" from the config: {strategy: percent of the account its holdings may lose at their stops
+    together}, or None when it is not set. With it set each strategy has its own cap, so one strategy cannot
+    use up the room of the others (and "max_total_risk_pct" is no longer what stops a buy)."""
+    raw = (cfg or {}).get("risk_caps_pct")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("risk_caps_pct in trader/config.json must be an object like "
+                         "{\"drift\": 2, \"news\": 2, \"intraday\": 1}")
+    out = {}
+    for k, v in raw.items():
+        if isinstance(v, bool):
+            raise ValueError("risk_caps_pct.%s in trader/config.json must be a number" % k)
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("risk_caps_pct.%s in trader/config.json must be a number" % k)
+        if not 0 <= f <= 20:
+            raise ValueError("risk_caps_pct.%s in trader/config.json must be between 0 and 20" % k)
+        out[str(k).strip().lower()] = f
+    return out
+
+
+def caps_on(cfg):
+    """True when any cap on risk at the stops is set (one per strategy, or the single total)."""
+    return bool(caps_pct(cfg) is not None or total_cap_pct(cfg))
+
+
 def total(client, state_dir, rate, t212):
     """Open risk at the stops across EVERY holding (any strategy, plus buys waiting to fill), from Trading 212
     (read-only), in US dollars, with the account value. Raises on any failure."""
@@ -85,7 +117,8 @@ def total(client, state_dir, rate, t212):
         raise ValueError("Trading 212 gave no account value")
     return {"open_risk_usd": round(r["open_risk_gbp"] * rate, 2), "open_risk_gbp": r["open_risk_gbp"],
             "account_usd": round(v["account_gbp"] * rate, 2), "account_gbp": v["account_gbp"],
-            "rows": r["rows"]}
+            "by_strategy_usd": {k: round(x * rate, 2) for k, x in r["by_strategy"].items()},
+            "by_strategy_gbp": r["by_strategy"], "rows": r["rows"]}
 
 
 def entries_today(broker_state, today):
