@@ -1,4 +1,4 @@
-"""Stage 1 of post-earnings drift: buy records carry a strategy ("intraday" or "drift").
+"""Stage 1 of post-earnings drift: buy records carry a strategy ("intraday", "drift", later "news").
 The 15:50 close keeps a drift position until its sell_date, a position with no buy record is
 alerted rather than sold, and the trail and half-sell never touch a drift position.
 Nothing buys drift yet: these tests write drift records by hand."""
@@ -57,15 +57,17 @@ class CloseKeepsDrift(test_eod_close.Close):
         self.assertEqual(self.writes(), [("DELETE", "/equity/orders/7001"), ("POST", "/equity/orders/market")])
         self.assertIn("overdue", res["closed"][0])
 
-    def test_a_drift_record_without_a_sell_date_is_sold_like_intraday(self):
+    def test_a_drift_record_without_a_sell_date_is_kept_and_reported(self):
+        # from 16 Nov 2026: "keep and report" is the default, so a holding is never sold for a missing date
         for bad in (None, "", "soon"):
             self.router.routes.clear()
             self.router.calls.clear()
             self.records(record(strategy="drift", sell_date=bad))
             self.account([held(7)])
             res = self.close()
-            self.assertEqual(len(self.router.posts()), 1, bad)
-            self.assertIn("no readable sell_date", res["closed"][0])
+            self.assertEqual(self.router.posts(), [], bad)
+            self.assertEqual(res["closed"], [])
+            self.assertIn("no readable sell date", res["unknown"][0])
 
     def test_intraday_and_unlabelled_positions_are_closed_exactly_as_before(self):
         for rec in (record(), record(strategy="intraday"), record(strategy="INTRADAY")):
@@ -223,7 +225,7 @@ class Labels(unittest.TestCase):
         self.assertEqual(t212.position_strategy(None), "intraday")
         self.assertEqual(t212.position_strategy({"strategy": "intraday"}), "intraday")
         self.assertEqual(t212.position_strategy({"strategy": " Drift "}), "drift")
-        self.assertEqual(t212.position_strategy({"strategy": "swing"}), "intraday")
+        self.assertEqual(t212.position_strategy({"strategy": "swing"}), "swing")   # unknown: kept as written, a holding
         self.assertFalse(t212.is_drift(None))
         self.assertTrue(t212.is_drift({"strategy": "drift"}))
 
@@ -232,7 +234,7 @@ class Labels(unittest.TestCase):
         self.assertFalse(t212.drift_due(rec, "2026-11-11")[0])
         self.assertTrue(t212.drift_due(rec, "2026-11-12")[0])
         self.assertTrue(t212.drift_due(rec, datetime.date(2026, 11, 13))[0])
-        self.assertTrue(t212.drift_due({"strategy": "drift"}, "2026-11-11")[0])
+        self.assertFalse(t212.drift_due({"strategy": "drift"}, "2026-11-11")[0])   # no date: kept, never sold
 
 
 if __name__ == "__main__":

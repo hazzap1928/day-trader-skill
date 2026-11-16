@@ -58,6 +58,36 @@ def count_of(cfg):
     return m
 
 
+def total_cap_pct(cfg):
+    """"max_total_risk_pct" from the config (the cap on what ALL holdings could lose at their stops together,
+    as a share of the account), or None when it is not set. With it set, it replaces the daily loss limit."""
+    v = (cfg or {}).get("max_total_risk_pct")
+    if v is None:
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        raise ValueError("max_total_risk_pct in trader/config.json must be a number")
+    if not 0.5 <= v <= 20:
+        raise ValueError("max_total_risk_pct in trader/config.json must be between 0.5 and 20")
+    return v
+
+
+def total(client, state_dir, rate, t212):
+    """Open risk at the stops across EVERY holding (any strategy, plus buys waiting to fill), from Trading 212
+    (read-only), in US dollars, with the account value. Raises on any failure."""
+    ht = _load("trader-broker", "holdings_t212")
+    h = _load("trader-broker", "holdings")
+    ht.t212, ht.holdings = t212, h
+    v = ht.read_view(client, state_dir, rate)
+    r = h.open_risk(v)
+    if not v.get("account_gbp"):
+        raise ValueError("Trading 212 gave no account value")
+    return {"open_risk_usd": round(r["open_risk_gbp"] * rate, 2), "open_risk_gbp": r["open_risk_gbp"],
+            "account_usd": round(v["account_gbp"] * rate, 2), "account_gbp": v["account_gbp"],
+            "rows": r["rows"]}
+
+
 def entries_today(broker_state, today):
     """Today's placed intraday buys (one record per entry), from trader/state/broker.json. Drift buys are
     left out: they have their own risk cap (drift.max_open_risk_pct), not intraday's daily loss limit."""
@@ -65,8 +95,8 @@ def entries_today(broker_state, today):
     for r in (broker_state or {}).get("orders") or []:
         if r.get("status") != "placed" or str(r.get("date") or "") != today:
             continue
-        if str(r.get("strategy") or "").strip().lower() == "drift":
-            continue
+        if str(r.get("strategy") or "intraday").strip().lower() != "intraday":
+            continue                              # a holding (drift, news): not a day trade
         if (r.get("kind") or ("entry" if str(r.get("side", "")).lower() == "buy" else "")) != "entry":
             continue
         out[r.get("fingerprint")] = r
@@ -157,10 +187,11 @@ def compute(entries, closed_today, positions, pending, guard_state, rate):
             "counted_usd": round(realised_loss + open_risk, 2)}
 
 
-def build(client, state_dir, today=None, report_mod=None):
+def build(client, state_dir, today=None, report_mod=None, with_total=False):
     """Ask Trading 212 (read-only) and write trader/state/day-risk.json. Returns the document.
     A fresh file (under REUSE_FOR seconds, same day) is returned as it is. Raises on any failure:
-    then no file is written and trader-risk counts the old way."""
+    then no file is written and trader-risk counts the old way.
+    with_total: also "total", the open risk across every holding, for "max_total_risk_pct"."""
     report_mod = report_mod or _load("trader-broker", "report")
     t212, tk = report_mod.t212, report_mod.tk
     now = _now()
@@ -169,7 +200,8 @@ def build(client, state_dir, today=None, report_mod=None):
     today = today or ny.date().isoformat()
     p = path(state_dir)
     old = t212._read_json(p, {}) or {}
-    if old.get("date") == today and isinstance(old.get("built_at"), (int, float)) and 0 <= now - old["built_at"] < REUSE_FOR:
+    if (old.get("date") == today and isinstance(old.get("built_at"), (int, float)) and 0 <= now - old["built_at"] < REUSE_FOR
+            and (not with_total or old.get("total"))):
         return old
     rate = (t212._read_json(os.path.join(state_dir, "fx.json"), {}) or {}).get("usd_per_gbp")
     if not rate:
@@ -192,6 +224,8 @@ def build(client, state_dir, today=None, report_mod=None):
     doc = dict(compute(entries, closed, positions, pending, guard, rate), date=today, built_at=now,
                usd_per_gbp=rate, method="open_risk",
                note="losses realised today + risk still open at the stops, in US dollars")
+    if with_total:
+        doc["total"] = total(client, state_dir, rate, t212)
     d = os.path.dirname(p)
     os.makedirs(d, exist_ok=True)
     tmp = p + ".tmp"

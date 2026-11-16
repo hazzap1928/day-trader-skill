@@ -27,8 +27,9 @@ With "autopilot": {"evidence_mode": true} (demo only; live refuses it):
 
 "evidence": {"start": "YYYY-MM-DD", "min_trades": 20}. There is no end date and no final PASS/FAIL day.
 Each report gives a running status, ON TRACK or NOT ON TRACK, for this week and for since the start,
-by the pass rule: a positive average per real trade after costs AND a better return than an S&P 500
-tracker over the same days. Below min_trades closed trades, that status is "too few trades to judge".
+by the pass rule: a positive average per real trade after costs. An S&P 500 tracker over the same days
+is shown beside it for information only (from 16 Nov 2026 it is never a pass or fail test).
+Below min_trades closed trades, that status is "too few trades to judge".
 An old "end" key is ignored.
 
     python3 trader-broker/evidence.py report      # build the report now (also sends it with --send)
@@ -501,8 +502,10 @@ def week_start(today):
 
 
 def judge(ok_avg, ok_tracker, n, min_trades):
-    """The running status by the pass rule, and below min_trades closed trades, "too few trades to judge"."""
-    lean = "ON TRACK" if ok_avg and ok_tracker else "NOT ON TRACK"
+    """The running status by the pass rule (a positive average per real trade after costs), and below
+    min_trades closed trades, "too few trades to judge". ok_tracker is NOT part of the rule: the S&P 500
+    tracker is shown for information only."""
+    lean = "ON TRACK" if ok_avg else "NOT ON TRACK"
     if n < min_trades:
         return "TOO FEW TRADES TO JUDGE", (lean if n else None)
     return lean, None
@@ -542,10 +545,11 @@ def build_report(client, sd, cfg, report_mod, fetch_daily=None, today=None):
         trips, _ = report_mod.round_trips(fills)
         broker = t212()._read_json(os.path.join(sd, "state", "broker.json"), {}) or {}
         drift_keys = {(x.get("t212_ticker"), str(x.get("date") or "")) for x in broker.get("orders") or []
-                      if str(x.get("strategy") or "").lower() == "drift" and str(x.get("side", "")).lower() == "buy"}
+                      if str(x.get("strategy") or "intraday").strip().lower() != "intraday"
+                      and str(x.get("side", "")).lower() == "buy"}
         closed = [c for c in trips if start <= _ny_dt(c["exit_at"]) <= upto and c.get("entry_at")
                   and _ny_dt(c["entry_at"]) >= start
-                  and (c["ticker"], _ny_dt(c["entry_at"])) not in drift_keys]     # drift has its own section
+                  and (c["ticker"], _ny_dt(c["entry_at"])) not in drift_keys]     # holdings (drift, news) are not day trades
     r["real"] = closed
     r["real_avg_gbp"] = _mean([c["pl"] for c in closed if c.get("pl") is not None])
     r["real_avg_ret"] = _mean([c["pl"] / c["cost_gbp"] for c in closed if c.get("pl") is not None and c.get("cost_gbp")])
@@ -658,7 +662,7 @@ def status_line(label, p):
             head += "; so far it reads %s" % p["lean"]
     else:
         head = "%s, based on %s" % (p["status"], n)
-    return "%s (%s to %s): %s. Average %s a trade after costs, total %s; strategy %s (on %s) vs S&P 500 tracker %s" % (
+    return "%s (%s to %s): %s. Average %s a trade after costs, total %s; strategy %s (on %s) vs S&P 500 tracker %s (for information)" % (
         label, p["from"], p["to"], head, _gbp(p["avg_gbp"]), _gbp(p["total_gbp"]), _pct(p["strategy_ret"]),
         _gbp(p["start_value"]) if p["start_value"] else "no start value", _pct(p["tracker_ret"]))
 
@@ -670,8 +674,8 @@ def _ny_dt(utc_naive):
 def report_text(r):
     k = r["kronos"]
     lines = ["EVIDENCE MODE REPORT (demo forward test since %s, no end date), %s" % (r["start"], r["today"]),
-             "Running status. ON TRACK needs a positive average per real trade after costs AND beating the "
-             "tracker over the same days; under %d closed trades it is too few trades to judge." % r["min_trades"],
+             "Running status. ON TRACK needs a positive average per real trade after costs; the S&P 500 tracker "
+             "is shown for information only. Under %d closed trades it is too few trades to judge." % r["min_trades"],
              status_line("This week", r["week"]),
              status_line("Since the start", r["since_start"]),
              "Real trades since the start: %d closed, average %s (%s) a trade after costs, total %s%s" % (

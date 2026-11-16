@@ -200,6 +200,8 @@ def why_not(msg):
         return "the price had already run too far above the planned buy price"
     if "no fresh quote" in m or "no quote" in m:
         return "couldn't get a fresh price"
+    if "total risk" in m:
+        return "it would put too much at risk across everything held"
     if "trader-risk" in m or "daily loss" in m or "trades a day" in m or "blocked" in m:
         return "it no longer passed the safety checks"
     if "changed since" in m:
@@ -759,8 +761,8 @@ def _track(p):
 def friday(r, drift=None):
     week, since = r.get("week"), r.get("since_start")
     out = ["\U0001f4ca <b>Week summary, %s</b>" % esc(day_name(r["today"])),
-           "The practice test since %s: does the plan make money after fees, and beat simply holding the S&amp;P 500?"
-           % esc(short_day(r["start"]))]
+           "The practice test since %s: does the plan make money after fees? The S&amp;P 500 is shown to compare, "
+           "not as a test." % esc(short_day(r["start"]))]
     for label, p in (("This week", week), ("Since the start", since)):
         if not p:
             continue
@@ -875,3 +877,121 @@ def paired(name):
 
 def test_tap():
     return "\U0001f9ea Test from the trading agent: tap a button. Nothing is bought, this is only a test."
+
+
+# ---------------------------------------------------------------- the holdings record (daily match, report only)
+
+_MISMATCH = {
+    "no_record": "is in the account, but I have no record of buying it",
+    "not_held": "is in my records as held, but it isn't in the account and I can't see a sale",
+    "qty": "the number of shares in the account doesn't match my records",
+    "no_stop": "has no safety net at Trading 212",
+    "part_stop": "has a safety net for only part of it",
+    "soft_stop": "has a safety net that only this Mac watches, so it only works while the market is open",
+    "stray_stop": "isn't held, but a leftover sell order for it is waiting at Trading 212",
+    "unknown_label": "has a label I don't know, so I'll keep it and never sell it by a rule",
+    "no_sell_rule": "has no sell date in my records, so I'll keep it until you decide",
+}
+
+
+def holdings_mismatch(rows):
+    """The daily check of my records against Trading 212. Report only: nothing is changed."""
+    items = ["%s %s" % (company(m.get("symbol")), _MISMATCH.get(m.get("kind"), esc(m.get("what")))) for m in rows]
+    return join(["\U0001f50e <b>My records and Trading 212 don't match</b>"] + bullets(items) +
+                ["I haven't changed anything. Please check the Trading 212 app."])
+
+
+# ---------------------------------------------------------------- news ideas (bought for a reason, held until a rule)
+
+def _idea_line(r, buying):
+    what = str(r.get("summary") or r.get("why") or "").strip()
+    if len(what) > 220:
+        what = what[:217].rstrip() + "..."
+    what = esc(what)
+    size = ""
+    if r.get("cost_gbp"):
+        size = " %s about %s, most it could lose about %s." % (
+            "I'll buy" if buying else "Would buy", gbp(r["cost_gbp"]), gbp(r.get("max_loss_gbp")))
+    return "%s: %s Event: %s. %s by %s.%s" % (
+        "<b>%s</b>" % company(r["symbol"]), what if what.endswith((".", "!", "?")) else what + ".",
+        esc(short_day(r.get("event_date") or "?")), "Sell" if buying else "Would sell",
+        esc(short_day(r.get("sell_date") or "?")), size)
+
+
+def news_ideas(doc, tally=None):
+    """The morning message: today's ideas in plain words. Practice only unless buying is on."""
+    ideas, buying = doc.get("ideas") or [], bool(doc.get("buying"))
+    head = "\U0001f4f0 <b>Today's news ideas</b>"
+    if not ideas:
+        out = [head, "No idea passed the checks today%s." % (
+            "" if not doc.get("rejected") else " (%d looked at and turned down)" % len(doc["rejected"]))]
+    else:
+        out = [head] + bullets(_idea_line(r, buying) for r in ideas)
+        if doc.get("rejected"):
+            n = len(doc["rejected"])
+            out.append("%d other idea%s didn't pass the checks." % (n, "" if n == 1 else "s"))
+    out.append("Buying is on: these are bought soon after the US market opens, each with a safety net." if buying
+               else "Practice only: nothing is bought. I just keep score.")
+    t = tally or {}
+    if t.get("ideas"):
+        out.append("Score so far: %d idea%s, %s after fees if each had been bought." % (
+            t["ideas"], "" if t["ideas"] == 1 else "s", signed_gbp(t.get("pl_gbp"))))
+    out.append("<i>Ideas from news reading, not advice. Untested.</i>")
+    return join(out)
+
+
+def news_failed():
+    return ("⚠️ This morning's news ideas run failed, so there are no ideas today and nothing is bought "
+            "because of it. Details are in trader/logs/news.log.")
+
+
+def news_bought(i):
+    items = ["%s at about %s each" % (b(shares(i["qty"])), b(usd(i["price"]))),
+             "Cost: %s (including the currency fee)" % b(gbp(i.get("cost_gbp"))),
+             "\U0001f6e1️ Safety net: auto-sells if it drops to %s. Most I could lose: %s" % (
+                 usd(i["stop"]), b("about " + gbp(i.get("max_loss_gbp"))))
+             if i.get("stop_ok", True) else
+             "⚠️ <b>The safety net isn't in yet</b> (the guard is on it)",
+             "Why: %s" % esc(i.get("why") or "?"),
+             "\U0001f4c5 Plan: sell by %s, or sooner if the reason breaks (I'll ask you first)" % esc(day_name(i["sell_date"]))]
+    return join(["\U0001f7e2 <b>Bought %s</b> on a news idea" % company(i["symbol"])] + bullets(items))
+
+
+def news_buy_failed():
+    return "⚠️ The news buys hit a problem, so nothing more is bought on them today. Details are in the log."
+
+
+def news_sell_ask(ask):
+    src = (ask.get("sources") or [{}])[0]
+    return join(["\U0001f440 <b>Sell %s?</b>" % company(ask["symbol"]),
+                 "The reason I bought it looks broken: %s" % esc(ask.get("why") or "?"),
+                 "Source: %s (%s)" % (esc(src.get("title") or "?"), esc(short_day(src.get("date") or "?")))
+                 if src else None,
+                 "Tap Approve to sell it at the next close. Tap Reject, or do nothing, to keep it. "
+                 "Its safety net stays either way."])
+
+
+def news_sell_end(text, outcome):
+    words = {"approved": "✅ <b>Approved by you.</b> It will be sold just before the US market next closes.",
+             "rejected": "❌ <b>Rejected by you.</b> Keeping it, with its safety net."}
+    return text + "\n\n" + words.get(outcome, esc(outcome))
+
+
+SELL_TAP = {"approved": "Approved: it will be sold at the next close.",
+            "rejected": "Rejected: keeping it.",
+            "already": "Already answered: nothing more done.",
+            "unknown": "Unknown request: nothing done."}
+
+
+def news_sold(page):
+    """A news holding that has been sold (from the holdings record, with Trading 212's own result)."""
+    res = page.get("result") or {}
+    p = _num(res.get("pl_gbp"))
+    dot = "\U0001f7e2" if p is not None and p > 0 else "\U0001f534"
+    why = {"stop": "hit the safety net", "sold at the close": "its sell date came, or you approved the sale",
+           "sold in the Trading 212 app": "sold in the Trading 212 app"}.get(str(res.get("why") or ""),
+                                                                             esc(res.get("why") or "sold"))
+    return join(["%s <b>Sold %s</b>: %s" % (dot, company(page.get("symbol")), why)] + bullets([
+        "Bought %s, sold %s" % (esc(short_day(page.get("buy_date") or "?")), esc(short_day(res.get("date") or "?"))),
+        "Result: %s" % (b(signed_gbp(p)) if p is not None else "not known yet"),
+        "Bought because: %s" % esc(page.get("reason") or "?")]))

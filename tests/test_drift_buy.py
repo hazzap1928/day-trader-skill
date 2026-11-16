@@ -526,7 +526,10 @@ class Friday(unittest.TestCase):
         self.assertIn("Shadow signals", text)
         self.rows(3, 1.0, 0.5)
         self.assertIn("ON TRACK.", "\n".join(db.friday_lines(self.dir, cfg)))
-        self.rows(3, 1.0, -0.5)                                       # made money but lost to SPY
+        self.rows(3, 1.0, -0.5)                                       # made money but behind SPY: information only
+        text = "\n".join(db.friday_lines(self.dir, cfg))
+        self.assertIn("average vs SPY -0.50 points: ON TRACK.", text)
+        self.rows(3, -1.0, 0.5)                                       # lost money
         self.assertIn("NOT ON TRACK.", "\n".join(db.friday_lines(self.dir, cfg)))
 
     def test_off_shows_nothing(self):

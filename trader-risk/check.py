@@ -504,9 +504,29 @@ def rec_is_entry(rec):
 
 
 def is_drift(rec):
-    """A post-earnings drift buy (trader-broker/drift_buy.py): it has its own slots and risk cap, so it
-    never counts toward intraday's trades a day, daily loss or day trades."""
-    return str(rec.get("strategy") or "").strip().lower() == "drift"
+    """A holding, not a day trade: a drift or news buy (or any other label that is not "intraday"). It has
+    its own rules, so it never counts toward intraday's trades a day, daily loss or day trades."""
+    return str(rec.get("strategy") or "intraday").strip().lower() != "intraday"
+
+
+HOLD_STRATEGIES = ("drift", "news")
+
+
+def total_risk(c, day_risk, today, now_utc):
+    """With "max_total_risk_pct" in the config: (cap in dollars, open risk in dollars, why not known).
+    The cap is that share of the account value; the open risk is what every holding could lose at its
+    stop, from trader/state/day-risk.json ("total", written by trader-broker). Without the setting:
+    (None, None, None)."""
+    pct = _f(c.get("max_total_risk_pct"))
+    if not pct:
+        return None, None, None
+    ok, why = day_risk_usable(day_risk, today, now_utc)
+    tot = (day_risk or {}).get("total") if ok else None
+    if not ok:
+        return 0.0, None, why
+    if not isinstance(tot, dict) or _f(tot.get("open_risk_usd")) is None or not _f(tot.get("account_usd")):
+        return 0.0, None, "trader/state/day-risk.json has no total for all holdings"
+    return round(_f(tot["account_usd"]) * pct / 100.0, 2), _f(tot["open_risk_usd"]), None
 
 
 def placed_today(state, today):
@@ -569,7 +589,7 @@ def day_risk_usable(doc, today, now_utc):
 
 
 def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None,
-          day_risk=None):
+          day_risk=None, strategy=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
     now          naive UTC (default: the real clock); its New York date is "today"
@@ -577,7 +597,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     day_risk     trader/state/day-risk.json (trader-broker/day_risk.py), used by the daily loss limit
                  with "daily_loss_count": "open_risk": losses realised today + risk still open at
                  the stops. Missing, stale or for another day: the old count (full risk of every
-                 entry placed today), with a warning."""
+                 entry placed today), with a warning.
+                 With "max_total_risk_pct" in the config its "total" (open risk across every holding) is
+                 checked against that cap INSTEAD of the daily loss limit; unknown blocks the entry.
+    strategy     "news" or "drift": a holding, not a day trade. The day-trade checks (entry window, trades
+                 and orders a day, day trades, a reward:risk target) do not apply; every other check does."""
     cfg = dict(cfg or {})
     try:
         if not cfg.get("money"):
@@ -605,7 +629,14 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     count_today = len(done_today)
     entries_today = [r for r in done_today if rec_is_entry(r)]
     loss_today = 0.0
+    strategy = str(strategy or "intraday").strip().lower()
+    if strategy != "intraday" and strategy not in HOLD_STRATEGIES:
+        raise RiskError("strategy must be intraday, %s, not %r" % (" or ".join(HOLD_STRATEGIES), strategy))
+    hold = strategy in HOLD_STRATEGIES
     method = loss_count(c)
+    cap_total, open_total, total_unknown = total_risk(c, day_risk, today, now_utc)
+    if cap_total is not None:
+        method = "total_risk"
     counted = {}
     if method == "open_risk":
         ok, why = day_risk_usable(day_risk, today, now_utc)
@@ -696,7 +727,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 reasons.append("format: a bracket order takes whole shares only, got qty %r" % qty)
             if tif not in ("day", "gtc"):
                 reasons.append("format: a bracket order needs time_in_force day or gtc, got %r" % tif)
-            if o.get("take_profit_limit_price") is None or o.get("stop_loss_stop_price") is None:
+            if hold and o.get("stop_loss_stop_price") is not None and o.get("take_profit_limit_price") is None:
+                pass                     # a holding has a stop and a sell date, and no take-profit
+            elif o.get("take_profit_limit_price") is None or o.get("stop_loss_stop_price") is None:
                 reasons.append("format: a bracket order needs both take_profit_limit_price and "
                                "stop_loss_stop_price")
         elif oc or o.get("advanced_instructions"):
@@ -857,10 +890,25 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                                  % (rr_net, rr, cost_note, _p(kc["k"] * (ref + target)),
                                                     _p(kc["k"] * (ref + stop)), _num(min_net),
                                                     " (evidence mode)" if evidence_mode(c) else ""))
-                    elif min_rr:
+                    elif min_rr and not hold:
                         later.append("reward:risk: no target to measure it against (min_reward_risk %s)"
                                      % _num(min_rr))
-            daily = _f(c.get("max_daily_loss_usd"))
+            daily = _f(c.get("max_daily_loss_usd")) if cap_total is None else None
+            if cap_total is not None:
+                if total_unknown:
+                    later.append("total risk: what all holdings could lose at their stops is not known (%s), "
+                                 "so nothing is bought" % total_unknown)
+                elif max_loss is not None and open_total + batch_loss + max_loss > cap_total + CENT:
+                    later.append("total risk: %s already at risk at the stops across all holdings plus %s for "
+                                 "this one = %s, over your cap of %s (%s%% of the account)"
+                                 % (money(open_total + batch_loss), money(max_loss),
+                                    money(open_total + batch_loss + max_loss), money(cap_total),
+                                    _pct(c["max_total_risk_pct"])))
+                elif max_loss is None:
+                    later.append("total risk: this entry has no stop, so its risk cannot be counted")
+                else:
+                    info.append("total risk before this: %s of %s across all holdings"
+                                % (money(open_total + batch_loss), money(cap_total)))
             if daily and max_loss is not None:
                 used = loss_today + batch_loss
                 if used + max_loss > daily + CENT:
@@ -869,12 +917,15 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                                        if method == "open_risk" else "already at risk",
                                                        money(max_loss), money(used + max_loss),
                                                        gbp_label(c, "max_daily_loss_usd")))
-            cap_t = int(c.get("max_trades_per_day") or 0)
+            cap_t = 0 if hold else int(c.get("max_trades_per_day") or 0)
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
-            later.extend(win_reasons)
-            if c.get("pdt_guard") and pdt_n >= 3:
+            if hold:
+                later.extend(r for r in win_reasons if "market is closed today" in r)
+            else:
+                later.extend(win_reasons)
+            if c.get("pdt_guard") and pdt_n >= 3 and not hold:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
                              % (pdt_n, ", ".join(pdt_list)))
@@ -890,7 +941,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 if rr_net is not None:
                     info.append("after costs (%s): reward:risk %.2f, max loss about %s"
                                 % (cost_note, rr_net, money(round(shares * net_risk, 2))))
-            if daily or cap_t:
+            if cap_total is not None:
+                if cap_t:
+                    info.append("today before this: %d of %s trades" % (len(entries_today) + batch_entries, cap_t))
+            elif daily or cap_t:
                 info.append("today before this: %d of %s trades, %s of %s daily loss"
                             % (len(entries_today) + batch_entries, cap_t or "unlimited",
                                money(loss_today + batch_loss), gbp_label(c, "max_daily_loss_usd") if daily else "no limit on"))
@@ -902,7 +956,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         if key in placed_keys:
             later.append("duplicate: a %s %s was already placed today" % (side, sym))
         passed_so_far = sum(1 for r in results if r["verdict"] == "PASS")
-        cap_n = int(c.get("max_orders_per_day") or 0)
+        cap_n = 0 if hold else int(c.get("max_orders_per_day") or 0)
         if cap_n and count_today + passed_so_far >= cap_n:
             later.append("daily limit: %d placed today plus %d passed earlier in this batch, "
                          "your limit is %d a day" % (count_today, passed_so_far, cap_n))
@@ -956,6 +1010,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         "cash_after": round(acct["cash"], 2),
         "today": {"orders_placed": count_today, "entries_placed": len(entries_today),
                   "loss_at_risk": round(loss_today, 2), "daily_loss_count": method,
+                  "total_risk_cap": cap_total, "total_risk_open": open_total, "strategy": strategy,
                   "day_trades_5d": pdt_n if c.get("pdt_guard") else None},
     }
 
@@ -1049,6 +1104,8 @@ def main(argv=None):
                     help="today's realised losses and open risk, for \"daily_loss_count\": \"open_risk\"")
     ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
+    ap.add_argument("--strategy", default="intraday",
+                    help="intraday (default), or news / drift: a holding, so the day-trade checks do not apply")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
     ap.add_argument("--no-write", action="store_true", help="do not record the verdicts")
     ap.add_argument("--json", action="store_true")
@@ -1075,7 +1132,7 @@ def main(argv=None):
             day_risk = read_json(a.day_risk, "day risk", required=False) if a.day_risk else None
         except RiskError:
             day_risk = None              # broken: the old count, with a warning
-        res = check(orders, cfg, portfolio, prices, state, a.today, now, times, day_risk)
+        res = check(orders, cfg, portfolio, prices, state, a.today, now, times, day_risk, a.strategy)
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]
         if not a.no_write:

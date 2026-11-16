@@ -332,7 +332,7 @@ def todo(b):
                                   e["symbol"], "today" if d == b["session"] else "on %s" % d.strftime("%a"), e["when"])))
     if b.get("drift_rows") is None:
         items.append((2, "Drift positions could not be read: check /status before the open."))
-    intraday = [r for r in b["positions"]["rows"] if not r.get("drift")]
+    intraday = [r for r in b["positions"]["rows"] if not r.get("drift") and not r.get("hold")]
     if intraday:
         names = ", ".join(r["symbol"] for r in intraday)
         eod = b.get("eod") or {}
@@ -382,8 +382,11 @@ def build(client, state_dir):
     b["earnings"] = earnings([session, b["next"]], held, set(b["flagged"]))
     b["drift_rows"] = drift_holdings(client, state_dir, cfg, session)
     drift_t = {r["ticker"] for r in b["drift_rows"] or []}
+    broker = t212._read_json(os.path.join(state_dir, "state", "broker.json"), {}) or {}
     for r in pos["rows"]:
         r["drift"] = r["ticker"] in drift_t
+        # a holding (news, or any label that is not a day trade) is MEANT to be held overnight
+        r["hold"] = t212.is_hold(t212.position_record(broker, r["ticker"], getattr(client, "env", "demo")))
     b["allocation"] = allocation_line(cfg, state_dir, session, prev, held, b["drift_rows"])
     b["todo"] = todo(b)
     b["drift"] = drift_line(state_dir, session, "briefing")
@@ -631,9 +634,10 @@ def phone_text(b, path, state_dir):
         how = (M.safety_words("order", r["stop"]) if r["fully_covered"] else
                M.safety_words("partial", covered=r["covered"], qty=r["qty"]) if r["covered"] else M.safety_words("none"))
         held.append((r["ticker"], r["qty"], r.get("price"), how))
-    if intraday:
+    day_trades = [r for r in intraday if not r.get("hold")]       # a news holding is meant to be held: no warning
+    if day_trades:
         problems.append("\u26a0\ufe0f Still holding from yesterday: %s. These are normally sold at the close."
-                        % ", ".join(M.company(r["ticker"]) for r in intraday))
+                        % ", ".join(M.company(r["ticker"]) for r in day_trades))
     big = [e for e in b.get("econ") or [] if e.get("big")]
     news = "; ".join("%s at %s UK" % (e["name"], e["uk_time"] or "a time not given") for e in big[:3]) or None
     ear = [(e["symbol"], "today" if d == b["session"] else "on %s" % d.strftime("%A"))

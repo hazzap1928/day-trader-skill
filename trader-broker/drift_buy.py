@@ -491,6 +491,22 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
         push(_msgs(sd).drift_none(err))
         return out
     risk_now = sum(r["risk_gbp"] for r in rows)
+    total_cap, total_now = None, 0.0
+    cap_pct = _num(cfg.get("max_total_risk_pct"))
+    if cap_pct:
+        # the cap on what ALL holdings (any strategy) could lose at their stops together: drift obeys it too
+        try:
+            ht = mod("trader-broker", "holdings_t212")
+            hh = mod("trader-broker", "holdings")
+            ht.t212, ht.holdings = T, hh
+            total_now = hh.open_risk(ht.view(positions, pending, {}, state, guard, client.env, rate))["open_risk_gbp"]
+            total_cap = round(f["budget_gbp"] * cap_pct / 100.0, 2)
+        except Exception as e:
+            for sym in ok:
+                skip(sym, "the total risk across all holdings could not be worked out (%s)" % str(e)[:100])
+            out["status"] = "total risk unknown"
+            release_all(sd, dayi, "total risk unknown")
+            return out
     fractional = bool(cfg.get("fractional"))
     step = 0.01 if fractional else 1
     for sym in ok:
@@ -532,6 +548,11 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
             skip(sym, "drift's open risk would be GBP %.2f + GBP %.2f, over the GBP %.2f cap (max_open_risk_pct)"
                  % (risk_now, sz["max_loss_gbp"], f["risk_cap_gbp"]))
             continue
+        if total_cap is not None and total_now + sz["max_loss_gbp"] > total_cap + 0.005:
+            settle(sd, dayi, sym, "released", "total-risk cap")
+            skip(sym, "the risk across all holdings would be GBP %.2f + GBP %.2f, over the GBP %.2f cap "
+                      "(max_total_risk_pct)" % (total_now, sz["max_loss_gbp"], total_cap))
+            continue
         try:
             sell_date = T.drift_sell_date(day, s["hold_days"] - 1)
         except T.T212Error as e:
@@ -545,6 +566,7 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None):
             continue
         settle(sd, dayi, sym, "used", "bought (drift)")
         risk_now += sz["max_loss_gbp"]
+        total_now += sz["max_loss_gbp"]
         info = {"symbol": sym, "qty": sz["qty"], "price": px, "stop": stop, "sell_date": sell_date,
                 "cost_gbp": sz["cost_gbp"], "max_loss_gbp": sz["max_loss_gbp"], "atr": round(atr, 4),
                 "order_id": T._ident((res.get("entry") or {}).get("id")), "stop_ok": res.get("stop_ok", True),
@@ -724,8 +746,8 @@ def friday_lines(sd, cfg, today=None):
     real = load_jsonl(trades_path(sd))
     shadow = [r for r in _drift().load_signals(sd) if (r.get("results") or {}).get(str(s["hold_days"]), {}).get("ret_net_pct") is not None]
     L = ["", "## Post-earnings drift (demo)",
-         "Pass rule: a positive average per closed trade after costs AND beating SPY over the same holding periods "
-         "(average vs SPY above 0). Under %d closed trades it is too few trades to judge." % s["min_trades"]]
+         "Pass rule: a positive average per closed trade after costs. SPY over the same holding periods is shown "
+         "for information only. Under %d closed trades it is too few trades to judge." % s["min_trades"]]
     L.append("- " + _judge_line("Real drift trades", [r["ret_pct"] for r in real if r.get("ret_pct") is not None],
                                 [r["vs_spy_pct"] for r in real if r.get("vs_spy_pct") is not None], s["min_trades"],
                                 extra="buying is %s" % ("ON" if active(cfg) else "OFF")))
@@ -750,7 +772,7 @@ def friday_phone(sd, cfg, today=None):
         if not n:
             return None
         avg, avg_vs = sum(rets) / n, (sum(vs) / len(vs) if vs else None)
-        ok = avg > 0 and avg_vs is not None and avg_vs > 0
+        ok = avg > 0                               # the market comparison is information, never the test
         status = ("on track" if ok else "not on track") if n >= s["min_trades"] else \
             "too few to judge yet (%d of %d)" % (n, s["min_trades"])
         return {"n": n, "avg": avg, "vs": avg_vs, "status": status}
@@ -766,7 +788,7 @@ def _judge_line(label, rets, vs, min_n, extra=None):
     if not n:
         return "%s: none closed yet: too few trades to judge." % label
     avg, avg_vs = sum(rets) / n, (sum(vs) / len(vs) if vs else None)
-    ok = avg > 0 and avg_vs is not None and avg_vs > 0
+    ok = avg > 0                                   # the market comparison is information, never the test
     lean = "ON TRACK" if ok else "NOT ON TRACK"
     status = lean if n >= min_n else "too few trades to judge (%d of %d; reads %s so far)" % (n, min_n, lean)
     return "%s: %d closed, average %+.2f%% after costs, average vs SPY %s: %s." % (

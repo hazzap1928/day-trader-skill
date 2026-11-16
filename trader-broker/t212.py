@@ -1175,16 +1175,16 @@ def cmd_place(client, args, confirm=None):
                         "a live account. Turn it off first. Nothing was sent.", 2)
     mode = stop_mode(cfg)
     sell_date = None
-    if strategy == "drift":
-        # drift buying (trader-broker/drift_buy.py): demo only, behind drift.buy_enabled, a real stop always
+    if strategy in HOLD_STRATEGIES:
+        # a holding (trader-broker/drift_buy.py, news_ideas.py): demo only, behind its own buy_enabled, a real stop always
         if client.env != "demo" or cfg.get("paper") is not True or cfg.get("live_enabled"):
-            raise T212Error("drift buying is demo only (\"paper\": true); nothing was sent", 2)
-        if (cfg.get("drift") or {}).get("buy_enabled") is not True:
-            raise T212Error("drift.buy_enabled is off in trader/config.json; nothing was sent", 2)
+            raise T212Error("%s buying is demo only (\"paper\": true); nothing was sent" % strategy, 2)
+        if (cfg.get(strategy) or {}).get("buy_enabled") is not True:
+            raise T212Error("%s.buy_enabled is off in trader/config.json; nothing was sent" % strategy, 2)
         sell_date = _iso_date(getattr(args, "sell_date", None))
         if sell_date is None or sell_date <= datetime.date.fromisoformat(_today_ny(ticket_module())):
-            raise T212Error("a drift buy needs a sell_date after today, not %r; nothing was sent"
-                            % (getattr(args, "sell_date", None),), 2)
+            raise T212Error("a %s buy needs a sell_date after today, not %r; nothing was sent"
+                            % (strategy, getattr(args, "sell_date", None)), 2)
         mode = "broker"               # held overnight and at weekends: a real stop, whatever stop_mode says
     allow = allowed_tickers(with_universe(cfg, sd))
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
@@ -1221,8 +1221,8 @@ def cmd_place(client, args, confirm=None):
     if side == "buy" and allow is not None and str(order.get("symbol", "")).upper() not in allow:
         raise T212Error("ticket %d buys %s, which is not on your allowed_tickers list; nothing was sent"
                         % (index, str(order.get("symbol", "")).upper()), 2)
-    if strategy == "drift" and (side != "buy" or kind != "entry"):
-        raise T212Error("ticket %d: a drift order must be a buy to open; nothing was sent" % index, 2)
+    if strategy in HOLD_STRATEGIES and (side != "buy" or kind != "entry"):
+        raise T212Error("ticket %d: a %s order must be a buy to open; nothing was sent" % (index, strategy), 2)
     if side == "sell" and kind != "exit":
         raise T212Error("ticket %d would sell short; this tool only buys to open and sells what you hold" % index, 2)
     if str(order.get("type", "market")).lower() != "market":
@@ -1278,7 +1278,8 @@ def cmd_place(client, args, confirm=None):
         stop = _num(order.get("stop_loss_stop_price")) or _num((order.get("plan") or {}).get("stop"))
         sz = size_entry(price, stop, ticket_qty, fx[0], cash, cfg, fractional_for(cfg, inst))
         bodies = [(MARKET, market_body(ticker, "buy", sz["qty"]))]
-        if mode == "broker" and is_fractional(sz["qty"]) and fractional_stops(cfg) == "software" and strategy != "drift":
+        if (mode == "broker" and is_fractional(sz["qty"]) and fractional_stops(cfg) == "software"
+                and strategy not in HOLD_STRATEGIES):
             mode = "software"                     # fractional position: the guard holds the stop
         if mode == "broker":
             bodies.append((STOP, stop_body(ticker, sz["qty"], stop)))
@@ -1314,12 +1315,14 @@ def cmd_place(client, args, confirm=None):
             "paper": client.env == "demo", "t212_ticker": ticker, "reply": reply,
             "plain": "%s %s %s, market" % (side.upper(), _qty(sz["qty"]), ticker)}
     if side == "buy":
-        base.update(strategy=strategy,               # "intraday", or "drift" with its sell_date
+        base.update(strategy=strategy,               # "intraday", or "drift" / "news" with its sell_date
                     max_loss=sz["max_loss_usd"], max_loss_gbp=sz["max_loss_gbp"], stop=sz["stop_usd"],
                     entry=sz["entry_usd"], cost_gbp=sz["cost_gbp"], fx_rate=fx[0],
                     target=_num(order.get("take_profit_limit_price")) or _num((order.get("plan") or {}).get("target")))
         if sell_date is not None:
             base["sell_date"] = sell_date.isoformat()
+        if getattr(args, "idea", None):
+            base["idea"] = str(args.idea)             # the news idea this buy came from (trader/state/news/)
     path, body = bodies[0]
     _record(paths["state"], state, dict(base, at=tk.ny_iso(_utc_now()), status="sending"))
     log_event(sd, secrets, "request", env=client.env, ticket=index, fingerprint=fp, method="POST", path=path, body=body)
@@ -1526,17 +1529,25 @@ def guard_ticket(state, ticker, env):
     return found
 
 
-STRATEGIES = ("intraday", "drift")
+STRATEGIES = ("intraday", "drift", "news")
+HOLD_STRATEGIES = ("drift", "news")        # held for days or weeks: demo only, a real stop, a sell date
 
 
 def position_strategy(rec):
-    """"intraday" or "drift" for a buy record. No label (records from before labels) is intraday."""
-    s = str((rec or {}).get("strategy") or "intraday").strip().lower()
-    return s if s in STRATEGIES else "intraday"
+    """The strategy label of a buy record, as written (lower case). No label at all (records from before
+    labels) is "intraday". A label this pack does not know is returned as it is: such a position is a
+    holding, kept and reported, never sold as a day trade."""
+    return str((rec or {}).get("strategy") or "intraday").strip().lower()
 
 
 def is_drift(rec):
     return rec is not None and position_strategy(rec) == "drift"
+
+
+def is_hold(rec):
+    """Anything that is not a plain day trade: drift, news, and any unknown label. No trailing stop, no half
+    sale, and the 15:50 close keeps it."""
+    return rec is not None and position_strategy(rec) != "intraday"
 
 
 def position_record(state, ticker, env):
@@ -1558,16 +1569,39 @@ def _iso_date(v):
         return None
 
 
-def drift_due(rec, today):
-    """(due, why) for a drift record on the New York date `today` (a date or "YYYY-MM-DD").
-    Due on its sell_date or later. A drift record with no readable sell_date is due (sold, as intraday is)."""
+def hold_due(rec, today, approved=False):
+    """(due, why, report) for a holding (any record that is not a day trade) on the New York date `today`.
+    Due on its sell_date or later, or when you approved its sale. KEEP AND REPORT is the default: an
+    unknown label, or no readable sell date, is never due; `report` is then True so you are told."""
+    label = position_strategy(rec)
     d = _iso_date(rec.get("sell_date"))
     t = today if isinstance(today, datetime.date) else _iso_date(today)
+    if label not in STRATEGIES:
+        return False, "KEPT: its label %r is not one this pack knows, so no rule sells it" % label, True
+    if approved:
+        return True, "%s, a sale you approved" % label, False
     if d is None:
-        return True, "drift record with no readable sell_date, so closed like an intraday position"
+        return False, "KEPT: a %s holding with no readable sell date, so no rule sells it" % label, True
     if t >= d:
-        return True, "drift sell date %s%s" % (d.isoformat(), "" if t == d else ", overdue")
-    return False, "drift, sell date %s" % d.isoformat()
+        return True, "%s sell date %s%s" % (label, d.isoformat(), "" if t == d else ", overdue"), False
+    return False, "%s, sell date %s" % (label, d.isoformat()), False
+
+
+def drift_due(rec, today):
+    """(due, why) for a drift record: hold_due without the report flag."""
+    return hold_due(rec, today)[:2]
+
+
+def approved_sales(state_dir, env):
+    """Tickers whose sale you approved on your phone (holdings pages with status "selling"), for this
+    account. The 15:50 close sells them; nothing else reads this."""
+    doc = _read_json(os.path.join(state_dir, "state", "holdings.json"), {}) or {}
+    out = set()
+    for p in doc.get("pages") or []:
+        if (isinstance(p, dict) and p.get("status") == "selling" and p.get("broker") == "trading212"
+                and p.get("account") == env and (p.get("broker_ref") or {}).get("ref")):
+            out.add(p["broker_ref"]["ref"])
+    return out
 
 
 _ALERTS = []
@@ -2050,7 +2084,7 @@ def guard_pass(client, state_dir):
             if sw and sw.get("fingerprint") == rec.get("fingerprint"):
                 stop_still_missing(g, ticker, held - covered, sw)
             ticket_qty = min(float(_num(rec["qty"])), held - covered)
-            guard_market(g, row, rec, held - covered, ticket_qty, row["price"], None if is_drift(rec) else trail, cfg)
+            guard_market(g, row, rec, held - covered, ticket_qty, row["price"], None if is_hold(rec) else trail, cfg)
             if row.get("status") == "watching":
                 row["status"] = "software stop"
                 row["note"] = "the guard sells at market at or under %.2f (%s)" % (row["stop"], row["software"])
@@ -2077,14 +2111,14 @@ def guard_pass(client, state_dir):
                    "then delete %s from \"unclear\" in %s" % (ticker, g.unclear[ticker], ticker, g.path))
             continue
         if mode == "market":
-            guard_market(g, row, rec, held, ticket_qty, price, None if is_drift(rec) else trail, cfg)
+            guard_market(g, row, rec, held, ticket_qty, price, None if is_hold(rec) else trail, cfg)
             continue
         want = min(held, ticket_qty) - covered          # never more than the ticket bought
         want = _floor(want, 0.01 if (want % 1) > 1e-9 else 1)
         if want <= 0:
             row["status"] = "covered"
-            if is_drift(rec):
-                row["trail"] = "drift position: no trailing or half sale, the stop stays where it is"
+            if is_hold(rec):
+                row["trail"] = "%s position: no trailing or half sale, the stop stays where it is" % position_strategy(rec)
             elif trail and price is not None:
                 guard_trail(g, row, rec, stops[0], held, price, trail, cfg) if len(stops) == 1 else \
                     row.update(trail="not trailed: %d stop orders cover it, the guard trails exactly one" % len(stops))
@@ -2172,7 +2206,9 @@ def eod_close(client, state_dir):
     the shares). Exits only: every write is a cancel or a SELL. Demo only.
     Which positions, from their buy record in trader/state/broker.json:
       intraday (or no strategy label): sold
-      drift: sold on or after its sell_date; before it, kept with its stop untouched
+      drift, news: sold on or after its sell_date, or when you approved its sale on your phone;
+                   before that, kept with its stop untouched
+      an unknown label, or no readable sell date: KEPT, and a GUARD ALERT says so
       no buy record at all: not sold, and a GUARD ALERT says so
     Returns {"at", "closed": [...], "failed": [...], "kept": [...], "unknown": [...], "nothing": bool}."""
     if client.env != "demo":
@@ -2185,6 +2221,7 @@ def eod_close(client, state_dir):
     today = _today_ny(tk)
     positions = client.get(POSITIONS) or []
     pending = client.get(ORDERS) or []
+    approved = approved_sales(state_dir, client.env)
     for p in positions:
         ticker = _o_ticker(p)
         held = _num(p.get("quantity")) or 0
@@ -2196,14 +2233,19 @@ def eod_close(client, state_dir):
                                   "sell it. Sell it yourself in the app if it should go" % (ticker, _qty(held)))
             continue
         why = ""
-        if is_drift(rec):
-            due, why = drift_due(rec, today)
+        if is_hold(rec):
+            due, why, report = hold_due(rec, today, ticker in approved)
             if not due:
-                out["kept"].append("%s: %s held, %s: kept, its stop left in place" % (ticker, _qty(held), why))
+                if report:
+                    out["unknown"].append("%s: %s held. %s. Its stop is left in place; sell it yourself in the app "
+                                          "if it should go" % (ticker, _qty(held), why))
+                else:
+                    out["kept"].append("%s: %s held, %s: kept, its stop left in place" % (ticker, _qty(held), why))
                 continue
             if "overdue" in why:
-                out["overdue"].append("%s: its drift sell date was %s, so it is sold at today's close instead "
-                                      "(the Mac or the guard was off on the day)" % (ticker, rec.get("sell_date")))
+                out["overdue"].append("%s: its %s sell date was %s, so it is sold at today's close instead "
+                                      "(the Mac or the guard was off on the day)"
+                                      % (ticker, position_strategy(rec), rec.get("sell_date")))
         stops, others = guard_sell_orders(pending, ticker)
         if g.unclear.get(ticker):
             out["failed"].append("%s: NOT CLOSED, an earlier guard order is unclear (%s); sell it in the app"

@@ -362,12 +362,14 @@ class Report(Base):
                            (calendar.timegm((2026, 11, 6, 14, 30, 0)), 100.5, 0, 0, spy[1])]
         return ev.build_report(self.client, self.dir, self.cfg, FakeReport(trips), fetch_daily=daily, today=today)
 
-    def test_on_track_needs_both_tests(self):
+    def test_on_track_is_making_money_and_the_tracker_is_information_only(self):
         r = self.report([self.trip(12.0), self.trip(8.0)], "2026-11-06")
         self.assertEqual(r["status"], "ON TRACK")                     # +1.0% vs the tracker's +0.9%
         self.assertAlmostEqual(r["strategy_ret"], 0.01)
         r = self.report([self.trip(12.0), self.trip(8.0)], "2026-11-06", spy=(100.0, 103.0))
-        self.assertEqual(r["status"], "NOT ON TRACK")
+        self.assertEqual(r["status"], "ON TRACK")                     # behind the S&P 500: shown, never a fail
+        self.assertFalse(r["ok_tracker"])
+        self.assertIn("for information", ev.report_text(r))
         r = self.report([self.trip(-5.0), self.trip(1.0)], "2026-11-06")
         self.assertEqual(r["status"], "NOT ON TRACK")
 

@@ -499,9 +499,8 @@ class Pilot(object):
                 side = str(o.get("side") or "").upper()
                 if side == "BUY" or (not side and (t212._num(o.get("quantity")) or 0) > 0):
                     held.add(str(t212._o_ticker(o) or "").split("_")[0].upper())
-            # drift positions have their own slots: they never count toward intraday's max_open_positions
-            state = t212._read_json(self.p("state", "broker.json"), {}) or {}
-            held -= {t.split("_")[0].upper() for t in self.drift_buy().drift_tickers(state, self.client.env)}
+            # holdings (drift, news) have their own slots: they never count toward intraday's max_open_positions
+            held -= {t.split("_")[0].upper() for t in self.hold_tickers()}
         except t212.T212Error as e:
             self.say("positions count failed (%s): the cash check at placing time decides"
                      % t212.scrub(e, self.client._secrets))
@@ -714,17 +713,20 @@ class Pilot(object):
         is removed, so trader-risk counts the old, stricter way (full risk of every entry today)."""
         dr = mod("trader-broker", "day_risk")
         try:
-            if dr.count_of(self.cfg) != "open_risk":
+            cap = dr.total_cap_pct(self.cfg)     # the cap on total risk across all holdings, when it is set
+            if dr.count_of(self.cfg) != "open_risk" and not cap:
                 return
         except ValueError:
             return                               # trader-risk refuses the bad setting with the reason
         report = mod("trader-broker", "report")
         report.t212, report.tk = t212, tk
         try:
-            dr.build(self.client, self.sd, _ny().date().isoformat(), report_mod=report)
+            dr.build(self.client, self.sd, _ny().date().isoformat(), report_mod=report, with_total=bool(cap))
         except Exception as e:
-            self.say("day risk: could not be read from Trading 212 (%s); the daily loss counts the old way"
-                     % t212.scrub(e, self.client._secrets))
+            self.say("day risk: could not be read from Trading 212 (%s); %s"
+                     % (t212.scrub(e, self.client._secrets),
+                        "the total risk is not known, so trader-risk blocks new buys" if cap
+                        else "the daily loss counts the old way"))
             try:
                 os.remove(dr.path(self.sd))
             except OSError:
@@ -975,6 +977,9 @@ class Pilot(object):
             self.phone.send(M.help_text())
 
     def tap(self, u):
+        ms = re.match(r"^(sa|sr):([0-9a-f]{8}):([0-9a-f]{16})$", u["data"])
+        if ms:
+            return self.sell_tap(u, ms.group(2), ms.group(3), ms.group(1) == "sa")
         m = re.match(r"^(ap|rj):([0-9a-f]{8}):([0-9a-f]{16})$", u["data"])
         t = None
         if m:
@@ -1114,12 +1119,22 @@ class Pilot(object):
                            push=phone is not None, phone=phone)
 
     def _drift_ticker(self, t212_ticker):
+        """True for a holding (drift, news, or an unknown label): its buy and sale have their own messages."""
+        return t212_ticker in self.hold_tickers()
+
+    def hold_tickers(self):
+        """Every Trading 212 ticker whose latest buy record is a holding, not a day trade."""
         try:
-            db = self.drift_buy()
-            return t212_ticker in db.drift_tickers(t212._read_json(self.p("state", "broker.json"), {}) or {},
-                                                   self.client.env)
+            state = t212._read_json(self.p("state", "broker.json"), {}) or {}
+            latest = {}
+            for r in state.get("orders") or []:
+                if (r.get("broker") == "trading212" and r.get("env") == self.client.env and r.get("t212_ticker")
+                        and str(r.get("side", "")).lower() == "buy" and r.get("kind") == "entry"
+                        and r.get("status") != "failed"):
+                    latest[r["t212_ticker"]] = r
+            return {t for t, r in latest.items() if t212.is_hold(r)}
         except Exception:
-            return False
+            return set()
 
     def fill_message(self, t212_ticker, qty, avg):
         """The one buy message, with the real fill price: for a buy the autopilot placed (unless it was already
@@ -1208,6 +1223,10 @@ class Pilot(object):
         per = f.get("max_loss_per_trade_gbp", c.get("max_loss_per_trade_gbp"))
         day = f.get("max_daily_loss_gbp", c.get("max_daily_loss_gbp"))
         n = len(t212.allowed_tickers(self.cfg) or [])
+        cap = t212._num(c.get("max_total_risk_pct"))
+        if cap and t212._num(c.get("budget_gbp")):
+            return "Most I'll risk: %s a trade, %s across everything held. Choosing from %d companies" % (
+                M.gbp(per), M.gbp(float(c["budget_gbp"]) * cap / 100.0), n)
         return "Most I'll risk: %s a trade, %s a day. Choosing from %d companies" % (M.gbp(per), M.gbp(day), n)
 
     def holdings(self):
@@ -1292,6 +1311,108 @@ class Pilot(object):
             self.evidence_close(report)
         self.drift_resolve()
         self.drift_sells()
+        self.holdings_match()
+
+    # ------------------------------------------------------------ the holdings record and the news strategy
+
+    def news(self):
+        """trader-broker/news_ideas.py and the holdings modules, with this autopilot's own t212 (one set of fakes)."""
+        nw = mod("trader-broker", "news_ideas")
+        h, ht = mod("trader-broker", "holdings"), mod("trader-broker", "holdings_t212")
+        ht.t212, ht.holdings = t212, h
+        nw.t212, nw.drift, nw.allocation, nw.holdings, nw.holdings_t212 = t212, mod("trader-broker", "drift"), allocation, h, ht
+        return nw
+
+    def holdings_match(self):
+        """The daily match of the holdings record against Trading 212 (report only: it never places, cancels
+        or fixes anything). New disagreements go to the phone once. Never stops the day."""
+        try:
+            nw = self.news()
+            rate = self.rate()
+            if not rate:
+                self.fx_fresh()
+                rate = self.rate()
+            if not rate:
+                raise PilotError("no GBP/USD rate in trader/fx.json")
+            report = mod("trader-broker", "report")
+            report.t212, report.tk = t212, tk
+            res = nw.holdings_t212.daily_match(self.client, self.sd, rate, _ny().date().isoformat(), report,
+                                               ideas=nw.ideas_by_id(self.sd))
+            self.say(nw.holdings_t212.text(res))
+            if res["new"]:
+                phone_mod.push(self.sd, M.holdings_mismatch(res["new"]), phone=self.phone)
+            for ev, page in res["events"]:
+                if ev == "closed" and page.get("strategy") == "news":
+                    phone_mod.push(self.sd, M.news_sold(page), phone=self.phone)
+        except Exception as e:
+            self.say("holdings match: could not check today (%s)" % t212.scrub(e, self.client._secrets))
+
+    def news_buy_due(self, ny):
+        if self.state.get("news_buy") == self.state.get("day"):
+            return False
+        try:
+            cfg = self.drift_cfg()
+            nw = self.news()
+            if not nw.active(cfg):
+                return False
+            h, m = _hm(nw.settings(cfg)["buy_at"], "09:35")
+        except Exception:
+            return False
+        return ny >= ny.replace(hour=h, minute=m, second=0, microsecond=0)
+
+    def news_buy_step(self):
+        """The news buys (news_ideas.py), once a day, only with news.buy_enabled. Never stops the day."""
+        self.state["news_buy"] = self.state.get("day")
+        self.save()
+        try:
+            nw = self.news()
+            cfg = self.drift_cfg()
+            if not nw.active(cfg):
+                return
+            rate = self.rate()
+            if not rate:
+                self.fx_fresh()
+                rate = self.rate()
+            if not rate:
+                raise PilotError("no GBP/USD rate in trader/fx.json")
+            res = nw.buy_today(self.client, self.sd, cfg, _ny(), rate, self.drift_quote, bool(self.state.get("paused")),
+                               self.say, lambda text: phone_mod.push(self.sd, text, phone=self.phone))
+            self.say("news buy: %s; bought %s; skipped %s" % (
+                res["status"], ", ".join(b["symbol"] for b in res["bought"]) or "none",
+                "; ".join("%s (%s)" % kv for kv in res["skipped"]) or "none"))
+        except Exception as e:
+            self.say("news buy step failed (nothing more is bought on news today): %s" % t212.scrub(e, self.client._secrets))
+            phone_mod.push(self.sd, M.news_buy_failed(), phone=self.phone)
+
+    def news_asks(self):
+        """Send each waiting "sell it?" request (a news holding whose reason looks broken) with Approve and
+        Reject. A request is only ever a question: nothing is sold here."""
+        try:
+            nw = self.news()
+            for a in nw.asks_to_send(self.sd):
+                mid = self.phone.send(M.news_sell_ask(a), [("Approve", "sa:%s:%s" % (a["id"], a["nonce"])),
+                                                         ("Reject", "sr:%s:%s" % (a["id"], a["nonce"]))])
+                nw.mark_sent(self.sd, a["id"], mid)
+                self.say("asked on the phone: sell %s? (%s)" % (a["symbol"], a["why"]))
+        except Exception as e:
+            self.say("news sell requests: not sent (%s)" % t212.scrub(e, self.client._secrets))
+
+    def sell_tap(self, u, ask_id, nonce, approve):
+        """Your Approve or Reject on a "sell it?" request. Approve marks the holding for the guard's next
+        15:50 close; the autopilot itself never sells."""
+        try:
+            outcome, ask = self.news().answer(self.sd, ask_id, nonce, approve)
+        except Exception as e:
+            self.say("sell request %s: could not be answered (%s)" % (ask_id, t212.scrub(e, self.client._secrets)))
+            self.phone.answer(u["id"], M.SELL_TAP["unknown"])
+            return
+        self.phone.answer(u["id"], M.SELL_TAP.get(outcome, M.SELL_TAP["unknown"]))
+        if outcome in ("approved", "rejected"):
+            self.say("sell request %s (%s): %s by you" % (ask_id, ask["symbol"], outcome))
+            try:
+                self.phone.edit(ask.get("message_id"), M.news_sell_end(M.news_sell_ask(ask), outcome))
+            except phone_mod.PhoneError as e:
+                self.say("could not update the phone message: %s" % e)
 
     # ------------------------------------------------------------ post-earnings drift (SHADOW, never an order)
 
@@ -1609,6 +1730,7 @@ class Pilot(object):
                 self.flush_phone()
                 self.catch_up_briefing()
                 self.universe_refresh()
+                self.news_asks()
                 st = alerts.market_status(_utc())
                 if st.get("opens") and not self.state.get("summary_sent"):
                     self.day()
@@ -1665,6 +1787,7 @@ class Pilot(object):
                 pass
             self.save()
         if self.state.get("open_sent") != self.state["day"]:
+            self.holdings_match()                   # report only: the record against Trading 212, before the open message
             phone_mod.push(self.sd, self.open_message(first, last), phone=self.phone)
             self.state["open_sent"] = self.state["day"]
             self.save()
@@ -1681,6 +1804,9 @@ class Pilot(object):
                 continue
             if self.drift_buy_due(ny):
                 self.drift_buy_step()                   # drift buys first each morning, before 09:45
+            if self.news_buy_due(ny):
+                self.news_buy_step()                    # then news buys (only with news.buy_enabled)
+            self.news_asks()
             if ny >= next_cycle and next_cycle <= last:
                 try:
                     self.cycle_started = _now()

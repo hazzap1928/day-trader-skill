@@ -204,6 +204,9 @@ def build(client, state_dir):
     today, week, bought_today, drift_closed = [], [], [], []
     drift_keys = {(x.get("t212_ticker"), str(x.get("date") or "")) for x in broker.get("orders") or []
                   if str(x.get("strategy") or "").lower() == "drift" and str(x.get("side", "")).lower() == "buy"}
+    news_keys = {(x.get("t212_ticker"), str(x.get("date") or "")) for x in broker.get("orders") or []
+                 if str(x.get("strategy") or "intraday").strip().lower() not in ("intraday", "drift")
+                 and str(x.get("side", "")).lower() == "buy"}       # news (or an unknown label): not a day trade
     if fills is not None:
         closed, open_lots = round_trips(fills)
         for c in closed:
@@ -212,6 +215,8 @@ def build(client, state_dir):
                 if d == day:
                     drift_closed.append(c)          # a drift sale: reported as DRIFT SELL, not an intraday trade
                 continue
+            if c.get("entry_at") and (c["ticker"], tk.to_eastern(c["entry_at"]).date().isoformat()) in news_keys:
+                continue                            # a news sale: told by its own message, not a day trade
             sym = (c["ticker"] or "").split("_")[0].upper()
             rec, tm = ticket_for(sym, d.isoformat(), broker, pilot)
             c.update(symbol=sym, reason=exit_reason(c, guard, t212._num((rec or {}).get("stop")), d.isoformat()),
@@ -224,7 +229,8 @@ def build(client, state_dir):
             if d == day:
                 today.append(c)
         for f in fills:
-            if f["side"] == "BUY" and tk.to_eastern(f["at"]).date() == day and (f["ticker"], day.isoformat()) not in drift_keys:
+            if (f["side"] == "BUY" and tk.to_eastern(f["at"]).date() == day
+                    and (f["ticker"], day.isoformat()) not in drift_keys | news_keys):
                 bought_today.append(f)
     r.update(today=today, week=week, bought_today=bought_today, fills_ok=fills is not None, drift_closed=drift_closed)
     try:
