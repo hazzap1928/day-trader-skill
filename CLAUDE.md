@@ -21,7 +21,10 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/phone.py` | the user's own Telegram bot: messages, Approve/Reject buttons, an outbox for failed sends |
 | `trader-broker/messages.py` | **every word sent to the phone**, one function per message type (see "Phone messages") |
 | `trader-broker/drift.py` | post-earnings drift **shadow** scan: shortlist, signal log, virtual results. No Trading 212 connection, never an order |
-| `trader-broker/drift_buy.py` | drift **buying** (stage 3), OFF unless `drift.buy_enabled`: the 09:33 buys, reservations, holdings lines, DRIFT SELL, the Friday drift section |
+| `trader-broker/drift_buy.py` | drift **buying** (stage 3), only with `drift.buy_enabled` (ON since 12 Nov): the 09:33 buys, reservations, holdings lines, DRIFT SELL, the Friday drift section |
+| `trader-broker/holdings.py` | the **holdings record**: one page per buy (reason, stop, sell rule, result), the match and the open-risk sum. Broker-neutral: no broker code |
+| `trader-broker/holdings_t212.py` | Trading 212's side of the record: the account as a plain "view", and the daily match. **Read-only, report only** |
+| `trader-broker/news_ideas.py` | the **"news" strategy**: ideas from a scheduled `claude -p` run, checked by the pack's rules. **Shadow** unless `news.buy_enabled` (see "News ideas") |
 | `trader-broker/evidence.py` | evidence mode (forward test): signal log, virtual results, slippage, Friday report |
 | `trader-broker/briefing.py`, `report.py` | 07:30 morning briefing; closing report from Trading 212's own fills |
 | `trader-broker/allocation.py` | demo cash allocation: per-trade cap, morning reservations, free pool, max open positions |
@@ -31,6 +34,12 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/go_live.py` | the user's own switch to live (checklist in `GO_LIVE.md`). **Claude never runs it** |
 | `trader-kronos/` | Kronos-small forecasts, **shadow only**; own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
 | `research/` | backtest scripts and `README.md` with the results (data goes in `trader/research-data/`) |
+| `docs/hold-agent-spec.md` | the hold-and-review spec and the owner's decisions of 16 Nov 2026 |
+
+**Direction (16 Nov 2026):** the day-trading engine is being replaced by a hold-and-review agent
+(`docs/hold-agent-spec.md`). Built so far: the holdings record and daily match, "keep and report" at the
+close, the cap on total risk, the news strategy in shadow. Still to do: the daily review, rule and
+approval sales for every strategy, and retiring the ORB scanner LAST (it still runs).
 
 The guard's protections:
 - stops are good till cancelled, and checked again 1 minute after placing and on every cycle
@@ -39,20 +48,111 @@ The guard's protections:
 - end-of-day close at 15:50 New York: it cancels each stop, then sells at market. Which positions
   depends on the buy record in `trader/state/broker.json` (see "Strategy labels" below)
 
-## Strategy labels (post-earnings drift, stage 1 of 4)
+## Strategy labels, and "keep and report" at the close (from 16 Nov 2026)
 
-- Each buy record has `"strategy"`: `"intraday"` or `"drift"`. `t212.py place` (and so the autopilot)
-  labels every buy `"intraday"`. A record with no label counts as intraday. Nothing buys drift yet:
-  the drift scan, drift buying behind a switch, and switching it on are stages 2 to 4.
-- A drift record also has `"sell_date"`, a New York trading date. `t212.drift_sell_date(entry, n)`
-  works it out as n NYSE trading days after the entry date (the holiday list in
+- Each buy record has `"strategy"`: `"intraday"`, `"drift"` or `"news"` (`t212.STRATEGIES`).
+  `t212.py place` labels a buy `"intraday"` unless told otherwise. A record with **no** label counts
+  as intraday. Any other label is kept as written: `t212.is_hold(rec)` is true for everything that
+  is not intraday, unknown labels included.
+- A drift or news record also has `"sell_date"`, a New York trading date. `t212.drift_sell_date(entry, n)`
+  works one out as n NYSE trading days after the entry date (the holiday list in
   `trader-alerts/alerts.py`, 2026 and 2027 only; past that it refuses).
-- The 15:50 close sells intraday and unlabelled positions, and drift positions on or after their
-  `sell_date` (or with no readable one). It keeps a drift position before its sell date, stop untouched.
-  A position with no buy record at all is **not sold**: it gets a GUARD ALERT instead.
-- The 1R trailing stop and half-sell-at-target are intraday only. Drift keeps its fixed stop, the
-  missing-stop check and the software-stop backup.
-- Tests: `tests/test_drift.py`.
+- **The 15:50 close** (`t212.eod_close`, `hold_due`) sells:
+  - intraday and unlabelled positions
+  - a drift or news position on or after its `sell_date`
+  - a position whose sale the owner approved on the phone (a holdings page with status `selling`)
+- **It keeps, and reports with a GUARD ALERT, never sells:** an unknown label, a holding with no
+  readable sell date, a position with no buy record at all. (Before 16 Nov a drift record with no
+  date, or an unknown label, was sold as a day trade.)
+- The 1R trailing stop and half-sell-at-target are intraday only. Every holding keeps its fixed stop,
+  the missing-stop check and the software-stop backup.
+- Tests: `tests/test_drift.py`, `tests/test_holdings.py`.
+
+## The holdings record and the daily match (from 16 Nov 2026)
+
+- **`trader/state/holdings.json`:** one page per buy: `symbol`, `strategy`, `reason`, `wrong_if`, `event`,
+  `sources`, `buy_date`, `buy_price`, `qty`, `stop`, `sell_rule` (`date`, `rule`), `status`, `result`,
+  plus `broker`, `account` and `broker_ref` (the broker's own ticker). Every change is also added to
+  `holdings-log.jsonl`. `holdings.py` has no broker code, so an Interactive Brokers version can reuse it.
+- **Status:** `waiting` (not filled), `open`, `sell_asked`, `selling` (approved: the next close sells it),
+  `closed` (with the result from the broker's own fills), `mismatch`.
+- **The daily match** (`holdings_t212.daily_match`, from the autopilot before the MARKET OPEN message and
+  after the closing report): it reads positions, pending orders and, when needed, the fill history. It
+  makes pages for new buys, closes pages whose sale shows in the fills, and lists every disagreement:
+  held with no page, a page with nothing held and no sale, share counts that differ, no stop, a part
+  stop, a software stop, a stray stop, an unknown label, no sell date.
+- **Report only.** It never places, cancels or changes an order, and never "fixes" a page. A new
+  disagreement goes to the phone once (`messages.holdings_mismatch`); it is told again only if it changes.
+- **By hand:** `python3 trader-broker/holdings.py show [--all]`, `python3 trader-broker/holdings_t212.py match`.
+- **Tests:** `tests/test_holdings.py`.
+
+## The cap on total risk (from 16 Nov 2026, replaces the daily loss limit)
+
+- **`"max_total_risk_pct": 4`** in the config: everything ALL holdings (any strategy, plus buys waiting
+  to fill) could lose at their stops together is at most 4% of the account. With the key set, the 3%
+  daily loss limit is **not checked** (`max_daily_loss_gbp` is still written each morning, unused).
+  Without the key the old daily count applies.
+- **How it is counted** (`holdings.open_risk`): per position, shares x (price paid - stop) plus the FX
+  fee, at the live stop order, else the guard's software stop, else the stop its buy planned. A
+  position with no stop at all counts its **whole value**. A buy waiting to fill counts its planned loss.
+- **Where it is enforced:**
+  - trader-risk (`check.total_risk`): the autopilot writes `"total"` into `trader/state/day-risk.json`
+    (`day_risk.total`, read-only from Trading 212, read again before every check, never reused). Missing,
+    stale or unreadable means the entry is **blocked** ("total risk is not known"), never passed.
+  - drift buying (`drift_buy.buy_today`) and the news strategy check it themselves.
+- Realised losses no longer stop the day. `max_trades_per_day` (5) and the 1% a trade still limit ORB.
+- **Tests:** `tests/test_total_risk.py`.
+
+## News ideas (from 16 Nov 2026): `trader-broker/news_ideas.py`, SHADOW
+
+- **Switch:** `"news": {"buy_enabled": false}` is the default. **Only the owner turns it on; Claude never
+  does.** Demo only: it refuses when `paper` is not true, and `t212.py place` refuses a news order on
+  live, with buying off, or without a sell date after today.
+- **The morning run** (launchd job `news`, weekdays 12:00 UK, `run-news.sh`; skips US holidays; once a day):
+  1. `claude -p` (the owner's Claude Code plan, no API key) with **web search and web fetch only**, run
+     in an empty folder without the pack's keys in its environment. The prompt lists the universe and
+     any held news positions, and asks for one JSON object.
+  2. Each idea needs: company, `why`, `event`, `event_date` (today or later), `wrong_if`, `sell_rule`,
+     `sell_date` (after today, at most `max_hold_days` 120 away, moved back to a trading day), and at
+     least one source with a URL and a date. Anything missing is rejected.
+  3. Checks by code: the universe, `blocked_tickers`, a stop (`atr_mult` 3 x the 14-day ATR under the
+     price, a setting, untested), size (`t212.size_entry`: 1% max loss, `max_position_pct`, and the room
+     left after drift and everything held, at least `min_buy_gbp` 100), trader-risk with
+     `strategy="news"`, and the total-risk cap. With the account unreadable no idea passes.
+     In shadow the run keeps a pretend book: earlier passed ideas that would still be held, and the ones
+     passed earlier the same morning, count toward the room, the total-risk cap and `max_positions`.
+  4. Every idea, passed or rejected, goes to `trader/state/news/ideas.jsonl`; today's are in `today.json`;
+     each run in `runs.jsonl`. One message to the phone (`messages.news_ideas`).
+  5. After the message: headlines and filings (trader-news), company facts (trader-analyst) and a Kronos
+     verdict are added to each passing idea, for information, inside a time budget. They never block.
+- **trader-risk and a holding:** with `strategy` news or drift (`check.py --strategy`), the entry window,
+  trades and orders a day, day trades and the reward:risk target do not apply; every other check does.
+  The ORB scan, trader-budget's `size.py` (it needs a price target) and the Time Machine are not used.
+- **Virtual results** (`resolve`, at the start of each morning run): bought at the open of its day, sold
+  at its stop (a gap fills at the open) or at the close on its sell date, in pounds after 0.15% FX +
+  0.05% slippage each way, from final daily closes only. SPY over the same days is logged for
+  information.
+- **A failed Claude run:** logged, `today.json` says `failed`, one message (once a day), and the buy
+  step buys nothing: it only reads a `today.json` that is for today and `ok`.
+- **With buying on:** the autopilot's `news_buy_step` at `buy_at` 09:35 New York checks each idea again
+  at a fresh quote and places it through `t212.cmd_place` with `strategy="news"`, the sell date, the
+  idea id, the cash check and a real stop. Never twice: `buys.jsonl`, and a stock held or waiting is skipped.
+- **Broken reasons:** the morning run reviews held news positions. A reason marked broken with a dated
+  source makes a request in `trader/state/news/asks.json`; the autopilot sends it with Approve and
+  Reject (`sa:`/`sr:` buttons). Approve sets the page to `selling` and the guard's next 15:50 close
+  sells it. Reject or no answer keeps it, stop in place. The autopilot itself never sells.
+- **Settings** (in `news`): `buy_enabled`, `enabled`, `buy_at`, `max_ideas` (5), `max_positions` (5),
+  `atr_mult` (3), `atr_days` (14), `max_hold_days` (120), `min_buy_gbp` (100), `model`, `timeout_min` (25),
+  `kronos_minutes` (10).
+- **Honest limits:** an idea is a model's reading of public web pages. It is untested, pages can be
+  wrong or try to mislead, and nothing in `research/` has beaten holding an S&P 500 tracker.
+- **By hand:** `python3 trader-broker/news_ideas.py show|resolve|selftest`; `run --force` asks Claude again.
+- **Tests:** `tests/test_news_ideas.py` (`tests/test_news.py` is the older trader-news tool).
+
+## The S&P 500 in reports (from 16 Nov 2026)
+
+- Shown for information only, never a pass or fail test. The Friday report's ON TRACK now means a
+  positive average per real trade after costs (`evidence.judge`); drift's Friday lines the same.
 
 ## Drift shadow scan (stage 2 of 4, from 10 Nov 2026): `trader-broker/drift.py`
 
@@ -85,12 +185,13 @@ The guard's protections:
   and `why_not` (a count per failed rule), and the "none" line says how many had the figures and were in the list.
 - **Tests:** `tests/test_drift_scan.py`.
 
-## Drift buying (stage 3 of 4, built 12 Nov 2026, OFF): `trader-broker/drift_buy.py`
+## Drift buying (stages 3 and 4: built 12 Nov 2026, ON since that evening): `trader-broker/drift_buy.py`
 
-- **Switch:** `"drift": {"buy_enabled": false}` is the default. Off means no buys, no reservations, no
+- **Switch:** `"drift": {"buy_enabled": false}` is the code's default; the owner's config has it `true`
+  (stage 4, the owner's decision, confirmed 16 Nov). Off means no buys, no reservations, no
   logs: nothing changes. Demo only: `drift_buy.active` needs `paper` true and no `live_enabled`, and
   `t212.py place` refuses a drift order on live, with buying off, or without a sell date after today.
-  Stage 4 is the user's config change; Claude never turns it on.
+  Claude never changes this switch.
 - **When:** `buy_at` 09:33 New York, once a day, before the first intraday scan (09:45). A start after
   09:45 logs every name "missed" and sends an alert: never bought late. /pause stops drift buys too.
 - **Skips** (logged on the signal row as `buy` and in `state/drift/buys.jsonl`): blocked; held or
@@ -107,7 +208,8 @@ The guard's protections:
   pool / `slots`; drift pool = `max_share_pct` (50) % of the investable cash (the account less the 10%
   buffer). With 10 slots one slot is about 4.5% of the account.
 - **Open-risk cap:** `max_open_risk_pct` (4) % of the account: the most all drift positions can lose
-  at their stops together (gaps can lose more).
+  at their stops together (gaps can lose more). The cap on total risk across ALL holdings
+  (`max_total_risk_pct`) is checked as well.
 - **Cash reservations** (`allocation.json`, reservations with `"pool": "drift"`, 09:30 to 10:15 NY,
   released when the buy step ends): the 07:30 briefing reserves drift's slots FIRST and intraday's
   reservable share comes out of what drift does not use (`allocation.make_plan(..., drift=,
@@ -234,9 +336,10 @@ The guard's protections:
 | Job | When | What |
 |---|---|---|
 | `caffeinate` | always (KeepAlive) | `caffeinate -s`: no sleep on mains power (a closed lid still sleeps the laptop) |
-| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, sends MARKET OPEN, scans every 15 min 09:45 to 15:30 New York, runs the drift buys at 09:33 (only with `drift.buy_enabled`), the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results and sends DRIFT SELL messages) and the evidence report on Fridays |
+| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, sends MARKET OPEN, scans every 15 min 09:45 to 15:30 New York, runs the drift buys at 09:33 (only with `drift.buy_enabled`), the news buys at 09:35 (only with `news.buy_enabled`), the holdings match before the open message and after the closing report, sends "sell it?" requests at any hour, the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results and sends DRIFT SELL messages) and the evidence report on Fridays |
 | `t212-guard` | weekdays 13:00 UK | `run-guard.sh`: `t212.py budget --apply`, then `guard --watch` from the 09:30 open to 16:00 New York |
 | `briefing` | weekdays 07:30 UK | `run-briefing.sh`: the briefing; skips US holidays; retries its send for 30 min |
+| `news` | weekdays 12:00 UK | `run-news.sh`: `news_ideas.py run`: the Claude run, the checks, the log, one message (log: `trader/logs/news.log`). Never an order |
 
 - **Keys:** the scripts read only the `export T212_API_KEY/T212_API_SECRET/T212_ENV/TELEGRAM_BOT_TOKEN`
   lines from `~/.zshrc`, and use `/usr/bin/python3`.
@@ -250,8 +353,9 @@ The guard's protections:
   trailing stop 1R (from 1R profit), `eod_close` 15:50.
 - **`account_budget` on:**
   - `budget_gbp` = the account value with `cash_buffer_pct` 10, so 90% can be invested
-  - max loss 1% a trade, 3% a day of the start-of-day value; `daily_loss_count` `open_risk`
-    since 11 Nov (losses realised today + risk open at the stops; `full_risk` is the old count)
+  - max loss 1% a trade
+  - `max_total_risk_pct` 4 since 16 Nov: the cap on total risk across all holdings. It replaces the
+    3% daily loss limit (still written to the config each morning, no longer checked)
   - no `max_budget_gbp` cap
 - **Allocation (12 Nov):** `max_position_pct` 22, `allocation` on (4 positions, 50% free pool, 2
   reservations, 90 min), `evidence.confidence_bands` [0.0, 0.10].
@@ -265,7 +369,10 @@ The guard's protections:
 - **Costs** (GBP account): 0.15% FX fee + 0.05% slippage on every buy and sell. Trading 212's API
   trades only in the primary currency, so a USD balance cannot avoid the fee for API orders.
 - **`autopilot`:** `auto_buy: true`, `evidence_mode: true`.
-- **`drift`:** `scan_enabled: true` since 10 Nov; `buy_enabled` false (stage 3 built, not switched on).
+- **`drift`:** `scan_enabled: true` since 10 Nov; `buy_enabled: true` since 12 Nov (the owner's decision).
+  No drift buy yet: every shortlist so far was empty.
+- **`news`:** `buy_enabled: false` (shadow). Money: 10% cash always, drift up to 50% of the investable
+  cash, news uses what drift and the other holdings leave.
 
 ## Evidence mode: the forward test (from 9 Nov 2026, no end date)
 
@@ -308,6 +415,7 @@ The guard's protections:
   (exits only: stops, sells) act unattended.
 - **Never switch to live,** never run `go_live.py`, and never set `live_enabled`, `paper: false`, or
   `LIVE_PLACEMENT_ENABLED`. Going live is the user's decision.
+- **Never turn on a buying switch:** `news.buy_enabled` and `drift.buy_enabled` are the owner's to set.
 - **Never read, print, log or ask for** API keys, secrets or the Telegram token. Only variable names
   appear in `~/.zshrc` reads. Errors are scrubbed.
 - **Before editing `trader/config.json`,** back it up. Never turn on auto-buy or evidence mode on live.
@@ -327,8 +435,8 @@ The guard's protections:
 
 | Path | What |
 |---|---|
-| `trader/logs/` | `guard.log`, `autopilot.log`, `briefing.log`, `universe.log`, `guard-alerts.jsonl`, `outages.jsonl`, `t212-orders-DATE.jsonl` |
-| `trader/state/` | `broker.json` (placements), `t212-guard.json` (stops, software stops, trail, end-of-day), `autopilot.json`, `risk.json`, `account-days.json`, `phone.json`, `phone-outbox.json`, `briefing.json`, `evidence/` |
+| `trader/logs/` | `guard.log`, `autopilot.log`, `briefing.log`, `news.log`, `universe.log`, `guard-alerts.jsonl`, `outages.jsonl`, `t212-orders-DATE.jsonl` |
+| `trader/state/` | `holdings.json` and `holdings-log.jsonl` (the holdings record), `news/` (ideas, today's run, buys, sell requests), `broker.json` (placements), `t212-guard.json` (stops, software stops, trail, end-of-day), `autopilot.json`, `risk.json`, `account-days.json`, `phone.json`, `phone-outbox.json`, `briefing.json`, `evidence/` |
 | `trader/briefings/`, `trader/reports/` | each day's briefing; closing and evidence reports |
 | `trader/universe/` | `tradable.json` (the universe), `changes.jsonl` (each refresh), `refresh.json` (last start) |
 | `research/` | scripts and results summary; data in `trader/research-data/` or `$RESEARCH_DATA` |

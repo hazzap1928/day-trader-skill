@@ -78,7 +78,12 @@ keep the full detail.
 | ⚠️ safety guard problems | the guard cannot protect a position, or a sale at the close failed: what to do, in plain words |
 | ☀️ Good morning | 07:30 UK on weekdays (`briefing.py`) |
 | 📊 Day summary | about 15:55 New York: the day and week in pounds, each trade, past trades vs today, how the US market moved (`"report": {"market_line": true}`), tomorrow's earnings watchlist |
-| 📊 Week summary | every Friday after the close while the forward test is on: on track or not, this week and since the start, against holding the S&P 500 |
+| 📊 Week summary | every Friday after the close while the forward test is on: on track or not (does it make money after fees), this week and since the start. The S&P 500 is shown to compare, not as a test |
+| 📰 Today's news ideas | about 12:00 UK on weekdays, a few minutes after the news run starts: each idea in a sentence, its event date, when it would be sold, and how much it would buy. "Practice only: nothing is bought" unless `news.buy_enabled` is on |
+| ⚠️ news ideas run failed | the morning Claude run did not work: no ideas that day, and nothing is bought because of it. Once a day at most |
+| 🟢 Bought X on a news idea | only with `news.buy_enabled` on: shares, cost, the safety net, why, and the sell-by date |
+| 👀 Sell X? + Approve / Reject | a share bought on a news idea whose reason now looks broken. Approve sells it just before the US market next closes. Reject, or no answer, keeps it. Its safety net stays either way |
+| 🔎 My records and Trading 212 don't match | the daily check of the holdings record found a difference (a share with no record, no safety net, a different number of shares). Nothing is changed: it is only reported, once |
 
 The autopilot is **always on**: launchd starts `com.daytraderskill.autopilot` at login and restarts it if
 it stops. Whenever the Mac is on it answers commands, weekends and before the open included. It also:

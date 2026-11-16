@@ -200,9 +200,9 @@ def build(client, state_dir, today=None, report_mod=None, with_total=False):
     today = today or ny.date().isoformat()
     p = path(state_dir)
     old = t212._read_json(p, {}) or {}
-    if (old.get("date") == today and isinstance(old.get("built_at"), (int, float)) and 0 <= now - old["built_at"] < REUSE_FOR
-            and (not with_total or old.get("total"))):
-        return old
+    if (not with_total and old.get("date") == today and isinstance(old.get("built_at"), (int, float))
+            and 0 <= now - old["built_at"] < REUSE_FOR):
+        return old                            # with_total it is always read again: a buy a minute ago must count
     rate = (t212._read_json(os.path.join(state_dir, "fx.json"), {}) or {}).get("usd_per_gbp")
     if not rate:
         raise ValueError("no GBP/USD rate in trader/fx.json")

@@ -160,6 +160,30 @@ class TotalFromTheAccount(test_eod_close.Close):
         self.assertEqual([c[0] for c in self.router.calls if c[0] != "GET"], [])     # read-only
 
 
+class TheFileForTraderRisk(test_eod_close.Close):
+    def test_the_total_is_read_again_every_time_never_reused(self):
+        import test_real_exit
+        self.write("fx.json", {"usd_per_gbp": 1.25})
+        self.write("state/broker.json", {"orders": []})
+        r = self.router
+        naked = {"instrument": {"ticker": "AAPL_US_EQ"}, "quantity": 1, "currentPrice": 100.0, "averagePricePaid": 100.0}
+        r.add("GET", "/equity/positions", FakeResp([]), FakeResp([naked]))
+        r.add("GET", "/equity/orders", FakeResp([]))
+        r.add("GET", "/equity/account/summary", FakeResp(SUMMARY))
+        rep = load("trader-broker", "report")
+        rep.t212, rep.tk = t212, t212.ticket_module()
+        day_risk._now = lambda: self.clock[0]
+        try:
+            first = day_risk.build(self.client, self.dir, "2026-11-05", report_mod=rep, with_total=True)
+            second = day_risk.build(self.client, self.dir, "2026-11-05", report_mod=rep, with_total=True)
+        finally:
+            import time
+            day_risk._now = time.time
+        self.assertEqual(first["total"]["open_risk_usd"], 0.0)
+        self.assertEqual(second["total"]["open_risk_usd"], 100.0)       # a position bought a moment ago counts
+        self.assertEqual(self.read("state/day-risk.json")["total"]["account_usd"], 6250.0)
+
+
 class DriftObeysTheCap(test_drift_buy.DriftBase):
     def test_a_drift_buy_over_the_total_cap_is_skipped(self):
         cfg = dict(self.cfg, max_total_risk_pct=4)                      # 4% of 5,000 = GBP 200
