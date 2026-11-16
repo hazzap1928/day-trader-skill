@@ -28,6 +28,8 @@ def every_text_file():
     for base, dirs, files in os.walk(ROOT):
         # git-ignored downloads (trader-kronos's environment, Kronos's code and model files) are not ours
         dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".venv", "vendor", "models")]
+        if base == ROOT and "trader" in dirs:
+            dirs.remove("trader")     # the user's own local state (git-ignored): saved news headlines are not repo text
         for f in files:
             if f.endswith((".md", ".py", ".json", ".csv", ".txt", ".xml")) or f == "LICENSE":
                 yield os.path.join(base, f)
@@ -42,7 +44,7 @@ class Repo(unittest.TestCase):
     def test_root_matches_the_reel(self):
         # trader/ is the user's own local state (git-ignored), made by running the tools here
         root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d not in ("trader", ".DS_Store"))
-        self.assertEqual(root, sorted([".claude-plugin", "CLAUDE.md", "LICENSE", "METHODOLOGY.md", "README.md", "research", "tests",
+        self.assertEqual(root, sorted([".claude-plugin", "CLAUDE.md", "LICENSE", "METHODOLOGY.md", "README.md", "docs", "research", "tests",
                                       "trader-kronos"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
