@@ -136,6 +136,10 @@ class Base(unittest.TestCase):
         t212._ask = lambda prompt: self.reply
         with open(os.path.join(ROOT, "trader-budget", "config.example.json")) as fh:
             self.cfg = json.load(fh)
+        # day trading is off unless the config says so (since 17 Nov 2026); these tests cover the dormant
+        # day-trading path (trail, half sale, the 15:50 sale of day trades, the ORB cycle), so they switch it on.
+        # Tests of the default switch it off or leave the key out themselves.
+        self.cfg["autopilot"] = {"intraday_enabled": True}
         self.write("config.json", self.cfg)
         self.write("cache/t212-instruments-demo.json",
                    {"env": "demo", "fetched_at": NOW, "instruments": INSTRUMENTS})

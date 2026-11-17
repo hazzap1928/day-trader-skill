@@ -56,7 +56,10 @@ AUTOPILOT_ENV = "demo"           # the one account this ever places on
 DEFAULTS = {"every_minutes": 15, "expire_minutes": 10, "max_chase_r": 0.5, "min_edge": 0.0,
             "max_tickets_per_day": 10, "min_net_r": 0.0}
 FLAGS = {"auto_buy": False,      # true: a ticket that passes every check is placed without a tap (demo only)
-         "evidence_mode": False}  # true: the demo forward test (trader-broker/evidence.py); live refuses it
+         "evidence_mode": False,  # true: the demo forward test (trader-broker/evidence.py); live refuses it
+         "intraday_enabled": False}  # true: the ORB day-trading scan runs. Off unless set (since 17 Nov 2026), so an
+                                     # old config without the key never switches day trading back on
+                                     # (t212.intraday_on: with it off the guard keeps day trades too)
 POSITIONS_EVERY = 60             # seconds between fill and exit checks
 POLL_WAIT = 20                   # seconds a phone poll waits for a tap
 BRIEFING_CATCHUP = (7, 45)       # UK time on the Mac: from then until the open a missed briefing is run again
@@ -366,6 +369,8 @@ class Pilot(object):
         """One pass of the pipeline. Sends at most one ticket. Returns a short line of what happened."""
         self.cfg = self.read_cfg()
         self.s = settings(self.cfg)
+        if not self.s["intraday_enabled"]:
+            return "day trading is off (autopilot.intraday_enabled is false): no scan"
         if self.state.get("paused"):
             return "paused from your phone: no scan"
         why = self.hold_pause()

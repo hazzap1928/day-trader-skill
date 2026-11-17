@@ -1,23 +1,46 @@
 # day-trader-skill: notes for Claude
 
-A Claude skill pack for US day trading, plus a Trading 212 adapter that runs a **demo** account
-unattended from this Mac (Intel i7, 16 GB, macOS 13, UK time). Education and tooling, not financial advice.
+(The repo and folder keep their old name, `day-trader-skill`, for now.)
+
+## What this is now (17 Nov 2026)
+
+A **news-feed and post-earnings-drift agent** that runs a Trading 212 **demo** account unattended from
+this Mac (Intel i7, 16 GB, macOS 13, UK time). It buys each share for a written reason, holds it until a
+rule says sell, and reports how it did. Education and tooling, not financial advice.
 Branch `t212-adapter`. Run the tests with `cd tests && python3 -m unittest discover -s .`. Every test is
 offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them passing.
+
+**The two strategies that trade:**
+- **Drift** (post-earnings drift): buys EPS beats the morning after the report and holds 20 trading days
+  (`drift.py`, `drift_buy.py`). Buying ON since 12 Nov.
+- **News** (the news feed): two scheduled `claude -p` web-research runs a day produce dated, sourced ideas
+  with a stop and a sell date (`news_ideas.py`). Buying ON since 17 Nov.
+
+**Day trading is OFF.** `"autopilot": {"intraday_enabled": false}` (the owner's decision, evening of
+17 Nov): the ORB scan never runs. The ORB code, its tests and its limits are **still in the repo**, dormant,
+and are marked **(dormant: day trading)** below. Do not build on them. Do not delete them unless the owner
+asks (the spec retires the ORB scanner last).
+
+**More additions are to be confirmed (TBC).** Nothing else is planned in writing. When the owner adds a
+strategy or a feed, add it to "The parts" and give it its own section. Known loose ends:
+- asking about a holding that left the universe or went on the blocked list (the review only says it would)
+- any approval step for drift (its verdicts are logged only)
+- removing the dormant ORB code, tests and limits
+- the holiday list in `trader-alerts/alerts.py` covers 2026 and 2027 only
 
 ## The parts
 
 | Folder | What it does |
 |---|---|
-| `trader-scanner/` | `scan.py orb`: opening-range breakouts; scans `allowed_tickers` (or the universe) only, skips `blocked_tickers` |
-| `trader-scanner/universe.py` | the tradable universe: S&P 500 -> on Trading 212 -> $5+ -> $20m+ a day traded (the spread proxy: no free bid/ask); weekly, with a change log |
-| `trader-entry/`, `trader-exit/` | entry trigger check; stop (opening-range midpoint) and target (2R by default) |
-| `trader-timemachine/` | replays the plan on 10,000 simulated sessions plus history; reports R before **and after costs** |
-| `trader-budget/` | `size.py`: shares from the budget, the cash buffer, max position and max loss |
-| `trader-risk/` | `check.py`: the last gate. Loss limits, trades a day, allow/block lists, reward:risk **after costs** |
+| `trader-scanner/` | **(dormant: day trading)** `scan.py orb`: opening-range breakouts; scans `allowed_tickers` (or the universe) only, skips `blocked_tickers` |
+| `trader-scanner/universe.py` | **(in use)** the tradable universe, which drift and news both read: S&P 500 -> on Trading 212 -> $5+ -> $20m+ a day traded (the spread proxy: no free bid/ask); weekly, with a change log |
+| `trader-entry/`, `trader-exit/` | **(dormant: day trading)** entry trigger check; stop (opening-range midpoint) and target (2R by default) |
+| `trader-timemachine/` | **(dormant: day trading)** replays the plan on 10,000 simulated sessions plus history; reports R before **and after costs** |
+| `trader-budget/` | `size.py`: (used by news sizing through `t212.size_entry`) shares from the budget, the cash buffer, max position and max loss |
+| `trader-risk/` | `check.py`: the last gate for news buys (strategy caps) and the dormant ORB path. Loss limits, trades a day, allow/block lists, reward:risk **after costs** |
 | `trader-alerts/`, `trader-news/`, `trader-analyst/`, `trader-pelosi/` | quotes and market clock, news, facts, filings |
 | `trader-broker/t212.py` | Trading 212 API: reads, `place` (a typed yes in a terminal), `guard` (exits only), `budget`, `fx` |
-| `trader-broker/autopilot.py` | always-on demo autopilot: scan, Time Machine, size, risk, place; phone commands |
+| `trader-broker/autopilot.py` | always-on demo autopilot: runs the drift and news buy steps, the holdings match, reports and phone commands; the ORB scan (scan, Time Machine, size, risk, place) is skipped while `intraday_enabled` is false |
 | `trader-broker/phone.py` | the user's own Telegram bot: messages, Approve/Reject buttons, an outbox for failed sends |
 | `trader-broker/messages.py` | **every word sent to the phone**, one function per message type (see "Phone messages") |
 | `trader-broker/drift.py` | post-earnings drift **shadow** scan: shortlist, signal log, virtual results. No Trading 212 connection, never an order |
@@ -26,29 +49,34 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/holdings_t212.py` | Trading 212's side of the record: the account as a plain "view", and the daily match. **Read-only, report only** |
 | `trader-broker/news_ideas.py` | the **"news" strategy**: ideas from two scheduled `claude -p` runs a day, checked by the pack's rules, plus a verdict on every holding and the day's hot topics. Buys only with `news.buy_enabled` (ON since 17 Nov, see "News ideas") |
 | `trader-broker/review.py` | the **daily review** of what is held, after the close. **Report only**: it says what it would sell or ask about (see "The daily review") |
-| `trader-broker/evidence.py` | evidence mode (forward test): signal log, virtual results, slippage, Friday report |
+| `trader-broker/evidence.py` | **(mostly dormant: day trading)** evidence mode (forward test): signal log, virtual results, slippage, Friday report |
 | `trader-broker/briefing.py`, `report.py` | 07:30 morning briefing; closing report from Trading 212's own fills |
-| `trader-broker/allocation.py` | demo cash allocation: per-trade cap, morning reservations, free pool, max open positions |
+| `trader-broker/allocation.py` | demo cash allocation (drift reserves its slots first; the intraday reservations are dormant): per-trade cap, morning reservations, free pool, max open positions |
 | `trader-broker/account_budget.py` | budget and loss limits from the account value, every trading morning |
-| `trader-broker/day_risk.py` | today's realised losses plus risk still open at the stops, for the daily loss limit (`state/day-risk.json`) |
+| `trader-broker/day_risk.py` | writes the total-risk figures the buy checks read; the daily loss count is for day trades only: today's realised losses plus risk still open at the stops, for the daily loss limit (`state/day-risk.json`) |
 | `trader-broker/netwait.py` | no internet: check every 2 min for up to 30, then a BACK ONLINE message saying what was missed |
 | `trader-broker/go_live.py` | the user's own switch to live (checklist in `GO_LIVE.md`). **Claude never runs it** |
-| `trader-kronos/` | Kronos-small forecasts, **shadow only**; own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
+| `trader-kronos/` | Kronos-small forecasts, **shadow only** (news runs may use it, `kronos_minutes`); own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
 | `research/` | backtest scripts and `README.md` with the results (data goes in `trader/research-data/`) |
 | `docs/hold-agent-spec.md` | the hold-and-review spec and the owner's decisions of 16 Nov 2026 |
 
-**Direction (16 Nov 2026):** the day-trading engine is being replaced by a hold-and-review agent
-(`docs/hold-agent-spec.md`). Built so far: the holdings record and daily match, "keep and report" at the
-close, a risk cap for each strategy, pausing new buys on a mismatch, the daily review (report only), the
-news strategy with two runs a day (buying ON since 17 Nov), a keep/watch/sell verdict on every holding, and
-the approval step for news holdings (Approve sells soon after the next open). Still to do: asking about a
-holding that left the universe or went on the blocked list (the review only says it would), any approval
-step for drift (its verdicts are logged only), and retiring the ORB scanner LAST (it still runs).
+**Direction (16 to 17 Nov 2026):** the day-trading engine was replaced by a hold-and-review agent
+(`docs/hold-agent-spec.md`). Built: the holdings record and daily match, "keep and report" at the close, a
+risk cap for each strategy, pausing new buys on a mismatch, the daily review (report only), the news
+strategy with two runs a day, a keep/watch/sell verdict on every holding, and the approval step for news
+holdings (Approve sells soon after the next open). **The ORB scan is switched off**, not deleted:
+`Pilot.cycle` returns "day trading is off" before it scans. **Since 17 Nov the code default of
+`intraday_enabled` is `false`**: only `"intraday_enabled": true` turns it on, so a config without the key
+(every backup but the newest) keeps day trading off. With it off (`t212.intraday_on`), no position gets
+the trailing stop or the half sale, and the 15:50 close keeps and reports intraday and unlabelled
+positions instead of selling them (tests: `test_autopilot.py`, `test_holdings.py`; the day-trading tests
+switch it on in `test_t212_place.Base`). The guard, drift, news, the reviews and the reports run as before.
+The four ORB tool folders are kept as repurpose candidates (`docs/repurpose-plan.md`).
 
 The guard's protections:
 - stops are good till cancelled, and checked again 1 minute after placing and on every cycle
 - a REJECTED or missing stop becomes a **software stop**: a market sell at the stop, with a loud alert
-- trailing stop: starts once 1R in profit (`activate_r`, default 1), then trails 1R under the high
+- trailing stop (intraday only, dormant while day trading is off): starts once 1R in profit (`activate_r`, default 1), then trails 1R under the high
 - end-of-day close at 15:50 New York: it cancels each stop, then sells at market. Which positions
   depends on the buy record in `trader/state/broker.json` (see "Strategy labels" below)
 
@@ -62,7 +90,8 @@ The guard's protections:
   works one out as n NYSE trading days after the entry date (the holiday list in
   `trader-alerts/alerts.py`, 2026 and 2027 only; past that it refuses).
 - **The 15:50 close** (`t212.eod_close`, `hold_due`) sells:
-  - intraday and unlabelled positions
+  - intraday and unlabelled positions, **only while day trading is on** (`t212.intraday_on`); with it off
+    (the default) they are kept, stop untouched, and reported with a GUARD ALERT
   - a drift or news position on or after its `sell_date`
   - a position whose sale the owner approved on the phone (a holdings page with status `selling`), if the
     guard's sale after the open (below) did not already sell it
@@ -329,7 +358,9 @@ The guard's protections:
   `max_open_risk_pct` (4), `atr_mult` (3), `atr_days` (14), `hold_days` (20), `min_trades` (20).
 - **Tests:** `tests/test_drift_buy.py`.
 
-## Real exit and the daily loss count (from 11 Nov 2026)
+## Real exit and the daily loss count (from 11 Nov 2026) (dormant: day trading)
+
+All of this serves the ORB scanner. Kept for when the scan is switched back on or removed.
 
 - **Simulations use the real exit.** On a Trading 212 config (`broker` trading212) the Time Machine
   and the evidence virtual results walk each trade the way the guard runs it: `timemachine.GuardExit`
@@ -381,6 +412,9 @@ The guard's protections:
   already holds back in `reservedForOrders`. Tests: `tests/test_cash_view.py`.
 
 ## Cash allocation and confidence (from 12 Nov 2026): `trader-broker/allocation.py`
+
+Drift still uses the morning reservations (its slots come first). The intraday reservations, the
+per-trade cap and the Time Machine confidence bands are **dormant: day trading**.
 
 - **Demo only:** `allocation.active(cfg)` is false unless `paper` is true (and no `live_enabled`).
 - **Per-trade cap:** `max_position_pct` 22 (was 75) of `budget_gbp`, so 4 trades fit inside the 90%
@@ -434,7 +468,7 @@ The guard's protections:
 | Job | When | What |
 |---|---|---|
 | `caffeinate` | always (KeepAlive) | `caffeinate -s`: no sleep on mains power (a closed lid still sleeps the laptop) |
-| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, starts a news run the Mac slept through, sends MARKET OPEN, scans every 15 min 09:45 to 15:30 New York, runs the drift buys at 09:33 (only with `drift.buy_enabled`), the news buys at 09:35 (only with `news.buy_enabled`), the holdings match before the open message and after the closing report (and every 10 min while buys are paused), sends "sell it?" requests at any hour, the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results, sends DRIFT SELL messages and the daily review) and the evidence report on Fridays |
+| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, starts a news run the Mac slept through, sends MARKET OPEN, (no ORB scan while `intraday_enabled` is false; otherwise every 15 min 09:45 to 15:30 New York), runs the drift buys at 09:33 (only with `drift.buy_enabled`), the news buys at 09:35 (only with `news.buy_enabled`), the holdings match before the open message and after the closing report (and every 10 min while buys are paused), sends "sell it?" requests at any hour, the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results, sends DRIFT SELL messages and the daily review) and the evidence report on Fridays |
 | `t212-guard` | weekdays 13:00 UK | `run-guard.sh`: `t212.py budget --apply`, then `guard --watch` from the 09:30 open to 16:00 New York |
 | `briefing` | weekdays 07:30 UK | `run-briefing.sh`: the briefing; skips US holidays; retries its send for 30 min |
 | `news` | weekdays 06:00 UK | `run-news.sh run --kind main`: the main Claude review, the checks, the log; its ideas go into the 07:30 briefing (log: `trader/logs/news.log`). Never an order |
@@ -446,9 +480,15 @@ The guard (`t212-guard`) also sells, from 09:35 New York, any holding whose sale
   lines from `~/.zshrc`, and use `/usr/bin/python3`.
 - **The python.org 3.11** at `/usr/local/bin/python3` lacks certificates: HTTPS fails from it. Use
   `/usr/bin/python3` for live calls.
+- **Rate limits:** `t212.Client` keeps `trader/state/t212-ratelimit.json` (when each endpoint was last called,
+  plus the `x-ratelimit-*` headers). The guard and the autopilot share it; a failed save is logged, never
+  raised (`tests/test_ratelimit_note.py`, 17 Nov).
 - **Restart a job:** `launchctl kickstart -k gui/$(id -u)/com.daytraderskill.<job>`
 
 ## Current config (`trader/config.json`, git-ignored; backups beside it as `config.json.bak-*`)
+
+The ORB keys below (`max_trades_per_day`, `min_reward_risk`, entry times, trailing stop, `allocation`,
+`evidence.confidence_bands`) only matter for day trading, which is off (`autopilot.intraday_enabled` false).
 
 - **Account:** GBP, Trading 212 **demo** (`"paper": true`), fractional shares, `stop_mode` broker,
   trailing stop 1R (from 1R profit), `eod_close` 15:50.
@@ -462,7 +502,7 @@ The guard (`t212-guard`) also sells, from 09:35 New York, any holding whose sale
   - no `max_budget_gbp` cap
 - **Allocation (12 Nov):** `max_position_pct` 22, `allocation` on (4 positions, 50% free pool, 2
   reservations, 90 min), `evidence.confidence_bands` [0.0, 0.10].
-- **Trading rules:** `max_trades_per_day` 5, `min_reward_risk` 1.5, entries 09:45 to 15:30 New York.
+- **Trading rules (ORB only, dormant):** `max_trades_per_day` 5, `min_reward_risk` 1.5, entries 09:45 to 15:30 New York.
 - **Lists:** `allowed_tickers` holds 100 liquid large caps and ETFs (US-listed ETFs are mostly not
   buyable from a UK account); `blocked_tickers` is empty and always wins.
 - **`universe`** (`trader-scanner/universe.py`): `enabled` true since 10 Nov (502 S&P 500 stocks). On demo with `enabled` true, the filtered list in
@@ -471,14 +511,17 @@ The guard (`t212-guard`) also sells, from 09:35 New York, any holding whose sale
   always uses. A refresh that looks broken keeps last week's list. Changes: `trader/universe/changes.jsonl`.
 - **Costs** (GBP account): 0.15% FX fee + 0.05% slippage on every buy and sell. Trading 212's API
   trades only in the primary currency, so a USD balance cannot avoid the fee for API orders.
-- **`autopilot`:** `auto_buy: true`, `evidence_mode: true`.
+- **`autopilot`:** `auto_buy: true`, `evidence_mode: true`, `intraday_enabled: false` (day trading off since the evening of 17 Nov).
 - **`drift`:** `scan_enabled: true` since 10 Nov; `buy_enabled: true` since 12 Nov (the owner's decision).
   No drift buy yet: every shortlist so far was empty.
 - **`news`:** `buy_enabled: true` and `buy_confidence: ["medium", "high"]` since 17 Nov 2026 (the owner's
   decision; backup `config.json.bak-*` from that day). Money: 10% cash always, drift up to 50% of the investable
   cash, news uses what drift and the other holdings leave.
 
-## Evidence mode: the forward test (from 9 Nov 2026, no end date)
+## Evidence mode: the forward test (from 9 Nov 2026, no end date) (dormant: day trading)
+
+This is the ORB forward test. With `intraday_enabled` false no new intraday signals are logged; the Friday
+report still runs and carries the drift and news sections. Old rows and results stay.
 
 - **Open-ended:** `"evidence": {"start": "2026-11-09", "min_trades": 20}`. It runs until it is turned
   off; an old `end` key is ignored. The demo agent runs indefinitely.

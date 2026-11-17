@@ -336,7 +336,7 @@ class Approve(PilotBase):
 class AutoBuy(PilotBase):
     def setUp(self):
         super().setUp()
-        self.cfg = dict(self.cfg, autopilot={"auto_buy": True})
+        self.cfg = dict(self.cfg, autopilot={"auto_buy": True, "intraday_enabled": True})
         self.write("config.json", self.cfg)
 
     def cycle(self):
@@ -407,6 +407,29 @@ class AutoBuy(PilotBase):
         p.command("/pause")
         self.assertIn("paused", p.cycle())
         self.assertEqual(self.router.posts(), [])
+
+    def test_day_trading_can_be_switched_off_and_scans_nothing(self):
+        self.write("config.json", dict(self.cfg, autopilot={"intraday_enabled": False}))
+        p = self.pilot()
+        self.assertIn("day trading is off", p.cycle())
+        self.assertEqual(self.pipe.calls, [])                       # no scanner, no entry check, nothing built
+        self.assertEqual(self.router.posts(), [])
+        self.assertFalse(ap.settings({})["intraday_enabled"])       # off unless the config turns it on (17 Nov)
+        with self.assertRaises(ap.PilotError):
+            ap.settings({"autopilot": {"intraday_enabled": "no"}})
+
+    def test_a_config_without_the_switch_scans_nothing(self):
+        # an old backup restored by mistake has no intraday_enabled key: day trading must stay off
+        self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True}))
+        p = self.pilot()
+        self.assertIn("day trading is off", p.cycle())
+        self.assertEqual(self.pipe.calls, [])
+        self.assertEqual(self.router.posts(), [])
+        cfg = dict(self.cfg)
+        cfg.pop("autopilot", None)
+        self.write("config.json", cfg)
+        self.assertIn("day trading is off", self.pilot().cycle())
+        self.assertEqual(self.pipe.calls, [])
 
     def test_auto_buy_must_be_true_or_false(self):
         with self.assertRaises(ap.PilotError):

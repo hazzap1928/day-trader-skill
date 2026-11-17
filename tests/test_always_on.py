@@ -148,7 +148,7 @@ class OpenMessage(Base):
         self.assertIn("Safety guard: ⚠️ NOT RUNNING, so nothing is checking the safety nets", self.pilot().open_message())
 
     def test_evidence_mode_and_the_day_of_the_test(self):
-        self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True, "evidence_mode": True},
+        self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True, "evidence_mode": True, "intraday_enabled": True},
                                        evidence={"start": "2026-11-02"}))
         self.accounts([])
         text = self.pilot().open_message()

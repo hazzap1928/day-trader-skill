@@ -117,7 +117,7 @@ class LiveRefuses(Base):
 class Pilot(PilotBase):
     def setUp(self):
         super().setUp()
-        self.cfg = dict(self.cfg, autopilot={"auto_buy": True, "evidence_mode": True}, evidence=EVIDENCE)
+        self.cfg = dict(self.cfg, autopilot={"auto_buy": True, "evidence_mode": True, "intraday_enabled": True}, evidence=EVIDENCE)
         self.write("config.json", self.cfg)
         self.kronos_calls = []
         self._kv = ev.kronos_verdict
@@ -202,7 +202,7 @@ class Pilot(PilotBase):
         self.assertTrue(any("demo only" in x for x in ap.check_ready(self.cfg, "live", self.phone)))
 
     def test_off_means_no_log_and_the_cost_block_back(self):
-        self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True}))
+        self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True, "intraday_enabled": True}))
         self.pipe.net_r = -0.24
         p, line = self.cycle()
         self.assertEqual(self.router.posts(), [])
@@ -348,7 +348,7 @@ class FakeReport(object):
 class Report(Base):
     def setUp(self):
         super().setUp()
-        self.cfg = dict(self.cfg, autopilot={"evidence_mode": True, "auto_buy": True}, evidence=EVIDENCE)
+        self.cfg = dict(self.cfg, autopilot={"evidence_mode": True, "auto_buy": True, "intraday_enabled": True}, evidence=EVIDENCE)
         self.write("state/account-days.json", {"days": {"2026-11-02": {"start": 2000.0, "close": 2001.0}}})
         self.client = t212.Client("demo", "k", "s", state_dir=self.dir, log=lambda m: None)
 

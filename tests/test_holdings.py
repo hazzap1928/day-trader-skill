@@ -353,6 +353,36 @@ class CloseKeepsHoldings(test_eod_close.Close):
         self.assertEqual(self.router.posts()[0][2]["ticker"], TICKER)
         self.assertIn("AAPL_US_EQ", res["kept"][0])
 
+    def test_with_day_trading_off_a_day_trade_or_unlabelled_position_is_kept_and_reported(self):
+        # day trading off (or the switch missing, as in an old config): nothing is sold as a day trade
+        for auto in ({"intraday_enabled": False}, {}, None):
+            cfg = dict(self.cfg, **test_eod_close.EOD_ON)
+            if auto is None:
+                cfg.pop("autopilot", None)
+            else:
+                cfg["autopilot"] = auto
+            self.write("config.json", cfg)
+            for rec, words in ((record(strategy="intraday"), "label 'intraday'"), (record(), "no strategy label")):
+                self.router.routes.clear()
+                self.router.calls.clear()
+                self.pushed[:] = []
+                self.records(rec)
+                self.account([held(7)])
+                res = self.close()
+                self.assertEqual(self.writes(), [], (auto, words))          # no cancel, no sale
+                self.assertEqual(res["closed"], [])
+                self.assertIn("day trading is off", res["unknown"][0])
+                self.assertIn(words, res["unknown"][0])
+                self.assertTrue(self.pushed)                                 # you are told
+
+    def test_with_day_trading_off_holdings_still_follow_their_rules(self):
+        self.write("config.json", dict(self.cfg, autopilot={"intraday_enabled": False}, **test_eod_close.EOD_ON))
+        self.records(record(strategy="news", sell_date=TODAY))
+        self.account([held(7)])
+        res = self.close()
+        self.assertEqual(self.writes(), [("DELETE", "/equity/orders/7001"), ("POST", "/equity/orders/market")])
+        self.assertIn("news sell date 2026-11-05", res["closed"][0])
+
     def test_a_sale_you_approved_is_sold_at_the_close_and_only_that_one(self):
         self.records(record(strategy="news", sell_date="2026-12-01"))
         page = {"id": "p1", "symbol": "TSLA", "strategy": "news", "status": "selling", "broker": "trading212",
@@ -395,6 +425,25 @@ class GuardLeavesHoldingsAlone(test_trailing.GuardTrail):
             self.assertEqual(self.router.posts(), [], label)
             self.assertEqual(self.calls("DELETE"), [], label)
             self.assertIn("no trailing or half sale", text)
+
+    def test_with_day_trading_off_a_day_trade_gets_no_trail_and_no_half_sale(self):
+        # 380 is far past 1R and the target: with day trading on this position would trail and sell half
+        for auto in ({"intraday_enabled": False}, None):
+            for extra in ({}, {"strategy": "intraday"}):
+                self.router.routes.clear()
+                self.router.calls.clear()
+                cfg = dict(self.cfg, trailing_stop={"enabled": True, "distance_r": 1.0, "sell_half_at_target": True})
+                if auto is None:
+                    cfg.pop("autopilot", None)
+                else:
+                    cfg["autopilot"] = auto
+                self.write("config.json", cfg)
+                self.write("state/broker.json", {"orders": [dict(test_trailing.RECORD, **extra)]})
+                self.set_account(380.0, after_cancel=[])
+                code, text, err = self.guard()
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.router.posts(), [], (auto, extra))       # no new stop, no half sale
+                self.assertEqual(self.calls("DELETE"), [], (auto, extra))      # the stop is not touched
 
     def test_a_news_holding_with_a_missing_stop_gets_its_stop_back(self):
         self.set_trail(distance_r=1.0, sell_half_at_target=True)

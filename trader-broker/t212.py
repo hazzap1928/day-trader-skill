@@ -74,6 +74,7 @@ import math
 import os
 import re
 import subprocess
+import threading
 import sys
 import time
 import urllib.error
@@ -211,10 +212,20 @@ def _write_json(path, data):
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=1, sort_keys=True)
-    os.replace(tmp, path)
+    # a temporary name of its own per process and thread: the guard and the autopilot both write
+    # t212-ratelimit.json, and one shared ".tmp" let one remove the other's file before its rename
+    # (the guard stopped on that, 17 Nov 2026)
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------- HTTP
@@ -327,7 +338,10 @@ class Client(object):
             if v is not None:
                 entry[name] = int(v) if v == int(v) else v
         all_state.setdefault(self.env, {})[path] = entry
-        _write_json(self.rate_path, all_state)
+        try:
+            _write_json(self.rate_path, all_state)
+        except OSError as e:                   # bookkeeping only: never stop the guard or a sale over it
+            self.log("could not save the rate-limit note (%s); carrying on" % type(e).__name__)
 
     def _backoff(self, headers, attempt):
         h = {k.lower(): v for k, v in (headers or {}).items()}
@@ -1540,6 +1554,13 @@ def position_strategy(rec):
     return str((rec or {}).get("strategy") or "intraday").strip().lower()
 
 
+def intraday_on(cfg):
+    """True only with "autopilot": {"intraday_enabled": true} in the config. Missing, false, anything else or
+    an unreadable config means day trading is OFF: then no position gets the trailing stop or the half sale,
+    and the 15:50 close keeps and reports an intraday or unlabelled position instead of selling it."""
+    return ((cfg or {}).get("autopilot") or {}).get("intraday_enabled") is True
+
+
 def is_drift(rec):
     return rec is not None and position_strategy(rec) == "drift"
 
@@ -2007,7 +2028,7 @@ def guard_pass(client, state_dir):
         cfg = tk.read_config(os.path.join(state_dir, "config.json"))
     except tk.TicketError as e:
         raise T212Error(str(e), 2)
-    trail = trail_settings(cfg)
+    trail = trail_settings(cfg) if intraday_on(cfg) else None     # day trading off: no trail, no half sale
     mode = stop_mode(cfg)
     state = tk.load_state(os.path.join(state_dir, "state", "broker.json"))
     positions = client.get(POSITIONS) or []
@@ -2208,7 +2229,8 @@ def eod_close(client, state_dir, approved_only=False):
     """Sell the day's positions at market, after cancelling their pending sells (the stop holds
     the shares). Exits only: every write is a cancel or a SELL. Demo only.
     Which positions, from their buy record in trader/state/broker.json:
-      intraday (or no strategy label): sold
+      intraday (or no strategy label): sold only while day trading is on (intraday_on); with it off
+                   (the default since 17 Nov 2026) KEPT, its stop untouched, and a GUARD ALERT says so
       drift, news: sold on or after its sell_date, or when you approved its sale on your phone;
                    before that, kept with its stop untouched
       an unknown label, or no readable sell date: KEPT, and a GUARD ALERT says so
@@ -2224,6 +2246,10 @@ def eod_close(client, state_dir, approved_only=False):
     out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
            "closed": [], "failed": [], "sold": [], "kept": [], "unknown": [], "overdue": []}
     g = _Guard(client, state_dir, out)
+    try:
+        day_trading = intraday_on(tk.read_config(os.path.join(state_dir, "config.json")))
+    except Exception:
+        day_trading = False                    # config unreadable: keep and report, never sell a day trade blind
     state = tk.load_state(os.path.join(state_dir, "state", "broker.json"))
     today = _today_ny(tk)
     positions = client.get(POSITIONS) or []
@@ -2247,6 +2273,13 @@ def eod_close(client, state_dir, approved_only=False):
         if rec is None:
             out["unknown"].append("%s: %s held with no buy record from this pack, so the end-of-day close did NOT "
                                   "sell it. Sell it yourself in the app if it should go" % (ticker, _qty(held)))
+            continue
+        if not is_hold(rec) and not day_trading:
+            out["unknown"].append("%s: %s held, recorded as a day trade (%s), but day trading is off "
+                                  "(autopilot.intraday_enabled), so the end-of-day close did NOT sell it. Its stop is "
+                                  "left in place; sell it yourself in the app if it should go"
+                                  % (ticker, _qty(held), "no strategy label" if not str(rec.get("strategy") or "").strip()
+                                     else "label %r" % position_strategy(rec)))
             continue
         why = ""
         if is_hold(rec):

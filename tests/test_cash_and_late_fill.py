@@ -24,7 +24,7 @@ class CashPilot(PilotBase):
     def setUp(self):
         super().setUp()
         self.cfg = dict(self.cfg, allowed_tickers=["TSLA", "AAPL", "MSFT"],
-                        autopilot={"auto_buy": True, "evidence_mode": True}, evidence=EVIDENCE)
+                        autopilot={"auto_buy": True, "evidence_mode": True, "intraday_enabled": True}, evidence=EVIDENCE)
         self.write("config.json", self.cfg)
         self._kv = ev.kronos_verdict
         ev.kronos_verdict = lambda sig, **kw: {"verdict": "agree", "avg_R_net": 0.2}
@@ -131,7 +131,7 @@ class InsufficientFundsFromT212(CashPilot):
 
 class TicketCap(CashPilot):
     def test_only_buys_count_and_the_cap_holds_inside_a_scan(self):
-        self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True, "evidence_mode": True,
+        self.write("config.json", dict(self.cfg, autopilot={"auto_buy": True, "evidence_mode": True, "intraday_enabled": True,
                                                             "max_tickets_per_day": 1}))
         self.pipe.triggered = ("TSLA", "AAPL")
         self.acct()
