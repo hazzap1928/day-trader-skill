@@ -41,6 +41,7 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -369,7 +370,7 @@ def load_signals(sd):
 
 def save_signals(sd, rows):
     _dir(sd)
-    tmp = signals_path(sd) + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (signals_path(sd), os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, sort_keys=True) + "\n")
@@ -378,7 +379,7 @@ def save_signals(sd, rows):
 
 def _write(path, data):
     _dir(os.path.dirname(os.path.dirname(os.path.dirname(path))))
-    tmp = path + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=1, sort_keys=True)
     os.replace(tmp, path)

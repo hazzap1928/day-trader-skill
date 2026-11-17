@@ -38,10 +38,13 @@ own fills prove: a page whose shares were sold is closed with that sale's result
 """
 
 import argparse
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import sys
+import threading
 import time
 
 SCHEMA = 1
@@ -99,10 +102,40 @@ def load(sd):
     return doc
 
 
+_LOCK = threading.local()
+
+
+@contextlib.contextmanager
+def locked(sd):
+    """Hold the record for one read-change-write: the autopilot and the news runs both save it, and without
+    this one could save over the other's change. A file lock (holdings.json.lock), so it works across
+    programs; re-entrant inside one thread, so a locked function may call another."""
+    if getattr(_LOCK, "depth", 0):
+        _LOCK.depth += 1
+        try:
+            yield
+        finally:
+            _LOCK.depth -= 1
+        return
+    p = path(sd) + ".lock"
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    fh = open(p, "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        _LOCK.depth = 1
+        try:
+            yield
+        finally:
+            _LOCK.depth = 0
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
 def save(sd, doc):
     p = path(sd)
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (p, os.getpid(), threading.get_ident())       # a temporary name per program and thread
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2, sort_keys=True)
         fh.write("\n")

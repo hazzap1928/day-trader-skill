@@ -27,6 +27,7 @@ import datetime
 import importlib.util
 import json
 import os
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -261,7 +262,7 @@ def build(client, state_dir, today=None, report_mod=None, with_total=False):
         doc["total"] = total(client, state_dir, rate, t212)
     d = os.path.dirname(p)
     os.makedirs(d, exist_ok=True)
-    tmp = p + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (p, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2, sort_keys=True)
         fh.write("\n")

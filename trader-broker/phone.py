@@ -15,11 +15,14 @@ trader/state/phone.json. Education and tooling, not financial advice.
 """
 
 import argparse
+import contextlib
 import datetime
+import fcntl
 import importlib.util
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -110,7 +113,7 @@ def _read(path, default):
 
 def _write(path, doc):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=1, sort_keys=True)
     os.replace(tmp, path)
@@ -302,25 +305,50 @@ def outbox_path(state_dir):
     return os.path.join(state_dir, "state", "phone-outbox.json")
 
 
+@contextlib.contextmanager
+def _outbox_lock(state_dir):
+    """The autopilot, the guard, the briefing and the news runs all use the outbox: a file lock makes each
+    read-change-write whole, so none saves over a message another just queued."""
+    lp = outbox_path(state_dir) + ".lock"
+    os.makedirs(os.path.dirname(lp), exist_ok=True)
+    with open(lp, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def queue(state_dir, text):
     """Keep a message that could not be sent; the next one that gets through takes it along."""
-    doc = _read(outbox_path(state_dir), {}) or {}
-    items = doc.get("items") or []
-    items.append({"at": _now(), "text": str(text)[:3000]})
-    doc["items"] = items[-OUTBOX_MAX:]
-    doc["dropped"] = int(doc.get("dropped") or 0) + max(0, len(items) - OUTBOX_MAX)
-    _write(outbox_path(state_dir), doc)
+    with _outbox_lock(state_dir):
+        doc = _read(outbox_path(state_dir), {}) or {}
+        items = doc.get("items") or []
+        items.append({"at": _now(), "text": str(text)[:3000]})
+        doc["items"] = items[-OUTBOX_MAX:]
+        doc["dropped"] = int(doc.get("dropped") or 0) + max(0, len(items) - OUTBOX_MAX)
+        _write(outbox_path(state_dir), doc)
 
 
 def flush_outbox(p, state_dir):
-    """Send what waited while the phone could not be reached, oldest first, in one message."""
-    doc = _read(outbox_path(state_dir), {}) or {}
+    """Send what waited while the phone could not be reached, oldest first, in one message. Only what was
+    sent is taken out afterwards: a message queued meanwhile (by another program) stays for the next time."""
+    with _outbox_lock(state_dir):
+        doc = _read(outbox_path(state_dir), {}) or {}
     items = doc.get("items") or []
     if not items:
         return 0
     p.send(messages().delivered_late([(datetime.datetime.fromtimestamp(i["at"]).strftime("%a %H:%M"), i["text"])
                                       for i in items], doc.get("dropped") or 0))
-    _write(outbox_path(state_dir), {"items": []})
+    sent = [(i.get("at"), i.get("text")) for i in items]
+    with _outbox_lock(state_dir):
+        now = _read(outbox_path(state_dir), {}) or {}
+        left = [i for i in (now.get("items") or []) if (i.get("at"), i.get("text")) not in sent]
+        rest = {"items": left}
+        dropped = int(now.get("dropped") or 0) - int(doc.get("dropped") or 0)
+        if left and dropped > 0:
+            rest["dropped"] = dropped
+        _write(outbox_path(state_dir), rest)
     return len(items)
 
 

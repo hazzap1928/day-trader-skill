@@ -46,6 +46,7 @@ import os
 import statistics as st
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -189,7 +190,7 @@ def load(sd, name):
 
 def _save(sd, name, rows):
     p = _path(sd, name)
-    tmp = p + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (p, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, sort_keys=True) + "\n")

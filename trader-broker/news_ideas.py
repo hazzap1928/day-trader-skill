@@ -32,6 +32,7 @@ morning review says is broken is never sold by itself: the phone gets Approve an
 """
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import importlib.util
@@ -43,6 +44,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import redirect_stdout
 
@@ -105,6 +107,13 @@ def _hold():
     if holdings is None:
         holdings = _load("trader-broker", "holdings")
     return holdings
+
+
+def _hold_locked(sd):
+    """The holdings record's lock (holdings.locked) for one read-change-write; a stand-in module without it
+    (tests) gets no lock."""
+    lk = getattr(_hold(), "locked", None)
+    return lk(sd) if lk else contextlib.nullcontext()
 
 
 def _ht():
@@ -239,7 +248,7 @@ def _read(path, default):
 
 
 def _write(path, data):
-    tmp = path + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
         fh.write("\n")
@@ -263,7 +272,7 @@ def load_ideas(sd):
 
 
 def save_ideas(sd, rows):
-    tmp = ideas_path(sd) + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (ideas_path(sd), os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, sort_keys=True) + "\n")
@@ -1313,7 +1322,7 @@ def resolve_verdicts(sd, today, s, bars_fn):
         except Exception:
             continue
     if n:
-        tmp = verdicts_path(sd) + ".tmp"
+        tmp = "%s.%d.%d.tmp" % (verdicts_path(sd), os.getpid(), threading.get_ident())
         with open(tmp, "w", encoding="utf-8") as fh:
             for r in rows:
                 fh.write(json.dumps(r, sort_keys=True) + "\n")
@@ -1370,6 +1379,12 @@ def verdict_lines(t):
 
 
 def expire_asks(sd, today, env="demo"):
+    """expire_asks, holding the record's lock (holdings.locked): the autopilot saves it too."""
+    with _hold_locked(sd):
+        return _expire_asks(sd, today, env)
+
+
+def _expire_asks(sd, today, env="demo"):
     """A "sell it?" request from an earlier day that got no answer: closed as "no_answer" and the page goes
     back to "open" (kept, stop in place). Today's run asks again if it still says sell. Returns how many."""
     H = _hold()
@@ -1395,6 +1410,12 @@ def load_asks(sd):
 
 
 def make_asks(sd, reviews, today, env="demo"):
+    """make_asks, holding the record's lock (holdings.locked): the autopilot saves it too."""
+    with _hold_locked(sd):
+        return _make_asks(sd, reviews, today, env)
+
+
+def _make_asks(sd, reviews, today, env="demo"):
     """A pending approval request for each held news page whose reason the review says is broken, with
     a dated source. At most one open request a page. The page becomes "sell_asked". Never a sale."""
     H = _hold()
@@ -1445,6 +1466,12 @@ def mark_sent(sd, ask_id, message_id=None):
 
 
 def answer(sd, ask_id, nonce, approve):
+    """answer, holding the record's lock (holdings.locked): the autopilot saves it too."""
+    with _hold_locked(sd):
+        return _answer(sd, ask_id, nonce, approve)
+
+
+def _answer(sd, ask_id, nonce, approve):
     """Your tap. Returns (outcome, ask): "approved", "rejected", "already", "expired" or "unknown". Approve
     marks the page "selling": the guard sells it soon after the next US open (09:35 New York), or within minutes
     when the market is open, with the 15:50 close as the backup. Nothing is sold here."""

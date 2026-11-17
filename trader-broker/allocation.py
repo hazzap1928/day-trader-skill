@@ -37,6 +37,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -165,7 +166,7 @@ def _read(p):
 
 def _write(p, doc):
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (p, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2, sort_keys=True)
     os.replace(tmp, p)

@@ -9,6 +9,7 @@ places, cancels or changes an order, and a mismatch is reported, never fixed.
 """
 
 import argparse
+import contextlib
 import datetime
 import importlib.util
 import json
@@ -48,6 +49,13 @@ def _hold():
     if holdings is None:
         holdings = _load("trader-broker", "holdings")
     return holdings
+
+
+def _hold_locked(sd):
+    """The holdings record's lock (holdings.locked) for one read-change-write; a stand-in module without it
+    (tests) gets no lock."""
+    lk = getattr(_hold(), "locked", None)
+    return lk(sd) if lk else contextlib.nullcontext()
 
 
 def _sym(ticker):
@@ -159,6 +167,12 @@ def sales_since(client, since_day, report_mod, guard_state=None):
 
 
 def daily_match(client, sd, rate, today, report_mod=None, ideas=None, pause=True):
+    """daily_match, holding the record's lock (holdings.locked): the news runs save it too."""
+    with _hold_locked(sd):
+        return _daily_match(client, sd, rate, today, report_mod, ideas, pause)
+
+
+def _daily_match(client, sd, rate, today, report_mod=None, ideas=None, pause=True):
     """The daily match: read the account, bring the pages up to date, list what disagrees.
     Returns {"view", "events", "mismatches", "new", "risk", "pause", "pausing"}. Read-only at Trading 212;
     writes only trader/state/holdings.json and holdings-log.jsonl.

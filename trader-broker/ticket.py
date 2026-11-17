@@ -40,6 +40,7 @@ import json
 import os
 import re
 import sys
+import threading
 
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -263,7 +264,7 @@ def write_json(path, data):
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
         fh.write("\n")

@@ -29,6 +29,7 @@ import datetime
 import json
 import math
 import os
+import threading
 
 DEFAULTS = {"enabled": False, "budget_pct": 90.0, "max_loss_pct": 1.0, "daily_loss_pct": 3.0, "max_budget_gbp": None}
 LIMITS = {"budget_pct": (10, 100), "max_loss_pct": (0.1, 5), "daily_loss_pct": (0.5, 10)}
@@ -98,7 +99,7 @@ def plain(r, today=None):
 
 
 def _write_config(path, cfg):
-    tmp = path + ".tmp"
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
         fh.write("\n")
