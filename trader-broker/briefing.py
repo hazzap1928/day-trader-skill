@@ -396,13 +396,15 @@ def build(client, state_dir):
 
 def news_ideas_data(state_dir, session):
     """This morning's news ideas (the 06:00 review, trader-broker/news_ideas.py) for the briefing, or None
-    when the strategy is off or cannot be read. Read-only: the briefing never runs or changes anything."""
+    when the strategy is off. A fault in reading them is logged and comes back as {"state": "error"}, so the
+    briefing says so instead of leaving the section out. Read-only: the briefing never runs or changes anything."""
     try:
         nw = _load("trader-broker", "news_ideas")
         nw.t212 = t212
         return nw.briefing_data(state_dir, session.isoformat())
-    except Exception:
-        return None
+    except Exception as e:
+        sys.stderr.write("briefing: could not read today's news ideas: %s: %s\n" % (type(e).__name__, str(e)[:300]))
+        return {"state": "error", "why": str(e)[:200]}
 
 
 def all_earnings(day):
@@ -430,8 +432,12 @@ def drift_holdings(client, state_dir, cfg, session):
         if not db.drift_tickers(state, client.env):
             return []
         rate = (t212._read_json(os.path.join(state_dir, "fx.json"), {}) or {}).get("usd_per_gbp")
-        return db.read_holdings(client, state_dir, cfg, float(rate), session) if rate else None
-    except Exception:
+        if not rate:
+            sys.stderr.write("briefing: drift holdings not read: no GBP/USD rate in fx.json\n")
+            return None
+        return db.read_holdings(client, state_dir, cfg, float(rate), session)
+    except Exception as e:
+        sys.stderr.write("briefing: could not read the drift holdings: %s: %s\n" % (type(e).__name__, str(e)[:300]))
         return None
 
 
@@ -567,7 +573,8 @@ def full_text(b):
     d = b.get("ideas")
     if d:
         L += ["", "## News ideas (%s)" % ("buying ON" if d.get("buying") else "practice only: nothing is bought"),
-              "- this morning's review: %s" % {"ok": "done", "none": "not run yet", "running": "still running"}.get(
+              "- this morning's review: %s" % {"ok": "done", "none": "not run yet", "running": "still running",
+                                                "error": "COULD NOT BE READ (%s)" % d.get("why")}.get(
                   d.get("state"), d.get("state"))]
         for r in d.get("ideas") or []:
             L.append("- %s (confidence %s: %s; already moved %s%%): %s Event: %s on %s. Wrong if: %s Sell by %s."
@@ -668,6 +675,8 @@ def phone_text(b, path, state_dir):
         how = (M.safety_words("order", r["stop"]) if r["fully_covered"] else
                M.safety_words("partial", covered=r["covered"], qty=r["qty"]) if r["covered"] else M.safety_words("none"))
         held.append((r["ticker"], r["qty"], r.get("price"), how))
+    if b.get("drift_rows") is None:
+        problems.append(M.drift_unread())
     day_trades = [r for r in intraday if not r.get("hold")]       # a news holding is meant to be held: no warning
     if day_trades:
         problems.append("\u26a0\ufe0f Still holding from yesterday: %s. These are normally sold at the close."

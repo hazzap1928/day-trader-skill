@@ -1104,12 +1104,20 @@ def news_ideas(doc, tally=None):
     return join(out)
 
 
+def drift_unread():
+    """A line for the briefing's problems: the drift holdings could not be read this morning."""
+    return "⚠️ I couldn't read the earnings-drift holdings this morning. Send /status before the US open to check them."
+
+
 def news_briefing(d):
     """The news ideas part of the morning briefing (a list of lines), from news_ideas.briefing_data."""
     if not d:
         return []
-    head = "\U0001f4f0 <b>News ideas</b> (%s)" % ("buying is on" if d.get("buying") else "practice only, nothing is bought")
     state = d.get("state")
+    if state == "error":
+        return ["\U0001f4f0 <b>News ideas</b>", "⚠️ I couldn't read this morning's news ideas: something went wrong "
+                                                "on this Mac (the details are in the briefing log)."]
+    head = "\U0001f4f0 <b>News ideas</b> (%s)" % ("buying is on" if d.get("buying") else "practice only, nothing is bought")
     if state == "failed":
         return [head, "⚠️ This morning's news review failed%s, so there are no ideas from it. I'll look again about an "
                       "hour before the US market opens." % (

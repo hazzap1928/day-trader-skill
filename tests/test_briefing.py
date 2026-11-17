@@ -231,6 +231,37 @@ class Message(BriefBase):
         with open(path) as fh:
             self.assertIn("## 5. To do, most urgent first", fh.read())
 
+    def test_a_fault_reading_the_news_ideas_is_said_not_hidden(self):
+        saved = br._load
+
+        def broken(folder, name):
+            if name == "news_ideas":
+                raise RuntimeError("a bug in the news code (test)")
+            return saved(folder, name)
+        br._load = broken
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                d = br.news_ideas_data(self.dir, datetime.date(2026, 11, 5))
+        finally:
+            br._load = saved
+        self.assertEqual(d["state"], "error")
+        self.assertIn("could not read today's news ideas", err.getvalue())          # logged
+        M = t212.phone_module().messages()
+        self.assertIn("couldn't read this morning's news ideas", " ".join(M.news_briefing(d)))
+        self.assertEqual(M.news_briefing(None), [])                                  # off: still no section
+
+    def test_drift_holdings_that_cannot_be_read_are_said_on_the_phone(self):
+        self.all_data()
+        self.trading212(orders=())
+        b = self.build()
+        b["drift_rows"] = None
+        text = br.phone_text(b, os.path.join(self.dir, "briefings", "x.md"), self.dir)
+        self.assertIn("couldn't read the earnings-drift holdings", text)
+        b["drift_rows"] = []
+        text = br.phone_text(b, os.path.join(self.dir, "briefings", "x.md"), self.dir)
+        self.assertNotIn("couldn't read the earnings-drift holdings", text)
+
     def test_weekends_and_us_holidays_are_skipped(self):
         for when in (calendar.timegm((2026, 11, 7, 7, 30, 0)),        # Saturday
                      calendar.timegm((2026, 11, 26, 7, 30, 0))):      # Thanksgiving
