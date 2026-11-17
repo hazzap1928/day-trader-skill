@@ -485,7 +485,7 @@ The guard (`t212-guard`) also sells, from 09:35 New York, any holding whose sale
   raised (`tests/test_ratelimit_note.py`, 17 Nov).
 - **Restart a job:** `launchctl kickstart -k gui/$(id -u)/com.daytraderskill.<job>`
 
-## Current config (`trader/config.json`, git-ignored; backups beside it as `config.json.bak-*`)
+## Current config (`trader/config.json`, git-ignored; backups in `trader/backups/config/`, newest 5, older in `trader/archive/`)
 
 The ORB keys below (`max_trades_per_day`, `min_reward_risk`, entry times, trailing stop, `allocation`,
 `evidence.confidence_bands`) only matter for day trading, which is off (`autopilot.intraday_enabled` false).
@@ -515,7 +515,7 @@ The ORB keys below (`max_trades_per_day`, `min_reward_risk`, entry times, traili
 - **`drift`:** `scan_enabled: true` since 10 Nov; `buy_enabled: true` since 12 Nov (the owner's decision).
   No drift buy yet: every shortlist so far was empty.
 - **`news`:** `buy_enabled: true` and `buy_confidence: ["medium", "high"]` since 17 Nov 2026 (the owner's
-  decision; backup `config.json.bak-*` from that day). Money: 10% cash always, drift up to 50% of the investable
+  decision; backup `trader/backups/config/config.json.bak-*` from that day). Money: 10% cash always, drift up to 50% of the investable
   cash, news uses what drift and the other holdings leave.
 
 ## Evidence mode: the forward test (from 9 Nov 2026, no end date) (dormant: day trading)
