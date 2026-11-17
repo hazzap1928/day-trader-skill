@@ -29,6 +29,18 @@ the owner's approval on Telegram.
 | News runs | Two a day: 06:00 UK (into the 07:30 briefing) and 08:30 New York (a short update; a message only if something changed). A run that cannot finish in time is skipped, and nothing is bought from a run that did not finish |
 | News quality | Confidence (only "high" may be bought), how far the share has already moved, a sell date at most 10 trading days after the event unless a reason is given, a 5% price check at buy time, results by confidence on Fridays |
 
+**17 Nov 2026 (the owner's changes):**
+
+| Topic | Decision |
+|---|---|
+| News buying | ON for the demo account (`news.buy_enabled: true`). Caps unchanged: drift 2%, news 2%, intraday 1% |
+| Confidence | For now "medium" and "high" ideas may be bought (`news.buy_confidence`, a setting; "high" goes back) |
+| Proof of searching | A news run must show its web searches and the pages it opened. No searches: the run fails and nothing is bought. An idea needs a source the run opened |
+| Verdicts | Both news runs give every holding (news and drift) keep, watch or sell, with a reason, a confidence and dated sources. Shown in the briefing and the daily review |
+| Approval | A "sell" on a news holding sends Approve and Reject. Approve sells soon after the next open; Reject or no answer keeps it and it is asked again the next day; the stop stays until the sale |
+| Drift verdicts | Written down only, never acted on. Later reports compare "sold when it said sell" with what the rule made |
+| Hot topics | The 06:00 run also gives 3 to 5 things the US market is talking about, shown in the 07:30 briefing |
+
 ## 1. Where the drift build stood on 16 Nov
 
 | Stage | What it is | Status |

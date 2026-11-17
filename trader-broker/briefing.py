@@ -576,6 +576,16 @@ def full_text(b):
                         r.get("event_date"), r.get("wrong_if"), r.get("sell_date")))
         if d.get("rejected"):
             L.append("- %d other idea(s) did not pass the checks (python3 trader-broker/news_ideas.py show)" % d["rejected"])
+        if d.get("topics"):
+            L += ["", "## What the market is talking about"]
+            L += ["- %s (%s, %s, %s)" % (t["text"], t["source"].get("title"), t["source"].get("date"), t["source"].get("url"))
+                  for t in d["topics"]]
+        if d.get("verdicts"):
+            L += ["", "## Verdicts on what is held (a drift verdict is only written down)"]
+            L += ["- %s (%s): %s, confidence %s: %s%s" % (
+                v.get("symbol"), v.get("strategy"), v.get("verdict"), v.get("confidence"), v.get("why"),
+                "".join("; source %s: %s (%s)" % (x.get("date"), x.get("title"), x.get("url")) for x in v.get("sources") or []))
+                for v in d["verdicts"]]
     if b.get("drift_rows"):
         L += ["", "## Drift positions (demo, held up to 20 trading days; expected overnight)"]
         L += ["- " + _drift_buy().holding_line(r) for r in b["drift_rows"]]

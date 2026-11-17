@@ -16,7 +16,8 @@ judgement.
   8. One message.
 
 It never places, cancels or changes an order, never sends Approve/Reject buttons and never edits a page:
-it says what it would sell or ask about. Read-only at Trading 212. Demo. Education and tooling, not
+it says what it would sell or ask about, and shows each holding's verdict from the day's news runs (the news
+runs, not this review, send the "sell it?" question for a news holding). Read-only at Trading 212. Demo. Education and tooling, not
 financial advice.
 
     python3 trader-broker/review.py            # today's review as text (demo, read-only, nothing sent)
@@ -147,7 +148,7 @@ def limits(cfg, view, risk, cost):
     return out
 
 
-def build(sd, cfg, res, today, bars_fn=None, asks=None):
+def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None):
     """The review from a daily-match result (holdings_t212.daily_match). Pure but for the SPY bars
     (`bars_fn`, information only; a failure just leaves the market figure out). Changes nothing."""
     H, D = _hold(), _drift()
@@ -197,7 +198,8 @@ def build(sd, cfg, res, today, bars_fn=None, asks=None):
         row = {"symbol": pos.get("symbol"), "ref": ref, "strategy": strategy, "qty": qty, "avg": avg, "price": price,
                "gain_gbp": gain, "stop": st.get("stop"), "stop_how": st.get("how"), "risk_gbp": st.get("risk_gbp"),
                "buy_date": (page or {}).get("buy_date"), "reason": (page or {}).get("reason"),
-               "sell_date": None, "status": (page or {}).get("status"), "market_pct": None}
+               "sell_date": None, "status": (page or {}).get("status"), "market_pct": None,
+               "verdict": (verdicts or {}).get(pos.get("symbol")) if page is not None and H.is_hold(page) else None}
         sell = H.sell_date(page) if page else None
         if sell:
             row["sell_date"] = sell.isoformat()
@@ -278,6 +280,10 @@ def text(r):
             "no price" if row["gain_gbp"] is None else "GBP %+.2f" % row["gain_gbp"],
             "" if row["market_pct"] is None else " (S&P 500 %+.2f%% over the same days, for information)" % row["market_pct"],
             "none" if not row["stop"] else "$%.2f" % row["stop"], row.get("stop_how") or "?", row["sell_date"] or "none"))
+        if row.get("verdict"):
+            L.append("         today's verdict from the news runs: %s (confidence %s): %s%s" % (
+                row["verdict"].get("verdict"), row["verdict"].get("confidence"), row["verdict"].get("why"),
+                "; written down only, the date rule decides" if row["strategy"] == "drift" else ""))
     if not r["rows"]:
         L.append("  nothing is held")
     if r["due"]:
@@ -291,11 +297,11 @@ def text(r):
     return "\n".join(L)
 
 
-def run(sd, cfg, res, today, bars_fn=None, say=None, push=None, asks=None):
+def run(sd, cfg, res, today, bars_fn=None, say=None, push=None, asks=None, verdicts=None):
     """Build, save, log and (when worth it) send the review. Never raises; never changes an order or a page."""
     T = _t212()
     try:
-        r = build(sd, cfg, res, today, bars_fn=bars_fn, asks=asks)
+        r = build(sd, cfg, res, today, bars_fn=bars_fn, asks=asks, verdicts=verdicts)
     except Exception as e:
         r = could_not(today, e)
     try:
@@ -327,7 +333,9 @@ def main(argv=None, environ=None):
         pause = (cfg.get("holdings") or {}).get("pause_on_mismatch", True) is not False if isinstance(cfg.get("holdings"), dict) else True
         res = _ht().daily_match(client, a.state_dir, float(rate), today.isoformat(), _load("trader-broker", "report"), pause=pause)
         asks = (T._read_json(os.path.join(a.state_dir, "state", "news", "asks.json"), {}) or {}).get("asks")
-        r = build(a.state_dir, cfg, res, today, bars_fn=D.daily_bars, asks=asks)
+        doc = T._read_json(os.path.join(a.state_dir, "state", "news", "today.json"), {}) or {}
+        verdicts = doc.get("verdicts") if doc.get("day") == today.isoformat() and isinstance(doc.get("verdicts"), dict) else {}
+        r = build(a.state_dir, cfg, res, today, bars_fn=D.daily_bars, asks=asks, verdicts=verdicts)
     except Exception as e:
         r = could_not(today, T.scrub(str(e), ()))
     print(json.dumps(r, indent=2) if a.json else text(r))

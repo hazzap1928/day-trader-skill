@@ -135,6 +135,7 @@ def sales_since(client, since_day, report_mod, guard_state=None):
     since = report_mod.alerts.eastern_to_utc(datetime.datetime.combine(since_day, datetime.time(0, 0)))
     trips, _ = report_mod.round_trips(report_mod.history(client, since))
     eod = (guard_state or {}).get("eod") or {}
+    ap = (guard_state or {}).get("approved_sale") or {}
     out = []
     for c in trips:
         if not c.get("entry_at"):
@@ -145,6 +146,8 @@ def sales_since(client, since_day, report_mod, guard_state=None):
             why = "sold in the Trading 212 app"
         elif str(s.get("type") or "").upper() in ("STOP", "STOP_LIMIT"):
             why = "stop"
+        elif ap.get("date") == day and c["ticker"] in (ap.get("sold") or []):
+            why = "sold because you approved it"
         elif eod.get("date") == day and any((x or {}).get("ticker") == c["ticker"] for x in eod.get("sold") or []):
             why = "sold at the close"
         else:

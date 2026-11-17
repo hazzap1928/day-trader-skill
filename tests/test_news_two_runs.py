@@ -288,7 +288,7 @@ class TheUpdate(NewsBase):
         self.reads()
         out = self.update(keep(reviews=[{"symbol": "TSLA", "broken": True, "why": "The launch was delayed to next year.",
                                          "sources": [{"title": "Delayed", "url": "https://example.com/d", "date": "2026-11-05"}]}]))
-        self.assertIn("REVIEW", self.asked[0])
+        self.assertIn("HOLDINGS", self.asked[0])
         self.assertEqual(len(out["asks"]), 1)
         self.assertEqual(H.load(self.dir)["pages"][0]["status"], "sell_asked")
         self.assertEqual(self.writes(), [])
@@ -409,7 +409,7 @@ class OnlyHighIsBought(TN.Buying):
         res = self.buy()
         self.assertEqual(res["bought"], [])
         self.assertEqual(res["status"], "nothing to buy today")
-        self.assertIn("its confidence is medium: only high ideas are bought", res["skipped"][0][1])
+        self.assertIn("its confidence is medium: only high confidence ideas are bought", res["skipped"][0][1])
         self.assertEqual(self.router.calls, [])                          # Trading 212 was not even asked
         with open(os.path.join(self.dir, "state", "news", "buys.jsonl")) as fh:
             row = json.loads(fh.readline())

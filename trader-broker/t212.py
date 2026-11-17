@@ -2201,7 +2201,10 @@ def eod_settings(cfg):
     return {"at": (int(m.group(1)), int(m.group(2)))}
 
 
-def eod_close(client, state_dir):
+APPROVED_SELL_AT = (9, 35)     # New York: a sale you approved on your phone is made from this time on
+
+
+def eod_close(client, state_dir, approved_only=False):
     """Sell the day's positions at market, after cancelling their pending sells (the stop holds
     the shares). Exits only: every write is a cancel or a SELL. Demo only.
     Which positions, from their buy record in trader/state/broker.json:
@@ -2210,9 +2213,13 @@ def eod_close(client, state_dir):
                    before that, kept with its stop untouched
       an unknown label, or no readable sell date: KEPT, and a GUARD ALERT says so
       no buy record at all: not sold, and a GUARD ALERT says so
+    approved_only: the sale after the open of holdings whose sale you approved on your phone, and nothing
+    else. Same steps (cancel the stop, sell at market, put the stop back if the sale is refused). Each is tried
+    once a day here; if it fails, the 15:50 close tries again.
     Returns {"at", "closed": [...], "failed": [...], "kept": [...], "unknown": [...], "nothing": bool}."""
     if client.env != "demo":
         raise T212Error("the end-of-day close runs on the demo account only; nothing was sent", 2)
+    label = "approved sale" if approved_only else "end-of-day"
     tk = ticket_module()
     out = {"at": tk.ny_iso(_utc_now()), "env": client.env, "positions": [], "warnings": [], "placed": 0,
            "closed": [], "failed": [], "sold": [], "kept": [], "unknown": [], "overdue": []}
@@ -2222,12 +2229,21 @@ def eod_close(client, state_dir):
     positions = client.get(POSITIONS) or []
     pending = client.get(ORDERS) or []
     approved = approved_sales(state_dir, client.env)
+    tried = g.state.get("approved_sale") if isinstance(g.state.get("approved_sale"), dict) else {}
+    if tried.get("date") != today:
+        tried = {"date": today, "tried": [], "sold": []}
     for p in positions:
         ticker = _o_ticker(p)
         held = _num(p.get("quantity")) or 0
         if not ticker or held <= 0:
             continue
         rec = position_record(state, ticker, client.env)
+        if approved_only:
+            if ticker not in approved or ticker in tried["tried"] or rec is None or not is_hold(rec):
+                continue
+            tried["tried"].append(ticker)
+            g.state["approved_sale"] = tried
+            g.save()                               # marked before the order: never sent twice in a day from here
         if rec is None:
             out["unknown"].append("%s: %s held with no buy record from this pack, so the end-of-day close did NOT "
                                   "sell it. Sell it yourself in the app if it should go" % (ticker, _qty(held)))
@@ -2248,8 +2264,8 @@ def eod_close(client, state_dir):
                                       % (ticker, position_strategy(rec), rec.get("sell_date")))
         stops, others = guard_sell_orders(pending, ticker)
         if g.unclear.get(ticker):
-            out["failed"].append("%s: NOT CLOSED, an earlier guard order is unclear (%s); sell it in the app"
-                                 % (ticker, g.unclear[ticker]))
+            out["failed"].append("%s: NOT CLOSED (%s), an earlier guard order is unclear (%s); sell it in the app"
+                                 % (ticker, label, g.unclear[ticker]))
             continue
         cancelled, ok = [], True
         for o in stops + others:
@@ -2263,16 +2279,17 @@ def eod_close(client, state_dir):
             cancelled.append(o)
         if not ok:
             continue
-        g.log("request", method="POST", path=MARKET, body=market_body(ticker, "sell", held), why="end-of-day close")
+        g.log("request", method="POST", path=MARKET, body=market_body(ticker, "sell", held),
+              why="a sale you approved" if approved_only else "end-of-day close")
         try:
             _, resp = guard_send_sell(client, ticker, held)
         except PlaceError as e:
             g.log("response", path=MARKET, status=e.status, outcome=e.outcome, error=str(e))
             if e.outcome != "rejected":
-                g.unclear[ticker] = "end-of-day SELL %s: %s at %s" % (_qty(held), e, out["at"])
+                g.unclear[ticker] = "%s SELL %s: %s at %s" % (label, _qty(held), e, out["at"])
                 g.save()
-                out["failed"].append("%s: UNCLEAR whether the end-of-day SELL %s went through (%s); its stop was "
-                                     "cancelled. Check the app NOW" % (ticker, _qty(held), e))
+                out["failed"].append("%s: UNCLEAR whether the %s SELL %s went through (%s); its stop was "
+                                     "cancelled. Check the app NOW" % (ticker, label, _qty(held), e))
                 continue
             back = []
             for o in cancelled:
@@ -2280,8 +2297,8 @@ def eod_close(client, state_dir):
                 if price:
                     r, _ = g.stop(ticker, abs(_num(o.get("quantity")) or held), price, "restore after a failed close")
                     back.append("stop %.2f %s" % (price, "put back" if r == "ok" else "NOT put back"))
-            out["failed"].append("%s: the end-of-day SELL %s was REFUSED (%s); %s. The position is still open"
-                                 % (ticker, _qty(held), e, "; ".join(back) or "it had no stop"))
+            out["failed"].append("%s: the %s SELL %s was REFUSED (%s); %s. The position is still open"
+                                 % (ticker, label, _qty(held), e, "; ".join(back) or "it had no stop"))
             continue
         g.log("response", path=MARKET, body=resp)
         out["placed"] += 1
@@ -2291,8 +2308,12 @@ def eod_close(client, state_dir):
             ticker, _qty(held), _ident(resp.get("id")), " (%s)" % why if why else "",
             "" if not cancelled else ", cancelled %s" % ", ".join(
                 "%s %s" % (o.get("type", "?"), _fmt(o.get("stopPrice"))) for o in cancelled)))
-    g.state["eod"] = {"date": today, "at": out["at"], "closed": out["closed"], "failed": out["failed"],
-                      "sold": out["sold"], "kept": out["kept"], "unknown": out["unknown"]}
+    if approved_only:
+        tried["sold"] = sorted(set(tried.get("sold") or []) | {x["ticker"] for x in out["sold"]})
+        g.state["approved_sale"] = tried
+    else:
+        g.state["eod"] = {"date": today, "at": out["at"], "closed": out["closed"], "failed": out["failed"],
+                          "sold": out["sold"], "kept": out["kept"], "unknown": out["unknown"]}
     g.save()
     out["nothing"] = not out["closed"] and not out["failed"] and not out["kept"] and not out["unknown"]
     return out
@@ -2324,6 +2345,26 @@ def run_eod(client, state_dir):
         guard_alarm(client, "END-OF-DAY CLOSE: " + f)
     for f in res.get("overdue", []):
         guard_alarm(client, "DRIFT SELL OVERDUE: " + f)
+    return res
+
+
+def run_approved(client, state_dir):
+    """The sale, soon after the open, of each holding whose sale you approved on your phone. Returns the
+    result, or None when nothing is approved (no request is made then). Exits only; demo only."""
+    if client.env != "demo" or not approved_sales(state_dir, client.env):
+        return None
+    st = _read_json(os.path.join(state_dir, "state", "t212-guard.json"), {}) or {}
+    ap = st.get("approved_sale") if isinstance(st.get("approved_sale"), dict) else {}
+    if ap.get("date") == _today_ny(ticket_module()) and not (approved_sales(state_dir, client.env) - set(ap.get("tried") or [])):
+        return None                                # each was tried today: the 15:50 close is the backup
+    res = eod_close(client, state_dir, approved_only=True)
+    if res["closed"] or res["failed"]:
+        _say("APPROVED SALE (%s) %s\n%s" % (res["env"], res["at"], "\n".join(
+            ["  sold: " + x for x in res["closed"]] + ["  !!! " + x for x in res["failed"]])))
+    for x in res["sold"]:
+        _phone_push(client, _m(client).approved_sale_sent(str(x["ticker"]).split("_")[0]))
+    for f in res["failed"]:
+        guard_alarm(client, "APPROVED SALE FAILED: " + f)
     return res
 
 
@@ -2558,6 +2599,8 @@ def cmd_guard(client, args):
             _sleep(every)
             continue
         try:
+            if now_et >= now_et.replace(hour=APPROVED_SELL_AT[0], minute=APPROVED_SELL_AT[1], second=0):
+                run_approved(client, args.state_dir)       # a sale you approved: soon after the open
             res = guard_pass(client, args.state_dir)
             _say(json.dumps(res, sort_keys=True) if args.json else render_guard(res))
             guard_phone(client, res)

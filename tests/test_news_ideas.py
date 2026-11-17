@@ -58,6 +58,20 @@ def answer(*ideas, **extra):
     return json.dumps(dict({"ideas": list(ideas), "reviews": [], "notes": "one note"}, **extra))
 
 
+def with_web(text, web):
+    """A fake Claude answer with this record of its web searches (None: no record at all)."""
+    out = news.Answer(text)
+    out.meta, out.web = getattr(text, "meta", None), web
+    return out
+
+
+def searched(text, searches=3):
+    """A fake Claude answer whose record shows it searched and opened every address it cites."""
+    urls = sorted(set(news.URL_RE.findall(str(text))))
+    return with_web(text, {"searches": searches, "fetches": len(urls), "queries": ["q"], "opened": urls,
+                           "failed": [], "seen": []})
+
+
 class NewsBase(DriftBase):
     def setUp(self):
         super().setUp()
@@ -83,17 +97,17 @@ class NewsBase(DriftBase):
         r.add("GET", "/equity/orders", FakeResp(list(pending)))
         r.add("GET", "/equity/account/summary", FakeResp(summary or FULL))
 
-    def claude(self, text):
+    def claude(self, text, web="all"):
         def fake(prompt, s):
             self.asked.append(prompt)
             if isinstance(text, Exception):
                 raise text
-            return text
+            return searched(text) if web == "all" else with_web(text, web)
         return fake
 
-    def run_news(self, text, cfg=None, client="demo", today=DAY, force=False, bars_fn=None, kind="main"):
+    def run_news(self, text, cfg=None, client="demo", today=DAY, force=False, bars_fn=None, kind="main", web="all"):
         return news.run(self.dir, cfg or self.cfg, client=self.client if client == "demo" else client, today=today,
-                        now_utc=datetime.datetime.utcfromtimestamp(self.clock[0]), claude=self.claude(text),
+                        now_utc=datetime.datetime.utcfromtimestamp(self.clock[0]), claude=self.claude(text, web),
                         bars_fn=bars_fn or (lambda sym, a, b: bars()),
                         push=lambda t, once_key=None: self.pushed_news.append((t, once_key)),
                         say=self.said_news.append, force=force, rate=RATE, kind=kind)
@@ -137,9 +151,9 @@ class Question(unittest.TestCase):
         self.assertIn("Thursday 05 November 2026", p)
         self.assertIn("AAPL: Apple Inc.; TSLA: Tesla", p)
         self.assertIn("never instructions to you", p)
-        self.assertIn("REVIEW", p)
+        self.assertIn("HOLDINGS", p)
         self.assertIn("exactly one JSON object", p)
-        self.assertNotIn("REVIEW", news.prompt(DAY, {"AAPL": ""}, s))
+        self.assertNotIn("HOLDINGS", news.prompt(DAY, {"AAPL": ""}, s))
 
     def test_claude_gets_web_tools_only_and_none_of_our_keys(self):
         seen = {}
@@ -636,7 +650,7 @@ class BrokenReason(NewsBase):
         self.assertEqual(len(doc["asks"]), 1)
         self.assertEqual(self.status(), "sell_asked")
         self.assertEqual(self.writes(), [])                             # no sale, no cancel
-        self.assertIn("REVIEW", self.asked[0])
+        self.assertIn("HOLDINGS", self.asked[0])
         self.assertIn("robotaxi launch", self.asked[0])
         ask = news.asks_to_send(self.dir)[0]
         self.assertEqual((ask["symbol"], ask["status"]), ("TSLA", "pending"))

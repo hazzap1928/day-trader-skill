@@ -24,7 +24,7 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 | `trader-broker/drift_buy.py` | drift **buying** (stage 3), only with `drift.buy_enabled` (ON since 12 Nov): the 09:33 buys, reservations, holdings lines, DRIFT SELL, the Friday drift section |
 | `trader-broker/holdings.py` | the **holdings record**: one page per buy (reason, stop, sell rule, result), the match and the open-risk sum. Broker-neutral: no broker code |
 | `trader-broker/holdings_t212.py` | Trading 212's side of the record: the account as a plain "view", and the daily match. **Read-only, report only** |
-| `trader-broker/news_ideas.py` | the **"news" strategy**: ideas from two scheduled `claude -p` runs a day, checked by the pack's rules. **Shadow** unless `news.buy_enabled` (see "News ideas") |
+| `trader-broker/news_ideas.py` | the **"news" strategy**: ideas from two scheduled `claude -p` runs a day, checked by the pack's rules, plus a verdict on every holding and the day's hot topics. Buys only with `news.buy_enabled` (ON since 17 Nov, see "News ideas") |
 | `trader-broker/review.py` | the **daily review** of what is held, after the close. **Report only**: it says what it would sell or ask about (see "The daily review") |
 | `trader-broker/evidence.py` | evidence mode (forward test): signal log, virtual results, slippage, Friday report |
 | `trader-broker/briefing.py`, `report.py` | 07:30 morning briefing; closing report from Trading 212's own fills |
@@ -40,8 +40,10 @@ offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them pas
 **Direction (16 Nov 2026):** the day-trading engine is being replaced by a hold-and-review agent
 (`docs/hold-agent-spec.md`). Built so far: the holdings record and daily match, "keep and report" at the
 close, a risk cap for each strategy, pausing new buys on a mismatch, the daily review (report only), the
-news strategy in shadow with two runs a day. Still to do: the review acting on what it finds (rule and
-approval sales for every strategy), and retiring the ORB scanner LAST (it still runs).
+news strategy with two runs a day (buying ON since 17 Nov), a keep/watch/sell verdict on every holding, and
+the approval step for news holdings (Approve sells soon after the next open). Still to do: asking about a
+holding that left the universe or went on the blocked list (the review only says it would), any approval
+step for drift (its verdicts are logged only), and retiring the ORB scanner LAST (it still runs).
 
 The guard's protections:
 - stops are good till cancelled, and checked again 1 minute after placing and on every cycle
@@ -62,7 +64,13 @@ The guard's protections:
 - **The 15:50 close** (`t212.eod_close`, `hold_due`) sells:
   - intraday and unlabelled positions
   - a drift or news position on or after its `sell_date`
-  - a position whose sale the owner approved on the phone (a holdings page with status `selling`)
+  - a position whose sale the owner approved on the phone (a holdings page with status `selling`), if the
+    guard's sale after the open (below) did not already sell it
+- **A sale the owner approved is made soon after the open** (`t212.run_approved`, from the guard's loop at
+  or after `APPROVED_SELL_AT` 09:35 New York, or within one guard cycle when approved in market hours):
+  `eod_close(..., approved_only=True)` cancels the stop, sells at market, and puts the stop back if the sale
+  is refused. Tried once a day per stock (`approved_sale` in `t212-guard.json`); a failure alarms and the
+  15:50 close tries again. Demo only, exits only. One phone line (`messages.approved_sale_sent`).
 - **It keeps, and reports with a GUARD ALERT, never sells:** an unknown label, a holding with no
   readable sell date, a position with no buy record at all. (Before 16 Nov a drift record with no
   date, or an unknown label, was sold as a day trade.)
@@ -76,7 +84,7 @@ The guard's protections:
   `sources`, `buy_date`, `buy_price`, `qty`, `stop`, `sell_rule` (`date`, `rule`), `status`, `result`,
   plus `broker`, `account` and `broker_ref` (the broker's own ticker). Every change is also added to
   `holdings-log.jsonl`. `holdings.py` has no broker code, so an Interactive Brokers version can reuse it.
-- **Status:** `waiting` (not filled), `open`, `sell_asked`, `selling` (approved: the next close sells it),
+- **Status:** `waiting` (not filled), `open`, `sell_asked`, `selling` (approved: the guard sells it after the next open),
   `closed` (with the result from the broker's own fills), `mismatch`.
 - **The daily match** (`holdings_t212.daily_match`, from the autopilot before the MARKET OPEN message and
   after the closing report): it reads positions, pending orders and, when needed, the fill history. It
@@ -133,15 +141,19 @@ The guard's protections:
   a page (a test reads the source). A sale on the sell date is still made by the guard's 15:50 close, as
   before. "Would ask" is words only. A breach of a money limit sells nothing: the buy checks already refuse
   a buy that adds to it.
+- **It shows each holding's verdict** from the day's news runs (`news_ideas.todays_verdicts`, "Today's
+  read: keep / watch / sell" with the reason). The question for a news "sell" is sent by the news runs, not
+  by the review.
 - **Phone:** one message (`messages.daily_review`), only when something is held or something is wrong.
   "Couldn't check today" is sent only when the record says something should be held.
 - **Files:** `trader/state/reviews/DATE.json`. **By hand:** `python3 trader-broker/review.py` (prints, sends nothing).
 - **Tests:** `tests/test_review.py`.
 
-## News ideas (from 16 Nov 2026): `trader-broker/news_ideas.py`, SHADOW
+## News ideas (from 16 Nov 2026; buying ON since 17 Nov): `trader-broker/news_ideas.py`
 
-- **Switch:** `"news": {"buy_enabled": false}` is the default. **Only the owner turns it on; Claude never
-  does.** Demo only: it refuses when `paper` is not true, and `t212.py place` refuses a news order on
+- **Switch:** `"news": {"buy_enabled": false}` is the code's default; the owner's config has it `true` since
+  17 Nov 2026 (the owner's decision, set by Claude on the owner's written instruction for that one change).
+  **Only the owner turns it on; Claude never does on its own.** Demo only: it refuses when `paper` is not true, and `t212.py place` refuses a news order on
   live, with buying off, or without a sell date after today.
 - **Two runs each US trading day** (`run --kind main|update`; each `claude -p` uses the owner's Claude Code
   plan, no API key, **web search and web fetch only**, in an empty folder without the pack's keys):
@@ -151,8 +163,18 @@ The guard's protections:
   - **update, 08:30 New York** (launchd job `news-update`, started at 12:30 AND 13:30 UK; only the start at
     or after 08:30 New York does anything): a shorter look at what is new since 06:00 (results before the
     open included). It answers `checks` (keep or drop each morning idea, with a one-line reason), may add
-    new ideas, and reviews news holdings for a broken reason. **One short message only if something
-    changed** (`messages.news_update`). An idea it does not mention is "unconfirmed".
+    new ideas, and gives a verdict on every holding. **One short message only if something changed** (an
+    idea dropped or added, or a holding's verdict turned to watch or sell; `messages.news_update`). An idea
+    it does not mention is "unconfirmed".
+- **Proof of web searches** (`read_stream`, `searched`, `check_sources`): the run uses `--output-format
+  stream-json --verbose`, which lists every tool call. From it: how many WebSearch and WebFetch calls, the
+  pages web fetch really got ("opened"), and addresses only seen in search results. (The envelope's own
+  `server_tool_use` counters read 0 in Claude Code, so they are not used.)
+  - A run with no search and no opened page, or with no record at all, **fails**: its answer is thrown
+    away, and a failed update means no news buy that day.
+  - An idea needs at least one source the run opened (the same page whatever its `www.`, trailing slash or
+    `?tag`); a source neither opened nor seen is dropped. Each kept source carries `opened: true/false`.
+  - The counts and the first opened pages are kept in `today.json` (`runs.KIND.web`) and `runs.jsonl`.
 - **A missed run** (`news_ideas.timing`, `catch_up`, `Pilot.catch_up_news`): the always-on autopilot starts
   it when the Mac wakes (10 minutes of grace, once a day each). A run that can no longer finish in time is
   written down as `skipped`, never run late: main must finish before 08:30 New York, the update before
@@ -167,9 +189,11 @@ The guard's protections:
   has already moved on the news, Claude's estimate).
 - **Hold length (by code):** the sell date may be at most `max_days_after_event` (10) trading days after the
   event date, unless Claude gives a `long_hold_reason`.
-- **Only "high" confidence may be bought** (`buy_confidence`). Every other passed idea stays logged with a
-  virtual result, so the levels can be compared. Only ideas that would be bought count toward the pretend
-  book, the caps and `max_positions`.
+- **Which confidence may be bought** is the setting `buy_confidence`: one level (`"high"`, the code's
+  default) or a list. The owner's config has `["medium", "high"]` since 17 Nov ("for now"); `"high"` goes
+  back to high only. Every other passed idea stays logged with a virtual result, so the levels can be
+  compared. Only ideas that would be bought count toward the pretend book, the caps and `max_positions`.
+  `settings()` gives `buy_levels` (a tuple) and `buy_confidence` (words, e.g. "medium and high").
 - **Checks by code:** the universe, `blocked_tickers`, a stop (`atr_mult` 3 x the 14-day ATR under the
   price, a setting, untested), size (`t212.size_entry`: 1% max loss, `max_position_pct`, and the room
   left after drift and everything held, at least `min_buy_gbp` 100), trader-risk with `strategy="news"`,
@@ -189,23 +213,39 @@ The guard's protections:
   gone); update: one message. The plan's usage limit is recognised and said plainly. Nothing is bought.
 - **What a run uses:** `runs.jsonl` and `today.json` keep each run's seconds, turns and tokens
   (`news_ideas.run_meta`); `news_ideas.py show` prints them.
-- **Broken reasons:** either run reviews held news positions. A reason marked broken with a dated source
-  makes a request in `trader/state/news/asks.json`; the autopilot sends it with Approve and Reject
-  (`sa:`/`sr:` buttons). Approve sets the page to `selling` and the guard's next 15:50 close sells it.
-  Reject or no answer keeps it, stop in place. The autopilot itself never sells.
+- **A verdict on every holding** (`take_verdicts`, both runs): each open news AND drift page gets `keep`,
+  `watch` or `sell` with a one-line reason, a confidence and dated sources (checked like an idea's). Logged
+  in `trader/state/news/verdicts.jsonl`; today's are in `today.json` (`verdicts`). A holding the run did not
+  mention is logged `none`; a `sell` without a reason and an opened source counts as `watch`.
+  - **News holding, `sell`:** a request in `trader/state/news/asks.json`; the autopilot sends it with
+    Approve and Reject (`sa:`/`sr:` buttons). Approve sets the page to `selling` and the guard sells it soon
+    after the next US open (see "Strategy labels"). Reject keeps it. No answer keeps it: the next day's run
+    closes the old request (`no_answer`, old buttons answer "expired") and asks again if it still says sell.
+    One request a holding a day. The stop stays until the sale itself. The autopilot never sells.
+  - **Drift holding:** the verdict is written down and shown, never acted on. `resolve_verdicts` (each main
+    run) fills in, for a finished holding with a `sell` verdict that was not acted on, what selling at the
+    next day's open would have made against what the rule made; the Friday report shows both
+    (`verdict_tally`, `messages.friday_verdicts`).
+  - Shown in the 07:30 briefing ("My read on what I'm holding") and in the daily review.
+- **Hot topics** (main run only, `clean_topics`): 3 to 5 plain sentences on what the US market is talking
+  about, each with a dated source the run saw. In the briefing under "What the market is talking about"
+  (`messages.hot_topics`), whether or not they led to an idea.
 - **Files** (`trader/state/news/`): `ideas.jsonl` (every idea, with `from`, `state`: proposed, kept,
-  dropped, unconfirmed, new), `today.json` (with `runs.main` and `runs.update`), `runs.jsonl`, `buys.jsonl`.
+  dropped, unconfirmed, new), `today.json` (with `runs.main` and `runs.update`, `verdicts`, `topics`),
+  `runs.jsonl`, `buys.jsonl`, `verdicts.jsonl`, `asks.json`.
 - **Settings** (in `news`): `buy_enabled`, `enabled`, `buy_at`, `main_at` (06:00 UK), `update_at` (08:30 New
   York), `timeout_min` (25), `update_timeout_min` (15), `model`, `update_model`, `max_ideas` (5 a run),
   `max_positions` (5), `atr_mult` (3), `atr_days` (14), `max_hold_days` (120), `max_days_after_event` (10),
-  `max_move_pct` (5), `buy_confidence` (high), `min_buy_gbp` (100), `kronos_minutes` (10).
+  `max_move_pct` (5), `buy_confidence` (high, or a list), `min_buy_gbp` (100), `kronos_minutes` (10).
 - **Honest limits:** an idea is a model's reading of public web pages. It is untested, pages can be
   wrong or try to mislead, confidence is the model's own word, and nothing in `research/` has beaten
   holding an S&P 500 tracker.
 - **By hand:** `python3 trader-broker/news_ideas.py show|resolve|selftest`; `run --kind main|update --force`
   asks Claude again at any hour (a forced update after `buy_at` is never bought on).
-- **Tests:** `tests/test_news_ideas.py`, `tests/test_news_two_runs.py` (`tests/test_news.py` is the older
-  trader-news tool).
+- **Tests:** `tests/test_news_ideas.py`, `tests/test_news_two_runs.py`, `tests/test_news_verdicts.py` (search
+  proof, the confidence setting, verdicts, the approval step, the guard's sale, topics). `tests/test_news.py`
+  is the older trader-news tool. A fake Claude answer in a test must carry a search record
+  (`test_news_ideas.searched`).
 
 ## The S&P 500 in reports (from 16 Nov 2026)
 
@@ -400,6 +440,8 @@ The guard's protections:
 | `news` | weekdays 06:00 UK | `run-news.sh run --kind main`: the main Claude review, the checks, the log; its ideas go into the 07:30 briefing (log: `trader/logs/news.log`). Never an order |
 | `news-update` | weekdays 12:30 and 13:30 UK | `run-news.sh run --kind update`: the update at 08:30 New York (the start before 08:30 New York does nothing). One short message only if something changed. Never an order |
 
+The guard (`t212-guard`) also sells, from 09:35 New York, any holding whose sale the owner approved on the phone.
+
 - **Keys:** the scripts read only the `export T212_API_KEY/T212_API_SECRET/T212_ENV/TELEGRAM_BOT_TOKEN`
   lines from `~/.zshrc`, and use `/usr/bin/python3`.
 - **The python.org 3.11** at `/usr/local/bin/python3` lacks certificates: HTTPS fails from it. Use
@@ -432,7 +474,8 @@ The guard's protections:
 - **`autopilot`:** `auto_buy: true`, `evidence_mode: true`.
 - **`drift`:** `scan_enabled: true` since 10 Nov; `buy_enabled: true` since 12 Nov (the owner's decision).
   No drift buy yet: every shortlist so far was empty.
-- **`news`:** `buy_enabled: false` (shadow). Money: 10% cash always, drift up to 50% of the investable
+- **`news`:** `buy_enabled: true` and `buy_confidence: ["medium", "high"]` since 17 Nov 2026 (the owner's
+  decision; backup `config.json.bak-*` from that day). Money: 10% cash always, drift up to 50% of the investable
   cash, news uses what drift and the other holdings leave.
 
 ## Evidence mode: the forward test (from 9 Nov 2026, no end date)
@@ -476,7 +519,8 @@ The guard's protections:
   (exits only: stops, sells) act unattended.
 - **Never switch to live,** never run `go_live.py`, and never set `live_enabled`, `paper: false`, or
   `LIVE_PLACEMENT_ENABLED`. Going live is the user's decision.
-- **Never turn on a buying switch:** `news.buy_enabled` and `drift.buy_enabled` are the owner's to set.
+- **Never turn on a buying switch:** `news.buy_enabled` and `drift.buy_enabled` are the owner's to set
+  (change one only when the owner asks for that exact change in writing, as on 17 Nov for news).
 - **Never read, print, log or ask for** API keys, secrets or the Telegram token. Only variable names
   appear in `~/.zshrc` reads. Errors are scrubbed.
 - **Before editing `trader/config.json`,** back it up. Never turn on auto-buy or evidence mode on live.

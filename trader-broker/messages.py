@@ -948,15 +948,21 @@ def daily_review(r):
         mkt = "" if row.get("market_pct") is None else " (the S&amp;P 500 %s over the same days)" % pct(row["market_pct"], 1)
         net = "safety net at %s" % usd(row["stop"]) if row.get("stop") else "<b>no safety net</b>"
         sell = ", sell by %s" % esc(short_day(row["sell_date"])) if row.get("sell_date") else ""
-        items.append("%s (%s): %s%s; %s%s" % (company(row["symbol"]), _KIND.get(row.get("strategy"), "a label I don't know"),
-                                             gain, mkt, net, sell))
+        v = row.get("verdict") or {}
+        read = ""
+        if v.get("verdict") in _VERDICT:
+            read = ". Today's read: %s%s" % (_VERDICT[v["verdict"]], "" if not v.get("why") else " (%s)" % esc(_short(v["why"], 140)))
+            if row.get("strategy") == "drift":
+                read += ". Noted only: this one is sold by its date rule"
+        items.append("%s (%s): %s%s; %s%s%s" % (company(row["symbol"]), _KIND.get(row.get("strategy"), "a label I don't know"),
+                                               gain, mkt, net, sell, read))
     if not r.get("rows"):
         items.append("Nothing is held")
     if r.get("due"):
         items.append("\U0001f4c5 Sell date reached: %s will be sold just before the US market next closes" % ", ".join(
             company(x) for x in r["due"]))
     if r.get("approved"):
-        items.append("\U0001f4c5 You approved selling %s: sold just before the US market next closes" % ", ".join(
+        items.append("\U0001f4c5 You approved selling %s: sold soon after the US market next opens" % ", ".join(
             company(x) for x in r["approved"]))
     if r.get("overdue"):
         items.append("⚠️ Past its sell date and still held: %s. Please check the Trading 212 app" % ", ".join(
@@ -966,13 +972,79 @@ def daily_review(r):
                                                  "I've asked you about selling it" if w.get("asked")
                                                  else "I'd ask you about selling it (not switched on yet, so no question was sent)"))
     out += bullets(items)
-    out.append("<i>Report only: this review sells nothing and changes nothing.</i>")
+    out.append("<i>This review sells nothing and changes nothing. A sale needs its sell date or your Approve.</i>")
     return join(out)
 
 
 # ---------------------------------------------------------------- news ideas (bought for a reason, held until a rule)
 
 _STARS = {"high": "high confidence", "medium": "medium confidence", "low": "low confidence"}
+_VERDICT = {"keep": "keep", "watch": "keep, but watch it closely", "sell": "sell"}
+_VERDICT_DOT = {"keep": "✅", "watch": "\U0001f440", "sell": "\U0001f534"}
+
+
+def _short(text, n):
+    text = str(text or "").strip()
+    return text if len(text) <= n else text[:n - 3].rstrip() + "..."
+
+
+def _levels(want):
+    """The confidence levels that may be bought, as a tuple: "high" or ["medium", "high"]."""
+    if isinstance(want, str):
+        return (want,)
+    return tuple(want or ("high",))
+
+
+def level_words(want):
+    got = [x for x in ("low", "medium", "high") if x in _levels(want)]
+    return " and ".join(got) or "high"
+
+
+def _source(src):
+    if not src:
+        return ""
+    return " Source: %s (%s)." % (esc(_short(src.get("title") or "?", 80)), esc(short_day(src.get("date") or "?")))
+
+
+def verdict_line(v):
+    """One holding's verdict from a news review, in plain words."""
+    kind = v.get("verdict")
+    if kind not in _VERDICT:
+        return "%s: no clear view today." % company(v.get("symbol"))
+    why = _short(v.get("why") or "no reason given", 200)
+    conf = _STARS.get(v.get("confidence"))
+    out = "%s %s: <b>%s</b>%s. %s%s" % (_VERDICT_DOT[kind], company(v.get("symbol")), _VERDICT[kind],
+                                         "" if not conf else " (%s)" % conf,
+                                         esc(why if why.endswith((".", "!", "?")) else why + "."),
+                                         _source((v.get("sources") or [None])[0]))
+    if v.get("strategy") == "drift":
+        out += " Noted only: this one is sold by its date rule, whatever I think."
+    elif kind == "sell":
+        out += " I've asked you whether to sell it." if v.get("asked") else " I'll ask you whether to sell it."
+    return out
+
+
+def holding_verdicts(rows):
+    """The "my read on what I hold" block (a list of lines), or [] when nothing is held."""
+    rows = [v for v in rows or [] if v.get("symbol")]
+    if not rows:
+        return []
+    return ["\U0001f9d0 <b>My read on what I'm holding</b>"] + bullets(verdict_line(v) for v in rows)
+
+
+def hot_topics(topics):
+    """The "What the market is talking about" block (a list of lines), or [] when there are none."""
+    rows = [t for t in topics or [] if t.get("text")]
+    if not rows:
+        return []
+    out = []
+    for t in rows[:5]:
+        text = str(t["text"]).strip()
+        src = t.get("source") or {}
+        out.append("%s%s" % (esc(text if text.endswith((".", "!", "?")) else text + "."),
+                             "" if not src else " (%s, %s)" % (esc(_short(src.get("title") or "?", 80)),
+                                                             esc(short_day(src.get("date") or "?")))))
+    return ["\U0001f5e3️ <b>What the market is talking about</b>"] + bullets(out)
 
 
 def _idea_line(r, buying, want="high"):
@@ -980,7 +1052,7 @@ def _idea_line(r, buying, want="high"):
     if len(what) > 220:
         what = what[:217].rstrip() + "..."
     what = esc(what)
-    mine = buying and r.get("confidence") == want
+    mine = buying and r.get("confidence") in _levels(want)
     size = ""
     if r.get("cost_gbp"):
         size = " %s about %s, most it could lose about %s." % (
@@ -1008,22 +1080,27 @@ def news_ideas(doc, tally=None):
     """The main review's ideas as a message of their own: only used when the morning briefing had already
     gone. Practice only unless buying is on."""
     ideas, buying = [r for r in doc.get("ideas") or [] if r.get("from", "main") == "main"], bool(doc.get("buying"))
+    want = doc.get("buy_levels") or "high"
     head = "\U0001f4f0 <b>Today's news ideas</b>"
     rejected = [r for r in doc.get("rejected") or [] if r.get("from", "main") == "main"]
     if not ideas:
         out = [head, "No idea passed the checks today%s." % (
             "" if not rejected else " (%d looked at and turned down)" % len(rejected))]
     else:
-        out = [head] + bullets(_idea_line(r, buying) for r in ideas)
+        out = [head] + bullets(_idea_line(r, buying, want) for r in ideas)
         if rejected:
             n = len(rejected)
             out.append("%d other idea%s didn't pass the checks." % (n, "" if n == 1 else "s"))
-    out.append("Buying is on: I look again about an hour before the US market opens, and buy only the high-confidence "
-               "ideas that still hold, each with a safety net." if buying
+    out.append("Buying is on: I look again about an hour before the US market opens, and buy only the %s-confidence "
+               "ideas that still hold, each with a safety net." % esc(level_words(want)) if buying
                else "Practice only: nothing is bought. I just keep score.")
     if _score(tally):
         out.append(_score(tally))
     out.append("<i>Ideas from news reading, not advice. Untested.</i>")
+    for block in (hot_topics(doc.get("topics")), holding_verdicts(
+            sorted((doc.get("verdicts") or {}).values(), key=lambda v: str(v.get("symbol"))))):
+        if block:
+            out += [""] + block
     return join(out)
 
 
@@ -1053,6 +1130,11 @@ def news_briefing(d):
         out.append(_score(d["tally"]))
     if ideas:
         out.append("<i>Ideas from news reading, not advice. Untested. I check them again before the US market opens.</i>")
+    topics, read = hot_topics(d.get("topics")), holding_verdicts(d.get("verdicts"))
+    if topics:
+        out = topics + [""] + out
+    if read:
+        out += [""] + read
     return out
 
 
@@ -1065,13 +1147,16 @@ def news_update(doc, changes):
         why = str(r.get("update_why") or "").strip() or "no reason given"
         items.append("Dropped %s: %s" % (company(r["symbol"]), esc(why if why.endswith((".", "!", "?")) else why + ".")))
     for r in changes.get("new") or []:
-        items.append("New: " + _idea_line(r, buying))
+        items.append("New: " + _idea_line(r, buying, doc.get("buy_levels") or "high"))
     out += bullets(items)
     kept = [r for r in doc.get("ideas") or [] if r.get("state") == "kept"]
     if kept:
         out.append("Still standing from this morning: %s." % ", ".join(company(r["symbol"]) for r in kept))
-    out.append("Buying is on: only the high-confidence ideas still standing are bought, soon after the open."
-               if buying else "Practice only: nothing is bought.")
+    out.append("Buying is on: only the %s-confidence ideas still standing are bought, soon after the open."
+               % esc(level_words(doc.get("buy_levels") or "high")) if buying else "Practice only: nothing is bought.")
+    changed = [v for v in changes.get("verdicts") or [] if v.get("verdict") in ("watch", "sell")]
+    if changed:
+        out += [""] + holding_verdicts(changed)
     return join(out)
 
 
@@ -1111,6 +1196,25 @@ def friday_news(by, want="high", buying=False):
     return out
 
 
+def friday_verdicts(t):
+    """The Friday lines about the daily verdicts on what is held: did acting on a "sell" beat the rule?"""
+    out = []
+    names = {"drift": "earnings trades", "news": "news ideas"}
+    for name in sorted(t or {}):
+        g = t[name]
+        if not (g["keep"] + g["watch"] + g["sell"]):
+            continue
+        out.append("• My daily read on %s so far: %d keep, %d watch, %d sell" % (
+            names.get(name, esc(name)), g["keep"], g["watch"], g["sell"]))
+        if g["compared"]:
+            out.append("• Where I said sell and it was held anyway (%d finished): selling the next morning would have "
+                       "made %s; holding made %s. Too few to prove anything" % (
+                           g["compared"], signed_gbp(g["would_gbp"]), signed_gbp(g["rule_gbp"])))
+        elif g["sell"]:
+            out.append("• None of those sells has finished yet, so there is nothing to compare yet")
+    return out
+
+
 def news_bought(i):
     items = ["%s at about %s each" % (b(shares(i["qty"])), b(usd(i["price"]))),
              "Cost: %s (including the currency fee)" % b(gbp(i.get("cost_gbp"))),
@@ -1123,6 +1227,11 @@ def news_bought(i):
     return join(["\U0001f7e2 <b>Bought %s</b> on a news idea" % company(i["symbol"])] + bullets(items))
 
 
+def approved_sale_sent(sym):
+    return ("✅ <b>Selling %s</b>, as you approved. The sell order has gone in; the result will be in this "
+            "evening's report." % company(sym))
+
+
 def news_buy_failed():
     return "⚠️ The news buys hit a problem, so nothing more is bought on them today. Details are in the log."
 
@@ -1133,18 +1242,22 @@ def news_sell_ask(ask):
                  "The reason I bought it looks broken: %s" % esc(ask.get("why") or "?"),
                  "Source: %s (%s)" % (esc(src.get("title") or "?"), esc(short_day(src.get("date") or "?")))
                  if src else None,
-                 "Tap Approve to sell it at the next close. Tap Reject, or do nothing, to keep it. "
-                 "Its safety net stays either way."])
+                 "Tap Approve to sell it soon after the US market next opens (within minutes if it is open now). "
+                 "Tap Reject, or do nothing, to keep it: I'll ask again tomorrow if it still looks broken. "
+                 "Its safety net stays in place until it is sold."])
 
 
 def news_sell_end(text, outcome):
-    words = {"approved": "✅ <b>Approved by you.</b> It will be sold just before the US market next closes.",
-             "rejected": "❌ <b>Rejected by you.</b> Keeping it, with its safety net."}
+    words = {"approved": "✅ <b>Approved by you.</b> It will be sold soon after the US market next opens. "
+                         "Its safety net stays until then.",
+             "rejected": "❌ <b>Rejected by you.</b> Keeping it, with its safety net. I'll ask again tomorrow "
+                         "if it still looks broken."}
     return text + "\n\n" + words.get(outcome, esc(outcome))
 
 
-SELL_TAP = {"approved": "Approved: it will be sold at the next close.",
+SELL_TAP = {"approved": "Approved: it will be sold soon after the market next opens.",
             "rejected": "Rejected: keeping it.",
+            "expired": "That question is from an earlier day: nothing done. I ask again if it still looks broken.",
             "already": "Already answered: nothing more done.",
             "unknown": "Unknown request: nothing done."}
 
@@ -1155,6 +1268,7 @@ def news_sold(page):
     p = _num(res.get("pl_gbp"))
     dot = "\U0001f7e2" if p is not None and p > 0 else "\U0001f534"
     why = {"stop": "hit the safety net", "sold at the close": "its sell date came, or you approved the sale",
+           "sold because you approved it": "you approved the sale",
            "sold in the Trading 212 app": "sold in the Trading 212 app"}.get(str(res.get("why") or ""),
                                                                              esc(res.get("why") or "sold"))
     return join(["%s <b>Sold %s</b>: %s" % (dot, company(page.get("symbol")), why)] + bullets([

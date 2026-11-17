@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The "news" strategy: forward-looking ideas from a scheduled Claude Code run, checked by this pack's
 own rules. SHADOW unless "news": {"buy_enabled": true} in trader/config.json (only the owner sets it).
+Each run must show that it searched the web (no searches: the run fails and nothing is bought), gives
+every holding a verdict (keep, watch, sell: a news "sell" asks the owner, a drift one is only written
+down), and the main run adds a few "what the market is talking about" lines for the briefing.
 Demo only. Education and tooling, not financial advice: an idea is a model's reading of public news,
 it is untested, and nothing in this project's research has beaten holding an S&P 500 tracker.
 
@@ -53,11 +56,12 @@ DEFAULTS = {"enabled": True, "buy_enabled": False, "buy_at": "09:35", "max_ideas
             "update_at": "08:30",            # New York time: the shorter update before the US open
             "update_timeout_min": 15, "update_model": None,
             "max_move_pct": 5.0,             # at buy time: skip an idea that has moved more than this since proposed
-            "buy_confidence": "high",        # only ideas Claude marks with this confidence may be bought
+            "buy_confidence": "high",        # which confidence levels may be bought: "high", or ["medium", "high"]
             "max_days_after_event": 10}      # trading days from the event to the sell date, unless a reason is given
 LAST_BUY = "15:30"               # New York: no news buy after this
 KINDS = ("main", "update")
 LEVELS = ("high", "medium", "low")
+VERDICTS = ("keep", "watch", "sell")   # what a run says about each holding
 MAIN_FROM = "00:00"              # New York: the main run belongs to the day that has begun there
 STALE_AFTER = 20 * 60            # seconds past its time limit before a run marked "running" counts as dead
 TEXT_MAX = 700
@@ -166,9 +170,13 @@ def settings(cfg):
         raise NewsError("news.timeout_min and news.update_timeout_min must be 1 to 60")
     if not 0.5 <= float(s["max_move_pct"]) <= 50:
         raise NewsError("news.max_move_pct must be 0.5 to 50")
-    if str(s["buy_confidence"]).lower() not in LEVELS:
-        raise NewsError("news.buy_confidence must be high, medium or low")
-    s["buy_confidence"] = str(s["buy_confidence"]).lower()
+    want = s["buy_confidence"]
+    want = [x for x in re.split(r"[,\s]+", want.lower()) if x and x != "and"] if isinstance(want, str) else want
+    if (not isinstance(want, (list, tuple)) or not want
+            or any(not isinstance(x, str) or x.lower() not in LEVELS for x in want)):
+        raise NewsError("news.buy_confidence must be high, medium or low, or a list of them like [\"medium\", \"high\"]")
+    s["buy_levels"] = tuple(x for x in LEVELS if x in {str(y).lower() for y in want})
+    s["buy_confidence"] = level_words(s["buy_levels"])       # in words, for logs and messages
     if not 1 <= s["max_days_after_event"] <= 250:
         raise NewsError("news.max_days_after_event must be 1 to 250")
     if not 1 <= s["max_ideas"] <= 20 or not 1 <= s["max_positions"] <= 20:
@@ -178,6 +186,12 @@ def settings(cfg):
     if not re.match(r"^\d{1,2}:\d{2}$", str(s["buy_at"])):
         raise NewsError("news.buy_at must be a New York time like 09:35")
     return s
+
+
+def level_words(levels):
+    """("high", "medium") as words: "medium and high". One level is just its name."""
+    got = [x for x in reversed(LEVELS) if x in (levels or ())]
+    return " and ".join(got) if got else "high"
 
 
 def require_demo(cfg):
@@ -346,7 +360,7 @@ def todays(rows, day):
 def in_book(row, s):
     """Would this passed idea be bought with buying on? Only those count toward the pretend book and the
     caps: the right confidence, and not dropped by the update."""
-    return (row.get("verdict") == "passed" and row.get("confidence") == s["buy_confidence"]
+    return (row.get("verdict") == "passed" and row.get("confidence") in s["buy_levels"]
             and row.get("state") not in ("dropped", "unconfirmed"))
 
 
@@ -361,7 +375,7 @@ def buyable(doc, s):
     if up.get("late"):
         return [], "the update finished after the buy time, so nothing is bought on news today"
     return [r for r in doc.get("ideas") or [] if r.get("state") in ("kept", "new")
-            and r.get("confidence") == s["buy_confidence"]], None
+            and r.get("confidence") in s["buy_levels"]], None
 
 
 # ---------------------------------------------------------------- the question for Claude
@@ -376,7 +390,7 @@ def names_for(sd, allowed):
     return {s: names.get(s, "") for s in sorted(allowed)}
 
 
-def prompt(day, names, s, held=()):
+def prompt(day, names, s, held=(), topics=True):
     """The whole question. The answer must be one JSON object and nothing else."""
     lines = [
         "Today is %s. You are a research assistant for a PRACTICE (demo) share account. Nothing you write places "
@@ -392,7 +406,10 @@ def prompt(day, names, s, held=()):
         "- Only companies from the list, by their ticker. Fewer good ideas beat more weak ones; none is a fine answer.",
         "- The event must be in the future (on or after today) and have a date. If the date is only a window, "
         "give the first day of the window and say so in \"event\".",
-        "- Every claim needs a source you actually opened: its title, its URL and the date it was published.",
+        "- Every claim needs a source: its title, its URL and the date it was published. A source counts only if "
+        "you OPENED that page with web fetch in this run, and you must give the exact URL you opened. The program "
+        "reads the record of your searches and of the pages you opened: an idea with no opened source is turned "
+        "down, and an answer written without any web search is thrown away.",
         "- \"wrong_if\" is what would prove the idea wrong (the event is cancelled or delayed, the figure is "
         "withdrawn, and so on).",
         "- \"sell_rule\" says in words when to sell; \"sell_date\" is the last day to hold, a weekday after today "
@@ -412,12 +429,23 @@ def prompt(day, names, s, held=()):
         "",
     ]
     if held:
-        lines += ["REVIEW. These are held because of an earlier idea. For each, say whether its reason is now broken "
-                  "(true only with a dated source):"]
+        lines += ["HOLDINGS. These shares are held now. For EACH one give a verdict in \"verdicts\": \"keep\" (the "
+                  "reason for holding still stands), \"watch\" (something new makes it less sure) or \"sell\" (the "
+                  "reason is broken, or dated news makes holding it clearly worse). Give a one-line reason in "
+                  "\"why\", a \"confidence\" (low, medium or high) and at least one dated source you opened in this "
+                  "run. Say \"sell\" only with such a source. You decide nothing: the owner is asked, or the verdict "
+                  "is only written down."]
         for h in held:
-            lines.append("- %s: reason: %s | event: %s on %s | wrong if: %s" % (
-                h.get("symbol"), h.get("reason"), h.get("event"), h.get("event_date"), h.get("wrong_if")))
+            kind = ("bought by a fixed earnings rule (it beat its forecast) and sold on a fixed date"
+                    if h.get("strategy") == "drift" else "bought on a news idea")
+            lines.append("- %s (%s): reason: %s | event: %s on %s | wrong if: %s | bought %s | to be sold by %s" % (
+                h.get("symbol"), kind, h.get("reason"), h.get("event") or "none", h.get("event_date") or "no date",
+                h.get("wrong_if") or "not written down", h.get("buy_date") or "?", h.get("sell_date") or "no date"))
         lines.append("")
+    if topics:
+        lines += ["HOT TOPICS. Also give 3 to 5 things the US stock market is talking about today, in \"topics\", "
+                  "whether or not they led to an idea. One plain sentence each that someone who is not an investor "
+                  "can read on a phone (no jargon, under 160 characters), each with one dated source you opened.", ""]
     lines += [
         "ANSWER with exactly one JSON object and no other text, in this shape:",
         json.dumps({"ideas": [{"symbol": "TICK", "company": "Name", "summary": "one short plain sentence",
@@ -428,8 +456,11 @@ def prompt(day, names, s, held=()):
                                "confidence": "low | medium | high", "confidence_why": "one line",
                                "moved_pct": 0.0, "moved_note": "one line",
                                "sources": [{"title": "...", "url": "https://...", "date": "YYYY-MM-DD"}]}],
-                    "reviews": [{"symbol": "TICK", "broken": False, "why": "one sentence",
-                                 "sources": [{"title": "...", "url": "https://...", "date": "YYYY-MM-DD"}]}],
+                    "verdicts": [{"symbol": "TICK", "verdict": "keep | watch | sell", "why": "one line",
+                                  "confidence": "low | medium | high",
+                                  "sources": [{"title": "...", "url": "https://...", "date": "YYYY-MM-DD"}]}],
+                    "topics": [{"text": "one plain sentence",
+                                "source": {"title": "...", "url": "https://...", "date": "YYYY-MM-DD"}}],
                     "notes": "anything the reader should know, one or two sentences"}),
         "",
         "THE LIST (ticker: company):",
@@ -441,15 +472,16 @@ def prompt(day, names, s, held=()):
 def update_prompt(day, names, s, held=(), morning=(), since="06:00 UK time"):
     """The shorter question before the US open: keep or drop each morning idea, add any new one, and
     review what is held. The answer must be one JSON object and nothing else."""
-    base = prompt(day, names, s, held).split("\n")
+    base = prompt(day, names, s, held, topics=False).split("\n")
     cut = next(i for i, line in enumerate(base) if line.startswith("ANSWER with exactly one JSON object"))
     shape = json.loads(base[cut + 1])
     shape = {"checks": [{"symbol": "TICK", "keep": True, "why": "one line"}], "ideas": shape["ideas"],
-             "reviews": shape["reviews"], "notes": shape["notes"]}
+             "verdicts": shape["verdicts"], "notes": shape["notes"]}
     lines = [
         "UPDATE BEFORE THE US OPEN. This is a short second look, about an hour before the US market opens. Be "
-        "quick: a few searches, not a long study. Look only for what is NEW since %s today: overnight and "
-        "pre-market news, and company results released before the open." % since,
+        "quick: a few searches, not a long study (but you MUST search: an answer with no web search is thrown "
+        "away). Look only for what is NEW since %s today: overnight and pre-market news, and company results "
+        "released before the open." % since,
         "",
     ]
     if morning:
@@ -469,8 +501,119 @@ def update_prompt(day, names, s, held=(), morning=(), since="06:00 UK time"):
 
 
 class Answer(str):
-    """Claude's answer text, with what the run used in .meta (time, turns, tokens, what it would have cost)."""
+    """Claude's answer text, with what the run used in .meta (time, turns, tokens, what it would have cost)
+    and, in .web, the record of its web searches and the pages it opened (see read_stream)."""
     meta = None
+    web = None
+
+
+URL_RE = re.compile(r"https?://[^\s\"'<>\\\])}]+")
+
+
+def url_keys(url):
+    """A web address in a form that can be compared: no http(s), no www., no #part, no trailing slash.
+    Two keys: with and without the ?query, so a tracking tag does not hide a page that was opened."""
+    u = re.sub(r"^https?://", "", str(url or "").strip(), flags=re.I).split("#")[0].rstrip(".,;)")
+    host, _, rest = u.partition("/")
+    host = host.lower()[4:] if host.lower().startswith("www.") else host.lower()
+    full = (host + "/" + rest).rstrip("/")
+    return {full, full.split("?")[0].rstrip("/")} if host else set()
+
+
+def read_stream(text):
+    """(the final result object or None, the web record or None) from a `claude -p --output-format stream-json`
+    run. The web record comes from the tool calls themselves:
+      {"searches": n, "fetches": n, "queries": [...], "opened": [url...], "failed": [url...], "seen": [url...]}
+    "opened" are pages web fetch really got; "seen" are addresses that only appeared in search results.
+    One plain JSON object (the older --output-format json) gives (that object, None): no record at all."""
+    text = str(text or "")
+    try:
+        whole = json.loads(text)
+        if isinstance(whole, dict):
+            return whole, None
+    except ValueError:
+        pass
+    result, calls, got = None, {}, False
+    web = {"searches": 0, "fetches": 0, "queries": [], "opened": [], "failed": [], "seen": []}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        kind = ev.get("type")
+        if kind == "result":
+            result, got = ev, True
+            continue
+        content = (ev.get("message") or {}).get("content") if isinstance(ev.get("message"), dict) else None
+        if kind not in ("assistant", "user") or not isinstance(content, list):
+            continue
+        got = True
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if kind == "assistant" and c.get("type") == "tool_use":
+                inp = c.get("input") if isinstance(c.get("input"), dict) else {}
+                calls[c.get("id")] = (c.get("name"), inp)
+                if c.get("name") == "WebSearch":
+                    web["searches"] += 1
+                    web["queries"].append(_text(inp.get("query"))[:200])
+                elif c.get("name") == "WebFetch":
+                    web["fetches"] += 1
+            elif kind == "user" and c.get("type") == "tool_result":
+                name, inp = calls.get(c.get("tool_use_id"), (None, {}))
+                extra = ev.get("tool_use_result") if isinstance(ev.get("tool_use_result"), dict) else {}
+                bad = c.get("is_error") is True
+                if name == "WebFetch":
+                    code = _num(extra.get("code"))
+                    ok = not bad and (code is None or 200 <= code < 300)
+                    for u in (inp.get("url"), extra.get("url")):
+                        if u and u not in web["opened" if ok else "failed"]:
+                            web["opened" if ok else "failed"].append(str(u))
+                elif name == "WebSearch" and not bad:
+                    body = c.get("content")
+                    for u in URL_RE.findall(body if isinstance(body, str) else json.dumps(body)):
+                        if u not in web["seen"] and len(web["seen"]) < 3000:
+                            web["seen"].append(u)
+    return result, (web if got else None)
+
+
+def searched(web):
+    """True when the run's record shows at least one web search or one page opened."""
+    return bool(web) and bool((web.get("searches") or 0) + (web.get("fetches") or 0))
+
+
+def check_sources(src, web):
+    """Each source marked with whether the run really opened it ("opened") or only saw its address in
+    search results ("seen"). A source that is neither was not looked at in this run and is dropped.
+    With no record (web None) the sources come back unmarked."""
+    if web is None:
+        return list(src)
+    opened, seen = set(), set()
+    for u in web.get("opened") or []:
+        opened |= url_keys(u)
+    for u in web.get("seen") or []:
+        seen |= url_keys(u)
+    out = []
+    for x in src:
+        k = url_keys(x.get("url"))
+        if k & opened:
+            out.append(dict(x, opened=True))
+        elif k & seen:
+            out.append(dict(x, opened=False))
+    return out
+
+
+def web_note(web):
+    """What goes in the run log about the searches: counts and the first pages opened."""
+    if not web:
+        return None
+    return {"searches": web.get("searches"), "fetches": web.get("fetches"), "opened": (web.get("opened") or [])[:40],
+            "failed": len(web.get("failed") or []), "queries": (web.get("queries") or [])[:20]}
 
 
 def _is_limit(text):
@@ -498,8 +641,9 @@ def run_meta(doc):
 
 def claude_command(s):
     exe = os.environ.get("CLAUDE_BIN") or os.path.expanduser("~/.local/bin/claude")
-    cmd = [exe, "-p", "--output-format", "json", "--tools", CLAUDE_TOOLS, "--allowedTools", CLAUDE_TOOLS,
-           "--strict-mcp-config", "--no-session-persistence"]
+    # stream-json (it needs --verbose) lists every tool call, so the searches and opened pages can be checked
+    cmd = [exe, "-p", "--output-format", "stream-json", "--verbose", "--tools", CLAUDE_TOOLS,
+           "--allowedTools", CLAUDE_TOOLS, "--strict-mcp-config", "--no-session-persistence"]
     if s.get("model"):
         cmd += ["--model", str(s["model"])]
     return cmd
@@ -533,10 +677,7 @@ def run_claude(text, s):
             os.rmdir(work)
         except OSError:
             pass
-    try:
-        doc = json.loads(p.stdout)
-    except ValueError:
-        doc = None
+    doc, web = read_stream(p.stdout)
     if p.returncode != 0 or not isinstance(doc, dict) or doc.get("is_error") or not isinstance(doc.get("result"), str):
         said = str((doc or {}).get("result") or (doc or {}).get("subtype") or "") if isinstance(doc, dict) else ""
         detail = (said or p.stderr or p.stdout or "").strip()
@@ -550,6 +691,9 @@ def run_claude(text, s):
         raise e
     out = Answer(doc["result"])
     out.meta = run_meta(doc)
+    out.web = web
+    if web is not None:                       # counted from the tool calls themselves, not the envelope's counters
+        out.meta.update(web_searches=web["searches"], web_fetches=web["fetches"], pages_opened=len(web["opened"]))
     return out
 
 
@@ -559,19 +703,29 @@ def parse(text):
     m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", t, re.S)
     if m:
         t = m.group(1)
-    else:
-        a, b = t.find("{"), t.rfind("}")
-        if a < 0 or b <= a:
-            raise NewsError("the answer has no JSON object in it")
-        t = t[a:b + 1]
-    try:
-        doc = json.loads(t)
-    except ValueError as e:
-        raise NewsError("the answer's JSON could not be read (%s)" % e)
+    if t.find("{") < 0:
+        raise NewsError("the answer has no JSON object in it")
+    doc, first_err, dec = None, None, json.JSONDecoder()
+    for i, ch in enumerate(t):                     # the first object with "ideas", whatever text comes after it
+        if ch != "{":
+            continue
+        try:
+            got, _end = dec.raw_decode(t, i)
+        except ValueError as e:
+            first_err = first_err or e
+            continue
+        if isinstance(got, dict) and "ideas" in got:
+            doc = got
+            break
+        doc = doc if doc is not None else got
+    if doc is None:
+        raise NewsError("the answer's JSON could not be read (%s)" % first_err)
     if not isinstance(doc, dict) or not isinstance(doc.get("ideas"), list):
         raise NewsError("the answer has no \"ideas\" list")
     if not isinstance(doc.get("reviews", []), list):
         raise NewsError("the answer's \"reviews\" is not a list")
+    if not isinstance(doc.get("verdicts", []), list):
+        raise NewsError("the answer's \"verdicts\" is not a list")
     if not isinstance(doc.get("checks", []), list):
         raise NewsError("the answer's \"checks\" is not a list")
     return doc
@@ -596,8 +750,9 @@ def clean_sources(raw, today):
     return out
 
 
-def validate(raw, today, s, allowed, blocked):
-    """(idea, None) with tidy fields, or (None, why not). `allowed` and `blocked` are drift.key() sets."""
+def validate(raw, today, s, allowed, blocked, web=None):
+    """(idea, None) with tidy fields, or (None, why not). `allowed` and `blocked` are drift.key() sets.
+    `web`: the run's record of searches and opened pages; with it, at least one source must have been opened."""
     D = _drift()
     if not isinstance(raw, dict):
         return None, "not an object"
@@ -636,6 +791,11 @@ def validate(raw, today, s, allowed, blocked):
     src = clean_sources(raw.get("sources"), today)
     if not src:
         return None, "no dated source"
+    named = len(src)
+    src = check_sources(src, web)
+    if web is not None and not any(x.get("opened") for x in src):
+        return None, "none of its %d source%s was opened in this run, so it is not used" % (named, "" if named == 1 else "s")
+    src.sort(key=lambda x: not x.get("opened", True))        # opened pages first
     after = trading_days_after(ev, sell)
     idea["long_hold_reason"] = _text(raw.get("long_hold_reason"))
     if after > s["max_days_after_event"] and len(idea["long_hold_reason"]) < 8:
@@ -901,14 +1061,15 @@ def friday_lines(sd, cfg):
     if not by:
         L.append("- no idea has a result yet")
     L.append("- all passed ideas: %d, total GBP %+.2f" % (t["ideas"], t["pl_gbp"]))
-    return L
+    return L + verdict_lines(verdict_tally(sd))
 
 
 def friday_phone(sd, cfg):
     """The news part of the Friday phone message, or None when the strategy is off."""
     if not settings(cfg)["enabled"]:
         return None
-    return _msgs(sd).friday_news(by_confidence(sd), settings(cfg)["buy_confidence"], active(cfg))
+    out = _msgs(sd).friday_news(by_confidence(sd), settings(cfg)["buy_confidence"], active(cfg))
+    return out + _msgs(sd).friday_verdicts(verdict_tally(sd))
 
 
 def briefing_data(sd, day):
@@ -924,7 +1085,9 @@ def briefing_data(sd, day):
         return {"state": m.get("status") or "none", "limit": bool(m.get("limit")), "why": m.get("why"),
                 "ideas": [r for r in doc.get("ideas") or [] if r.get("from", "main") == "main"],
                 "rejected": len([r for r in doc.get("rejected") or [] if r.get("from", "main") == "main"]),
-                "buying": active(cfg), "buy_confidence": s["buy_confidence"], "tally": tally(sd)}
+                "buying": active(cfg), "buy_confidence": list(s["buy_levels"]), "tally": tally(sd),
+                "topics": doc.get("topics") or [] if m.get("status") == "ok" else [],
+                "verdicts": verdict_list(doc) if m.get("status") == "ok" else []}
     except Exception:
         return None
 
@@ -995,6 +1158,237 @@ def held_news(sd, env="demo"):
             if p.get("strategy") == "news" and p.get("status") in ("open", "sell_asked")]
 
 
+def held_pages(sd, env="demo"):
+    """Every open holding a run gives a verdict on: the news and the drift pages of the holdings record."""
+    H = _hold()
+    return [p for p in H.live(H.load(sd), "trading212", env)
+            if p.get("strategy") in H.HOLD and p.get("status") in ("open", "sell_asked")]
+
+
+def verdicts_path(sd):
+    return os.path.join(_dir(sd), "verdicts.jsonl")
+
+
+def load_verdicts(sd):
+    return _read_lines(verdicts_path(sd))
+
+
+def read_verdicts(got):
+    """The answer's verdicts. An older answer's "reviews" (broken true or false) count as sell or keep."""
+    out = [v for v in got.get("verdicts") or [] if isinstance(v, dict)]
+    for r in got.get("reviews") or []:
+        if isinstance(r, dict):
+            out.append(dict(r, verdict="sell" if r.get("broken") is True else "keep"))
+    return out
+
+
+def take_verdicts(sd, got, today, kind, web=None, rate=None, env="demo"):
+    """Write down the run's verdict on every holding (trader/state/news/verdicts.jsonl). Returns
+    (rows, sells): one row per holding, and the "sell" verdicts on NEWS holdings as requests for make_asks.
+    A drift verdict is only ever written down. "sell" needs a reason and a dated source the run opened;
+    without them it counts as "watch". A holding the run did not mention gets the verdict "none"."""
+    pages = {p.get("symbol"): p for p in held_pages(sd, env)}
+    rows, sells, seen = [], [], set()
+
+    def row(page, verdict, why, conf, src, note=None, said=None):
+        return {"day": today.isoformat(), "kind": kind, "at": int(_now()), "page": page.get("id"),
+                "symbol": page.get("symbol"), "strategy": page.get("strategy"), "verdict": verdict, "why": why,
+                "confidence": conf, "sources": src[:3], "note": note, "said": said, "rate": rate,
+                "sell_date": (page.get("sell_rule") or {}).get("date")}
+
+    for v in read_verdicts(got):
+        sym = _text(v.get("symbol")).upper()
+        page = pages.get(sym)
+        if page is None or sym in seen:
+            continue
+        seen.add(sym)
+        said = _text(v.get("verdict")).lower()
+        src = check_sources(clean_sources(v.get("sources"), today), web)
+        why, conf = _text(v.get("why"))[:240], _text(v.get("confidence")).lower()
+        verdict, note = (said if said in VERDICTS else "unclear"), None
+        if verdict == "sell" and (len(why) < 8 or not any(x.get("opened", True) for x in src)):
+            verdict, note = "watch", ("it said sell without a reason and a dated source it had opened, so this counts "
+                                      "as watch and nothing is asked")
+        r = row(page, verdict, why, conf if conf in LEVELS else "unknown", src, note, said)
+        rows.append(r)
+        if verdict == "sell" and page.get("strategy") == "news":
+            sells.append({"symbol": sym, "broken": True, "why": why, "sources": src})
+    for sym, page in sorted(pages.items()):
+        if sym not in seen:
+            rows.append(row(page, "none", "the run did not mention it", "unknown", []))
+    if rows:
+        with open(verdicts_path(sd), "a", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r, sort_keys=True) + "\n")
+    return rows, sells
+
+
+def merge_verdicts(doc, rows, asked=()):
+    """Today's verdicts in today's document, one per holding: a later run replaces an earlier one, except
+    that "none" (not mentioned) never wipes out a real verdict."""
+    old = doc.get("verdicts") if isinstance(doc.get("verdicts"), dict) else {}
+    new = {}
+    for r in rows:
+        sym = r["symbol"]
+        if r["verdict"] == "none" and sym in old:
+            new[sym] = old[sym]
+            continue
+        new[sym] = {k: r.get(k) for k in ("symbol", "strategy", "verdict", "why", "confidence", "sources", "note",
+                                           "kind", "page", "sell_date")}
+        new[sym]["asked"] = bool((old.get(sym) or {}).get("asked"))
+    for sym in asked:
+        if sym in new:
+            new[sym]["asked"] = True
+    doc["verdicts"] = new
+    return new
+
+
+def verdict_list(doc):
+    v = doc.get("verdicts") if isinstance(doc.get("verdicts"), dict) else {}
+    order = {"sell": 0, "watch": 1, "keep": 2}
+    return sorted(v.values(), key=lambda r: (order.get(r.get("verdict"), 3), str(r.get("symbol"))))
+
+
+def todays_verdicts(sd, day):
+    """{symbol: verdict} from today's document, for the daily review. {} when there is none for `day`."""
+    doc = _read(today_path(sd), None)
+    if not isinstance(doc, dict) or doc.get("day") != str(day) or not isinstance(doc.get("verdicts"), dict):
+        return {}
+    return doc["verdicts"]
+
+
+def clean_topics(raw, today, web=None):
+    """Up to 5 "what the market is talking about" lines: a plain sentence and one dated source the run saw."""
+    out = []
+    for t in raw if isinstance(raw, list) else []:
+        if not isinstance(t, dict):
+            continue
+        text = _text(t.get("text"))[:220]
+        src = check_sources(clean_sources([t.get("source")] if isinstance(t.get("source"), dict)
+                                          else t.get("sources"), today), web)
+        if len(text) < 12 or not src:
+            continue
+        out.append({"text": text, "source": src[0]})
+        if len(out) == 5:
+            break
+    return out
+
+
+def resolve_verdicts(sd, today, s, bars_fn):
+    """For a holding that has been sold: would acting on the first "sell" verdict have done better than what
+    happened? "Acting" means selling at the open of the next trading day after the verdict. Filled in once, on
+    the verdict's row: "would" (that sale, pounds after fees) and "rule" (the real result from the broker).
+    Returns how many rows changed. Information only: nothing here ever sells."""
+    H, D = _hold(), _drift()
+    rows = load_verdicts(sd)
+    pages = {p.get("id"): p for p in H.load(sd).get("pages") or []}
+    first = {}
+    for r in rows:
+        if r.get("verdict") == "sell" and r.get("page") not in first:
+            first[r.get("page")] = r
+    k, n = float(s["fx_fee"]) + float(s["slippage"]), 0
+    for pid, r in first.items():
+        page = pages.get(pid) or {}
+        res = page.get("result") or {}
+        if r.get("would") or page.get("status") != "closed" or _num(res.get("pl_gbp")) is None:
+            continue
+        day, sold = _date(r.get("day")), _date(res.get("date"))
+        qty, paid, rate = _num(page.get("qty")), _num(page.get("buy_price")), _num(r.get("rate"))
+        if not (day and sold and qty and paid and rate):
+            continue
+        try:
+            nxt = D.add_trading_days(day, 1)
+            if nxt >= sold and page.get("sell_approved"):
+                r["would"] = {"same": True, "why": "it was sold because you approved it"}
+            elif nxt > sold:
+                r["would"] = {"same": True, "why": "it was already sold by then"}
+            elif nxt >= today:
+                continue
+            else:
+                o = bars_fn(page["symbol"], nxt - datetime.timedelta(days=3), today)[nxt][0]
+                r["would"] = {"day": nxt.isoformat(), "open": round(o, 4),
+                              "pl_gbp": round(qty * (o * (1 - k) - paid * (1 + k)) / rate, 2)}
+            r["rule"] = {"date": res.get("date"), "pl_gbp": _num(res.get("pl_gbp")), "why": res.get("why")}
+            n += 1
+        except Exception:
+            continue
+    if n:
+        tmp = verdicts_path(sd) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r, sort_keys=True) + "\n")
+        os.replace(tmp, verdicts_path(sd))
+    return n
+
+
+def verdict_tally(sd):
+    """By strategy: how many verdicts of each kind (one a holding a day, the day's last), and for finished
+    holdings with a "sell" verdict that was not acted on, the two results side by side."""
+    last = {}
+    for r in load_verdicts(sd):
+        if r.get("verdict") in VERDICTS or (r.get("page"), r.get("day")) not in last:
+            last[(r.get("page"), r.get("day"))] = r
+    out = {}
+    for r in last.values():
+        g = out.setdefault(r.get("strategy") or "?", {"keep": 0, "watch": 0, "sell": 0, "compared": 0,
+                                                       "would_gbp": 0.0, "rule_gbp": 0.0, "open_sells": 0})
+        if r.get("verdict") in VERDICTS:
+            g[r["verdict"]] += 1
+    seen = set()
+    for r in load_verdicts(sd):
+        if r.get("verdict") != "sell" or r.get("page") in seen:
+            continue
+        seen.add(r.get("page"))
+        g = out.get(r.get("strategy") or "?")
+        w = r.get("would")
+        if g is None:
+            continue
+        if not w:
+            g["open_sells"] += 1
+        elif not w.get("same"):
+            g["compared"] += 1
+            g["would_gbp"] = round(g["would_gbp"] + (_num(w.get("pl_gbp")) or 0.0), 2)
+            g["rule_gbp"] = round(g["rule_gbp"] + (_num((r.get("rule") or {}).get("pl_gbp")) or 0.0), 2)
+    return out
+
+
+def verdict_lines(t):
+    """The verdicts part of the Friday report file."""
+    if not t:
+        return []
+    L = ["", "## Verdicts on what is held (from the two news runs; a drift verdict is never acted on)"]
+    for name in sorted(t):
+        g = t[name]
+        L.append("- %s: %d keep, %d watch, %d sell (one a holding a day)" % (name, g["keep"], g["watch"], g["sell"]))
+        if g["compared"]:
+            L.append("  - %d finished holding%s with a sell verdict that was not acted on: selling at the next open "
+                     "would have made GBP %+.2f; what happened made GBP %+.2f (after fees; a few cases prove nothing)"
+                     % (g["compared"], "" if g["compared"] == 1 else "s", g["would_gbp"], g["rule_gbp"]))
+        if g["open_sells"]:
+            L.append("  - %d with a sell verdict not finished yet, so not compared yet" % g["open_sells"])
+    return L
+
+
+def expire_asks(sd, today, env="demo"):
+    """A "sell it?" request from an earlier day that got no answer: closed as "no_answer" and the page goes
+    back to "open" (kept, stop in place). Today's run asks again if it still says sell. Returns how many."""
+    H = _hold()
+    asks = load_asks(sd)
+    old = [a for a in asks["asks"] if a.get("status") == "pending" and str(a.get("day") or "") < today.isoformat()]
+    if not old:
+        return 0
+    doc = H.load(sd)
+    for a in old:
+        a["status"], a["closed"] = "no_answer", int(_now())
+        page = H.find(doc, a.get("page"))
+        if page is not None and page.get("status") == "sell_asked":
+            page["status"] = "open"
+            H.log(sd, "sell_not_answered", id=page["id"], symbol=page.get("symbol"), ask=a.get("id"))
+    H.save(sd, doc)
+    _write(asks_path(sd), asks)
+    return len(old)
+
+
 def load_asks(sd):
     doc = _read(asks_path(sd), {})
     return doc if isinstance(doc, dict) and isinstance(doc.get("asks"), list) else {"asks": []}
@@ -1017,6 +1411,9 @@ def make_asks(sd, reviews, today, env="demo"):
         why = _text(r.get("why"))
         if page is None or not src or len(why) < 8:
             continue
+        if any(a.get("page") == page["id"] and a.get("day") == today.isoformat()
+               and a.get("status") in ("pending", "rejected", "approved") for a in asks["asks"]):
+            continue                              # one request a holding a day: Reject means "ask again tomorrow"
         for a in asks["asks"]:
             if a.get("page") == page["id"] and a.get("status") == "pending":
                 a["status"] = "replaced"
@@ -1048,13 +1445,16 @@ def mark_sent(sd, ask_id, message_id=None):
 
 
 def answer(sd, ask_id, nonce, approve):
-    """Your tap. Returns (outcome, ask): "approved", "rejected", "already" or "unknown". Approve marks the
-    page "selling": the guard's close sells it at the next 15:50 New York. Nothing is sold here."""
+    """Your tap. Returns (outcome, ask): "approved", "rejected", "already", "expired" or "unknown". Approve
+    marks the page "selling": the guard sells it soon after the next US open (09:35 New York), or within minutes
+    when the market is open, with the 15:50 close as the backup. Nothing is sold here."""
     H = _hold()
     asks = load_asks(sd)
     ask = next((a for a in asks["asks"] if a.get("id") == ask_id), None)
     if ask is None or str(ask.get("nonce")) != str(nonce):
         return "unknown", None
+    if ask.get("status") == "no_answer":
+        return "expired", ask                     # from an earlier day: a newer question replaces it
     if ask.get("status") != "pending":
         return "already", ask
     doc = H.load(sd)
@@ -1222,8 +1622,9 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
     for x in T.allowed_tickers(ucfg) or []:
         if D.key(x) in allowed:
             sym_of[D.key(x)] = str(x).upper()
-    held = [{"symbol": p["symbol"], "reason": p.get("reason"), "event": p.get("event"),
-             "event_date": p.get("event_date"), "wrong_if": p.get("wrong_if")} for p in held_news(sd)]
+    held = [{"symbol": p["symbol"], "strategy": p.get("strategy"), "reason": p.get("reason"), "event": p.get("event"),
+             "event_date": p.get("event_date"), "wrong_if": p.get("wrong_if"), "buy_date": p.get("buy_date"),
+             "sell_date": (p.get("sell_rule") or {}).get("date")} for p in held_pages(sd)]
     rows = load_ideas(sd)
     # a re-run of this kind replaces its own rows of today; the other run's rows stay
     rows = [r for r in rows if not (r.get("day") == doc["day"] and r.get("from", "main") == kind)]
@@ -1239,6 +1640,15 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
         question = prompt(today, names, s, held) if kind == "main" else \
             update_prompt(today, names, s, held, morning, "%s UK time" % s["main_at"])
         answer_text = (claude or run_claude)(question, ks)
+        try:                                      # kept, so a failed answer can be looked at later
+            with open(os.path.join(_dir(sd), "answer-%s-%s.txt" % (doc["day"], kind)), "w", encoding="utf-8") as fh:
+                fh.write(str(answer_text))
+        except OSError:
+            pass
+        web = getattr(answer_text, "web", None)
+        if not searched(web):                     # no proof it looked anything up: its answer is never used
+            raise NewsError("the Claude run made no web search and opened no page (or left no record of any), so "
+                            "its answer was thrown away")
         got = parse(answer_text)
     except Exception as e:
         return _fail(sd, doc, kind, e, client, say, push, M, s)
@@ -1275,7 +1685,7 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
                 r.update(state="dropped", update_why=_text(c.get("why"))[:240] or "dropped without a reason")
             if r["state"] != "kept":
                 changes["dropped"].append(r)
-    book_n = len(held)
+    book_n = len([h for h in held if h.get("strategy") == "news"])
     if acct is not None:
         # The pretend book: ideas that would be held count toward the room, the risk cap and max_positions,
         # so the caps bite as they would for real. Only ideas that would actually be bought count (the
@@ -1292,7 +1702,7 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
     seen = {r["symbol"] for r in todays(rows, doc["day"]) if r.get("verdict") == "passed"}
     passed_n = 0
     for raw in got["ideas"]:
-        idea, why = validate(raw, today, s, allowed, blocked)
+        idea, why = validate(raw, today, s, allowed, blocked, web)
         sym = (idea or {}).get("symbol") or _text((raw or {}).get("symbol") if isinstance(raw, dict) else "").upper() or "?"
         row = dict(idea or {"symbol": sym}, id="%s-%s" % (doc["day"], sym), day=doc["day"], list_from=src,
                    logged_at=int(_now()), shadow=not s["buy_enabled"], state="proposed" if kind == "main" else "new")
@@ -1328,14 +1738,22 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
         if kind == "update" and row["verdict"] == "passed":
             changes["new"].append(row)
     save_ideas(sd, rows)
-    asks = []
+    asks, vrows = [], []
     try:
-        asks = make_asks(sd, got.get("reviews") or [], today)
+        expire_asks(sd, today)                    # yesterday's unanswered request: kept, and asked again if still "sell"
+        vrows, sells = take_verdicts(sd, got, today, kind, web, rate)
+        asks = make_asks(sd, sells, today)
     except Exception as e:
-        say("news: the review of what is held could not be saved (%s)" % str(e)[:120])
+        say("news: the verdicts on what is held could not be saved (%s)" % str(e)[:120])
+    if kind == "main":
+        try:
+            say("news: %d verdict comparisons filled in" % resolve_verdicts(sd, today, s, bars_fn))
+        except Exception as e:
+            say("news: verdict comparisons not filled in (%s)" % str(e)[:120])
     mine = todays(rows, doc["day"])
     done = int(_now())
-    entry = {"status": "ok", "at": done, "started": doc["runs"][kind].get("started"), "usage": meta}
+    entry = {"status": "ok", "at": done, "started": doc["runs"][kind].get("started"), "usage": meta,
+             "web": web_note(web)}
     if kind == "update":
         h, m = _hm(s["buy_at"])
         fin = _ny(datetime.datetime.utcfromtimestamp(done))
@@ -1345,12 +1763,18 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
                rejected=[r for r in mine if r["verdict"] != "passed"], buying=s["buy_enabled"],
                generated_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), asks=sorted(set((doc.get("asks") or []) + [a["id"] for a in asks])))
     doc["notes" if kind == "main" else "update_notes"] = _text(got.get("notes"))
+    doc["buy_levels"] = list(s["buy_levels"])
+    old_verdicts = dict(doc.get("verdicts") or {}) if isinstance(doc.get("verdicts"), dict) else {}
+    merge_verdicts(doc, vrows, asked=[a["symbol"] for a in asks])
+    if kind == "main":
+        doc["topics"] = clean_topics(got.get("topics"), today, web)
     doc.pop("error", None)
     _write(today_path(sd), doc)
     got_n = [r for r in mine if r.get("from", "main") == kind]
     log_run(sd, day=doc["day"], kind=kind, status="ok", ideas=len([r for r in got_n if r["verdict"] == "passed"]),
             rejected=len([r for r in got_n if r["verdict"] != "passed"]), asks=len(asks),
-            dropped=len(changes["dropped"]), usage=meta)
+            dropped=len(changes["dropped"]), usage=meta, web=web_note(web),
+            verdicts={r["symbol"]: r["verdict"] for r in vrows})
     say("news %s: %d idea%s passed the checks (%s), %d rejected%s%s%s" % (
         kind, len([r for r in got_n if r["verdict"] == "passed"]), "" if len([r for r in got_n if r["verdict"] == "passed"]) == 1 else "s",
         ", ".join("%s [%s]" % (r["symbol"], r.get("confidence")) for r in got_n if r["verdict"] == "passed") or "none",
@@ -1359,11 +1783,19 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
         "".join("; %s %s: %s" % (r["symbol"], r["state"], r.get("update_why")) for r in morning) if kind == "update" else "",
         "" if not meta else "; the run took %ss, %s turns, %s tokens in and %s out" % (
             meta.get("seconds"), meta.get("turns"), meta.get("tokens_in"), meta.get("tokens_out"))))
+    say("news %s: %d web search%s, %d page%s opened%s" % (
+        kind, web.get("searches") or 0, "" if web.get("searches") == 1 else "es", len(web.get("opened") or []),
+        "" if len(web.get("opened") or []) == 1 else "s",
+        "".join("; %s: %s (%s)" % (r["symbol"], r["verdict"], r.get("why")) for r in vrows)))
     if kind == "main":
         if briefing_started(sd, doc["day"]):          # the briefing has gone: a message of its own, once
             push(M.news_ideas(doc, tally(sd)), once_key="news-ideas-" + doc["day"])
-    elif changes["dropped"] or changes["new"]:        # the update speaks only when something changed
-        push(M.news_update(doc, changes), once_key="news-update-" + doc["day"])
+    else:
+        before = old_verdicts
+        changes["verdicts"] = [v for v in verdict_list(doc) if v.get("verdict") in ("watch", "sell")
+                               and (before.get(v["symbol"]) or {}).get("verdict") != v.get("verdict")]
+        if changes["dropped"] or changes["new"] or changes["verdicts"]:   # the update speaks only when something changed
+            push(M.news_update(doc, changes), once_key="news-update-" + doc["day"])
     return doc
 
 
@@ -1424,7 +1856,7 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None, b
         if r.get("state") not in ("kept", "new"):
             skip(r, "not kept by the update before the open (%s): %s" % (r.get("state"), r.get("update_why") or "no reason"))
         else:
-            skip(r, "its confidence is %s: only %s ideas are bought" % (r.get("confidence") or "unknown", s["buy_confidence"]))
+            skip(r, "its confidence is %s: only %s confidence ideas are bought" % (r.get("confidence") or "unknown", s["buy_confidence"]))
     todo = [r for r in ok if r.get("id") not in done]
 
     if not todo:
@@ -1558,6 +1990,16 @@ def show(sd):
                                                " (%s)" % (r.get("error") or r.get("why")),
                                                "" if not u else "; %ss, %s turns, %s tokens in, %s out" % (
                                                    u.get("seconds"), u.get("turns"), u.get("tokens_in"), u.get("tokens_out"))))
+    for kind in KINDS:
+        w = ((doc.get("runs") or {}).get(kind) or {}).get("web")
+        if w:
+            lines.append("  %s run searched the web %s time(s) and opened %d page(s)" % (kind, w.get("searches"), len(w.get("opened") or [])))
+    for t in doc.get("topics") or []:
+        lines.append("  topic: %s (%s, %s)" % (t["text"], t["source"]["title"], t["source"]["date"]))
+    for v in verdict_list(doc):
+        lines.append("  holding %s (%s): %s, confidence %s: %s%s" % (v.get("symbol"), v.get("strategy"), v.get("verdict"),
+                                                                    v.get("confidence"), v.get("why"),
+                                                                    " [asked on the phone]" if v.get("asked") else ""))
     for r in doc.get("ideas") or []:
         lines.append("  PASSED %s [%s run, %s, confidence %s: %s; already moved %s%%]: %s | event: %s on %s | wrong if: %s "
                      "| sell: %s (%s) | stop $%.2f, %s shares, cost GBP %.2f"
@@ -1568,7 +2010,8 @@ def show(sd):
         if r.get("update_why"):
             lines.append("      update: %s" % r["update_why"])
         for x in r.get("sources") or []:
-            lines.append("      source %s: %s (%s)" % (x["date"], x["title"], x["url"]))
+            lines.append("      source %s: %s (%s)%s" % (x["date"], x["title"], x["url"],
+                                                          "" if x.get("opened", True) else " [seen in search results, not opened]"))
     for r in doc.get("rejected") or []:
         lines.append("  rejected %s: %s" % (r.get("symbol"), r.get("why_not")))
     return "\n".join(lines)

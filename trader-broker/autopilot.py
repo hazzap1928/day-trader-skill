@@ -1395,7 +1395,7 @@ class Pilot(object):
             rv.t212, rv.drift, rv.holdings, rv.holdings_t212 = t212, nw.drift, nw.holdings, nw.holdings_t212
             rv.run(self.sd, self.drift_cfg(), res, _ny().date(), bars_fn=nw.drift.daily_bars, say=self.say,
                    push=lambda text: phone_mod.push(self.sd, text, phone=self.phone),
-                   asks=nw.load_asks(self.sd)["asks"])
+                   asks=nw.load_asks(self.sd)["asks"], verdicts=nw.todays_verdicts(self.sd, _ny().date()))
         except Exception as e:
             self.say("daily review: could not be done (%s)" % t212.scrub(e, self.client._secrets))
 
@@ -1451,8 +1451,8 @@ class Pilot(object):
             self.say("news sell requests: not sent (%s)" % t212.scrub(e, self.client._secrets))
 
     def sell_tap(self, u, ask_id, nonce, approve):
-        """Your Approve or Reject on a "sell it?" request. Approve marks the holding for the guard's next
-        15:50 close; the autopilot itself never sells."""
+        """Your Approve or Reject on a "sell it?" request. Approve marks the holding for the guard, which sells
+        it soon after the next US open (the 15:50 close is the backup); the autopilot itself never sells."""
         try:
             outcome, ask = self.news().answer(self.sd, ask_id, nonce, approve)
         except Exception as e:
