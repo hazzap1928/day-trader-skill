@@ -520,18 +520,6 @@ class GuardToPhone(PilotBase):
         t212.guard_alarm(self.client, "key rejected")
         self.assertIn("Safety guard problem</b>\nkey rejected", self.pushed[-1])
 
-    def test_guard_news_is_orders_sent_not_quiet_checks(self):
-        res = {"positions": [{"ticker": "A", "status": "covered", "held": 1},
-                             {"ticker": "B", "status": "stop placed", "placed_qty": 5, "stop": 10.0, "held": 5},
-                             {"ticker": "C", "status": "covered", "trail": "RAISED the stop 1.00 -> 2.00 (high 3.00)"},
-                             {"ticker": "D", "status": "SOLD AT STOP", "trail": "market SELL 2 at the 9.00 stop"}],
-               "warnings": ["w1"]}
-        news = t212.guard_news(res)
-        self.assertEqual(len(news), 3)
-        self.assertIn("B stop placed: SELL 5 at 10.00", news[0])
-        self.assertIn("RAISED", news[1])
-        self.assertIn("SOLD AT STOP", news[2])
-
 
 if __name__ == "__main__":
     unittest.main()

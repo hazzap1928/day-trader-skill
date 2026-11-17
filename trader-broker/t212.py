@@ -2480,26 +2480,6 @@ def guard_alarm(client, text):
     _phone_push(client, _m(client).guard_alert(text))
 
 
-GUARD_NEWS = ("stop placed", "SOLD AT STOP", "STOP SALE FAILED", "stop failed", "unclear", "below stop")
-
-
-def guard_news(res):
-    """What in one pass is worth knowing: orders the guard sent or could not send (the log's wording)."""
-    out = []
-    for r in res.get("positions") or []:
-        st, tr = r.get("status") or "", r.get("trail") or ""
-        if st in GUARD_NEWS or tr.startswith(("RAISED", "SOLD HALF")) or "SOLD HALF" in tr:
-            line = "%s %s" % (r["ticker"], st)
-            if st == "stop placed":
-                line += ": SELL %s at %.2f, good till cancelled" % (_qty(r.get("placed_qty")), r["stop"])
-            if tr and not tr.startswith(("not trailed", "stop ")):
-                line += "; " + tr
-            elif r.get("note"):
-                line += ": " + r["note"]
-            out.append(line)
-    return out
-
-
 def guard_phone_texts(m, res):
     """[(text, once_key)] for the phone from one guard pass, in plain words. A raised trailing stop is
     told once a day per position (the log has every raise); a sale at the stop is left to the autopilot's

@@ -1168,13 +1168,6 @@ def add_info(sd, s, info_fn=None, kronos_fn=None, day=None, kronos=True):
 
 # ---------------------------------------------------------------- broken reasons: ask, never sell
 
-def held_news(sd, env="demo"):
-    """The open "news" pages of the holdings record."""
-    H = _hold()
-    return [p for p in H.live(H.load(sd), "trading212", env)
-            if p.get("strategy") == "news" and p.get("status") in ("open", "sell_asked")]
-
-
 def held_pages(sd, env="demo"):
     """Every open holding a run gives a verdict on: the news and the drift pages of the holdings record."""
     H = _hold()

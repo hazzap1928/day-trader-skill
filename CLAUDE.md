@@ -38,7 +38,7 @@ strategy or a feed, add it to "The parts" and give it its own section. Known loo
 | `trader-timemachine/` | **(dormant: day trading)** replays the plan on 10,000 simulated sessions plus history; reports R before **and after costs** |
 | `trader-budget/` | `size.py`: (used by news sizing through `t212.size_entry`) shares from the budget, the cash buffer, max position and max loss |
 | `trader-risk/` | `check.py`: the last gate for news buys (strategy caps) and the dormant ORB path. Loss limits, trades a day, allow/block lists, reward:risk **after costs** |
-| `trader-alerts/`, `trader-news/`, `trader-analyst/`, `trader-pelosi/` | quotes and market clock, news, facts, filings |
+| `trader-alerts/`, `trader-news/`, `trader-analyst/` | quotes and market clock, news, facts, filings |
 | `trader-broker/t212.py` | Trading 212 API: reads, `place` (a typed yes in a terminal), `guard` (exits only), `budget`, `fx` |
 | `trader-broker/autopilot.py` | always-on demo autopilot: runs the drift and news buy steps, the holdings match, reports and phone commands; the ORB scan (scan, Time Machine, size, risk, place) is skipped while `intraday_enabled` is false |
 | `trader-broker/phone.py` | the user's own Telegram bot: messages, Approve/Reject buttons, an outbox for failed sends |
@@ -450,7 +450,7 @@ per-trade cap and the Time Machine confidence bands are **dormant: day trading**
   (or `company()`/`tidy()`). If Telegram rejects the formatting it resends `messages.plain()`. Over 3,900
   characters it splits between paragraphs, buttons on the last piece.
 - **Logs and reports keep the old full wording.** `Pilot.event(log_text, phone=...)` logs one and sends the
-  other. `report.short_text`, `briefing.short_text`, `t212.render_eod`, `guard_news` and the drift
+  other. `report.short_text`, `briefing.short_text`, `t212.render_eod` and the drift
   `buy_text`/`sell_text` are the log and CLI versions.
 - **Fewer messages:** one buy message once the buy has filled (`Pilot.announce`, then `fill_message`;
   state `announce` in autopilot.json). A buy placed before it filled (stop due, entry not filled) sends
