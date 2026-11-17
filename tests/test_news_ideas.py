@@ -164,7 +164,8 @@ class Question(unittest.TestCase):
         real, real_exists = subprocess.run, os.path.exists
         old = dict(os.environ)
         os.environ.update(T212_API_KEY="k-secret", T212_API_SECRET="s-secret", TELEGRAM_BOT_TOKEN="t-secret",
-                          CLAUDE_BIN="/fake/claude")
+                          CLAUDE_BIN="/fake/claude", OTHER_API_KEY="o-secret", AWS_SECRET_ACCESS_KEY="a-secret",
+                          ANTHROPIC_API_KEY="x-secret", HOME="/Users/test")
         news.subprocess.run = fake_run
         news.os.path.exists = lambda p: True if p == "/fake/claude" else real_exists(p)
         try:
@@ -184,6 +185,8 @@ class Question(unittest.TestCase):
         self.assertEqual(seen["input"], "the question")
         self.assertFalse([k for k in seen["env"] if k.startswith(("T212_", "TELEGRAM_"))])
         self.assertNotIn("secret", json.dumps(seen["env"]))
+        self.assertLessEqual(set(seen["env"]), set(news.CLAUDE_ENV))                  # an allow-list, nothing else
+        self.assertEqual(seen["env"]["HOME"], "/Users/test")                          # the Claude login is found
         self.assertNotEqual(os.path.realpath(seen["cwd"]), os.path.realpath(news.ROOT))     # not the project folder
 
     def test_a_failed_claude_process_is_an_error_never_an_answer(self):

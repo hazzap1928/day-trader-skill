@@ -10,6 +10,10 @@ that the remote does not have yet, and refuses the push if one of them:
     api_key / secret / token value
   - adds the exact value of T212_API_KEY, T212_API_SECRET or TELEGRAM_BOT_TOKEN, when those are set
     in the shell that runs the push
+  - adds a line with an email address, other than a no-reply address or an example one (example.com,
+    example.org, example.net, sec.gov): the public fork must not carry a personal address
+  - has an author or committer email that is not a no-reply address (set one with
+    git config --local user.email <id>+<name>@users.noreply.github.com)
 
 It prints only the commit and file names, never a value. To check without pushing:
     printf 'x HEAD x 0000000000000000000000000000000000000000\n' | .githooks/pre-push origin url
@@ -31,6 +35,14 @@ BAD_LINE = [
      re.compile(r"(?i)(api[_-]?key|secret|token)[\"']?\s*[=:]\s*[\"'][A-Za-z0-9+/_.-]{24,}[\"']")),
 ]
 ENV_NAMES = ("T212_API_KEY", "T212_API_SECRET", "TELEGRAM_BOT_TOKEN")
+EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+OK_DOMAINS = ("users.noreply.github.com", "example.com", "example.org", "example.net", "sec.gov")
+
+
+def email_ok(address):
+    """A GitHub no-reply address, a plain noreply@ sender (as in a Co-Authored-By line) or an example one."""
+    local, _, domain = address.strip().lower().rpartition("@")
+    return domain in OK_DOMAINS or local == "noreply"
 
 
 def git(*args):
@@ -47,6 +59,9 @@ def commits(local, remote_sha):
 
 def check(sha, exact):
     found = []
+    who = git("log", "-1", "--format=%ae%n%ce", sha).split()
+    if any(not email_ok(a) for a in who):
+        found.append(("(commit)", "an author or committer email that is not a no-reply address"))
     for line in git("diff-tree", "-r", "--no-commit-id", "--name-status", "--root", sha).splitlines():
         parts = line.split("\t")
         if parts[0][:1] in ("A", "M", "C", "R") and BAD_PATH.search(parts[-1]):
@@ -61,6 +76,8 @@ def check(sha, exact):
         for what, rx in BAD_LINE:
             if rx.search(line):
                 found.append((path, what))
+        if any(not email_ok(m.group(0)) for m in EMAIL.finditer(line[1:])):
+            found.append((path, "an email address"))
         for name, value in exact:
             if value in line:
                 found.append((path, "the value of %s" % name))

@@ -648,6 +648,14 @@ def run_meta(doc):
     return out
 
 
+# What the headless Claude run may see of this program's environment: an allow-list, about what launchd gives
+# a job anyway. HOME and USER find the Claude login (Keychain); PATH, the locale and TMPDIR let it run;
+# the proxy and certificate names only if this Mac needs them. Nothing else is passed on.
+CLAUDE_ENV = ("HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+              "__CF_USER_TEXT_ENCODING", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy",
+              "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS")
+
+
 def claude_command(s):
     exe = os.environ.get("CLAUDE_BIN") or os.path.expanduser("~/.local/bin/claude")
     # stream-json (it needs --verbose) lists every tool call, so the searches and opened pages can be checked
@@ -661,12 +669,12 @@ def claude_command(s):
 def run_claude(text, s):
     """One headless Claude Code run with web search and web fetch only. Returns its final answer (text).
     Raises NewsError on any failure. It runs in an empty folder, so it sees no project file, and its
-    environment carries none of this pack's keys."""
+    environment carries only the names in CLAUDE_ENV (none of this pack's keys, nor any other secret that
+    happens to be exported in the shell that started it)."""
     cmd = claude_command(s)
     if not os.path.exists(cmd[0]):
         raise NewsError("the claude command was not found at %s" % cmd[0])
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("T212_", "TELEGRAM_", "CLAUDECODE", "CLAUDE_CODE_"))}
+    env = {k: v for k, v in os.environ.items() if k in CLAUDE_ENV}
     if not env.get("USER"):                   # the Claude login is in the Keychain, which needs to know the user
         try:
             import pwd
