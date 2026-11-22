@@ -27,6 +27,8 @@ The "serious" rule (version 2, the owner's of 22 Nov 2026; changing it starts ve
     prosecutors are named as acting. Shareholder law-firm notices ("investigates claims", class actions)
     never count unless one of those authorities is named.
   Routine 8-Ks and other headlines are shown in the evening review only.
+  "Notable" (version 1, the owner's of 22 Nov 2026): a headline naming the company with a weak forecast or results
+  below estimates is listed by name in the evening review, never in the briefing.
 
 Files (trader/state/holdwatch/): state.json (the SEC ticker list, every item found, what each place has
 shown), items.jsonl (every new item once, for judging the rule later).
@@ -98,6 +100,32 @@ SERIOUS_WORDS = [
     ("regulator says no", r"\bFDA (?:rejects?|declines?)\b|\bcomplete response letter\b|\bclinical hold\b|\bblocks? (?:the )?(?:deal|merger)\b"),
 ]
 _SERIOUS_RX = [(label, re.compile(rx, re.I)) for label, rx in SERIOUS_WORDS]
+
+# "notable" (the owner's, 22 Nov 2026; version 1): a weak forecast or results below estimates. Listed by name in
+# the evening review only, never in the morning briefing. The title must name the company, as for serious.
+NOTABLE_VERSION = 1
+NOTABLE_WORDS = [
+    ("weak forecast or results",
+     r"\b(?:forecasts?|guidance|outlook|revenue|sales|profit|earnings|results|quarter)\b[^.]{0,40}?\b(?:below|miss(?:es|ed)?|"
+     r"short of|falls? short|disappoint\w*|weak(?:er)?|soft(?:er)?|light|tepid|underwhelm\w*|lower than expected)\b"
+     r"|\b(?:weak|soft|disappointing|tepid|downbeat|gloomy|cautious)\s+(?:[\w-]+\s+)?(?:forecast|guidance|outlook|results|quarter)\b"
+     r"|\bmiss(?:es|ed)? (?:estimates|expectations|forecasts)\b"),
+]
+_NOTABLE_RX = [(label, re.compile(rx, re.I)) for label, rx in NOTABLE_WORDS]
+
+
+def notable(item, sym, name=None):
+    """(True, why) for a headline the owner wants in the evening review only (a weak forecast, results below
+    estimates), when it is not already serious; else (False, None)."""
+    if item.get("kind") == "filing":
+        return False, None
+    title = item.get("title") or ""
+    if not names_company(title, sym, name) or (_LAW_FIRM.search(title) and not _GOV.search(title)):
+        return False, None
+    for label, rx in _NOTABLE_RX:
+        if rx.search(title):
+            return True, "headline: " + label
+    return False, None
 # the SEC, the Justice Department, the FTC or prosecutors acting (named as doing it). Case matters: "sec" is not the SEC
 _AGENCY = r"(?:SEC|Securities and Exchange Commission|DOJ|Justice Department|Department of Justice|FTC|Federal Trade Commission|federal prosecutors|prosecutors)"
 _GOV = re.compile(r"\b%s\b[^.]{0,40}?\b(?:charges?|charged|sues|sued|opens?|launch(?:es|ed)?|probe\w*|investigat\w*|subpoena\w*|raid\w*|indict\w*|fines?|fined)\b"
@@ -443,10 +471,12 @@ def check(sd, cfg, now=None, fetcher=None, environ=None):
                     it["text_read"] = False
                     out["errors"].append("could not read the %s filing of %s: %s" % (it.get("day") or day, sym, str(e)[:120]))
             hit, why = serious(it, sym, nm.get(sym))
+            note, note_why = (False, None) if hit else notable(it, sym, nm.get(sym))
             row = {"id": it["id"], "page": p["id"], "symbol": sym, "strategy": rec["strategy"], "kind": it["kind"],
                    "form": it.get("form"), "items": it.get("items") or [], "title": it.get("title") or "",
                    "link": it.get("link") or "", "time": it["time"].isoformat(), "day": day.isoformat(),
-                   "tags": it.get("tags") or [], "serious": hit, "why": why, "rule": RULE_VERSION,
+                   "tags": it.get("tags") or [], "serious": hit, "why": why or note_why, "rule": RULE_VERSION,
+                   "notable": note, "notable_rule": NOTABLE_VERSION,
                    "text_read": it.get("text_read"),
                    "found_at": now.isoformat(), "shown": []}
             rec["items"].append(row)
@@ -507,6 +537,7 @@ def summary(items):
     """One holding's items for the review: {"filings": [...], "serious": [...], "headlines": n}."""
     filings = [i for i in items if i["kind"] == "filing"]
     return {"filings": filings, "serious": [i for i in items if i.get("serious")],
+            "notable": [i for i in items if i.get("notable") and not i.get("serious")],
             "headlines": sum(1 for i in items if i["kind"] != "filing"), "all": items}
 
 

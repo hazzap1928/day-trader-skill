@@ -1067,8 +1067,9 @@ def watch_words(w):
     if not w:
         return ""
     parts = ["\U0001f6a9 " + watch_item(i) for i in w.get("serious") or []]
+    parts += ["\U0001f538 " + watch_item(i) for i in w.get("notable") or []]
     parts += [watch_item(i) for i in w.get("filings") or [] if not i.get("serious")]
-    rest = sum(1 for i in w.get("all") or [] if i.get("kind") != "filing" and not i.get("serious"))
+    rest = sum(1 for i in w.get("all") or [] if i.get("kind") != "filing" and not i.get("serious") and not i.get("notable"))
     if rest:
         parts.append("%d other headline%s" % (rest, "" if rest == 1 else "s"))
     return "\n    ↳ New since the last review: " + "; ".join(parts) if parts else ""

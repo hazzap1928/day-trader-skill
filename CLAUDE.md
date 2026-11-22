@@ -109,6 +109,8 @@ holdings record (`holdings.py`), never Trading 212 (except `hold_slippage.py`, w
     prosecutors are named as acting. Shareholder law-firm notices never count unless those are named.
   - tested on real past examples (`tests/test_hold_watch.py` `PastExamples`, Intel and Boeing filings in
     `tests/fixtures/hold-watch/`).
+  - **notable (version 1, the owner's, 22 Nov):** a headline naming the company with a weak forecast or results
+    below estimates (`NOTABLE_WORDS`) is listed by name in the evening review (marked), never in the briefing.
   - **where:** the daily review lists each holding's new items (serious marked); the 07:30 briefing shows the
     serious ones only, inside the message, at most 3 a holding, each once. No messages of their own.
   - files: `trader/state/holdwatch/state.json`, `items.jsonl`. Switch: `"hold_watch": {"enabled": true}`
@@ -128,7 +130,10 @@ holdings record (`holdings.py`), never Trading 212 (except `hold_slippage.py`, w
   - research: `research/pead_stop.py`, the drift stop backtest (results in `research/README.md`, 22 Nov): the
     live 3 x ATR stop cost -0.18 (2019-23) and -0.29 (2024-26) points a trade against no stop; 4 x ATR about
     even; 2 x ATR and the rising stop clearly worse. Today's S&P 500 list only (delisted companies missing),
-    so the stop's cost is probably overstated a little. Changing the stop is the owner's decision.
+    so the stop's cost is probably overstated a little. Changing the stop is the owner's decision. With 4 x ATR
+    the worst trade was -40.3% in 2019-23 (EOG, a gap down in March 2020), so the owner's condition for moving to
+    4 x (worst no worse than about -30%) was not met; the stop stays 3 x. Slippage of 0.3% a side instead of
+    0.05% leaves drift behind the S&P 500 over the same days (`pead_stop.py --slip 0.3`).
 - **Chart labels at the buy** (`trader-scanner/chart.py`, reuses `scan.py find_setups`, version 1): plus
   `uptrend`, `below_ma50`, `down_10pct_5d`, `new_20d_low` ("falling apart" = any of the last three). From
   closes before the buy day only. `shadow.py` writes `page["chart"]` once; `research/pead_chart.py` compares

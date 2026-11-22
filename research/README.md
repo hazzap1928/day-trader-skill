@@ -107,6 +107,24 @@ recovered. The "rising" stop (raised as the price rises) was worse than the fixe
 In plain words: on this history, the stop protected against a few disasters and paid for it with many
 small, unnecessary sales.
 
+**The worst trades.** With 4 x ATR the worst trade was -40.3% in 2019-2023 (EOG, which opened 26% down on
+9 March 2020, the oil price crash, straight through its stop) and -28.9% in 2024-2026 (Oracle, held to its date).
+With 3 x ATR: -21.5% and -29.3%. A stop cannot help when a share opens far below it.
+
+**How much of the edge survives more slippage** (`pead_stop.py --slip 0.3`, `--slip 0.6`; the FX fee stays
+0.15%). Average a trade after costs, and in brackets against the S&P 500 over the same days:
+
+| Slippage a side | No stop, 2019-23 | 3 x ATR, 2019-23 | 4 x ATR, 2019-23 | No stop, 2024-26 | 3 x ATR, 2024-26 | 4 x ATR, 2024-26 |
+|---|---|---|---|---|---|---|
+| 0.05% (assumed) | +1.53% (+0.11) | +1.35% (+0.02) | +1.57% (+0.11) | +2.20% (+0.42) | +1.91% (+0.28) | +1.97% (+0.28) |
+| 0.3% | +1.02% (-0.40) | +0.85% (-0.48) | +1.07% (-0.40) | +1.69% (-0.09) | +1.40% (-0.23) | +1.47% (-0.23) |
+| 0.6% | +0.42% (-1.00) | +0.24% (-1.09) | +0.46% (-1.01) | +1.08% (-0.69) | +0.79% (-0.83) | +0.86% (-0.84) |
+
+The edge over the S&P 500 was small to begin with (+0.1 to +0.4 points a trade) and is gone at 0.3% a side.
+The agent's first drift buy (Everpure, 20 Nov 2026) filled 0.64% above the quote just before the order; Trading
+212's own record shows it filled at 09:33:21 at $102.37 ("OTC", filled by Trading 212 itself), while the market
+traded at $101.10 to $101.68 in that minute (Yahoo 1-minute bars). That was a Practice account fill.
+
 **Chart labels at the buy: none held up.** In 2019-2023, drift trades whose chart was "falling apart"
 (under the 50-day average, down 10% in a week or at a 20-day low) did BETTER (+2.9% against +0.9%), and
 those in an uptrend did worse. In 2024-2026 neither gap was there (+2.3% against +2.2%). No label had a gap

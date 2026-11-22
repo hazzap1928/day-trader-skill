@@ -23,6 +23,7 @@ Known limits (said again in the output): today's S&P 500 list only, so companies
 dividends and splits; trades overlap; FX moves ignored.
 
     python3 research/pead_stop.py          # needs trader/research-data/prices.json, sp500.csv, earnings.json
+    python3 research/pead_stop.py --slip 0.3 --only none,3x,4x     # 0.3% slippage a side; three variants
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,8 +39,14 @@ holds = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(holds)
 
 RANKING, SLOTS = "B", 10
+# --slip PCT: slippage per side on the share legs instead of 0.05% (the FX fee 0.15% stays); --only: variant names
+if "--slip" in sys.argv:
+    _slip = float(sys.argv[sys.argv.index("--slip") + 1]) / 100.0
+    holds.COST = 0.0015 + _slip
+    K_STOCK = 0.0015 + _slip
 VARIANTS = [("none", "none", None), ("fixed 2xATR", "fixed", 2.0), ("fixed 3xATR (live)", "fixed", 3.0),
             ("fixed 4xATR", "fixed", 4.0), ("rising 3xATR", "rising", 3.0)]
+_SHORT = {"none": "none", "fixed 2xATR": "2x", "fixed 3xATR (live)": "3x", "fixed 4xATR": "4x", "rising 3xATR": "rising"}
 PERIODS = [("2019-2023", DEV), ("2024-2026", TEST)]
 BOOT = 2000
 
@@ -173,6 +180,10 @@ def coverage(a, b):
 
 
 if __name__ == "__main__":
+    if "--only" in sys.argv:
+        keep = sys.argv[sys.argv.index("--only") + 1].split(",")
+        VARIANTS[:] = [v for v in VARIANTS if _SHORT[v[0]] in keep or v[0] in keep]
+    print("costs on each share buy and sale: %.2f%% (FX fee 0.15%% + slippage %.2f%%)" % (100 * holds.COST, 100 * holds.COST - 0.15))
     if not E:
         sys.exit("no trader/research-data/earnings.json: run python3 research/earnings_fetch.py first")
     out = {"variants": [v[0] for v in VARIANTS], "periods": {}}
@@ -205,7 +216,7 @@ if __name__ == "__main__":
                   "avg %+.2f%% a trade" % (name, r["total_pct"], r["total_pct"] - base, r["max_drawdown_pct"], r["trades"],
                                            r["stopped"], r["avg_trade_pct"]))
         out["periods"][label] = {"range": [a, b], "signals": sl, "coverage": cv, "book": bk, "tracker_pct": base}
-    with open(DATA + "pead_stop.json", "w") as fh:
+    with open(DATA + ("pead_stop.json" if "--slip" not in sys.argv else "pead_stop_slip%s.json" % sys.argv[sys.argv.index("--slip") + 1]), "w") as fh:
         json.dump(out, fh, indent=1, default=float)
     print("\nSaved %spead_stop.json. Limits: today's S&P 500 list only (survivorship), surprise figures as Nasdaq shows "
           "them now, overlapping trades (the 95%% ranges are too narrow), FX moves ignored." % DATA)

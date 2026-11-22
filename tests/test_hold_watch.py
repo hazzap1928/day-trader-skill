@@ -140,6 +140,18 @@ class Check(Base):
         with open(hw.log_path(self.dir)) as fh:
             self.assertEqual(len(fh.readlines()), 4)
 
+    def test_a_notable_headline_goes_to_the_review_not_the_briefing(self):
+        f = self.feed(headlines=[("Everpure gives weak outlook for next quarter", "Mon 23 Nov 2026 14:00:00 GMT", "w")])
+        f.files["yahoo-P.xml"] = rss(("Everpure gives weak outlook for next quarter", "Mon, 23 Nov 2026 14:00:00 GMT", "w"))
+        res = hw.check(self.dir, CFG, now=NOW, fetcher=f)
+        self.assertEqual([(i["serious"], i["notable"], i["why"]) for i in res["new"]],
+                         [(False, True, "headline: weak forecast or results")])
+        self.assertEqual(hw.take(self.dir, "briefing", serious_only=True), {})
+        review = hw.take(self.dir, "review")["2026-11-20-P-1"]
+        w = M.watch_words(hw.summary(review))
+        self.assertIn("\U0001f538 Headline (Mon 23 Nov): Everpure gives weak outlook for next quarter", w)
+        self.assertNotIn("other headline", w)
+
     def test_the_briefing_takes_at_most_three_serious_items_a_holding(self):
         f = self.feed(filings=[("Item 1.05", "2026-11-2%dT10:00:00-05:00" % d, "acc-%d" % d) for d in range(0, 4)]
                       + [("Item 2.06", "2026-11-23T10:00:00-05:00", "acc-9")])
@@ -247,6 +259,22 @@ class PastExamples(unittest.TestCase):
         ("INTC", "Intel", "Is it time to buy Intel stock?", False),
         ("INTC", "Intel", "Analyst downgrades Intel to sell", False),
     ]
+
+    def test_weak_forecast_headlines_are_notable_not_serious(self):
+        for sym, name, title in (("INTC", "Intel", "Intel forecasts quarterly revenue below estimates"),
+                                 ("NKE", "Nike", "Nike misses estimates as China sales slump"),
+                                 ("TGT", "Target", "Target gives disappointing holiday-quarter outlook"),
+                                 ("AAPL", "Apple", "Apple revenue falls short of Wall Street expectations")):
+            item = {"kind": "headline", "title": title}
+            self.assertEqual(hw.serious(item, sym, name), (False, None), title)
+            self.assertEqual(hw.notable(item, sym, name), (True, "headline: weak forecast or results"), title)
+        for sym, name, title in (("NKE", "Nike", "Nike raises full-year guidance on strong demand"),
+                                 ("INTC", "Intel", "AMD forecasts revenue below estimates"),           # another company
+                                 ("SMCI", "Super Micro Computer", "Rosen Law Firm: Super Micro Computer results "
+                                                                  "below estimates, investors who lost money"),
+                                 ("INTC", "Intel", "Intel revenue beats estimates")):
+            self.assertFalse(hw.notable({"kind": "headline", "title": title}, sym, name)[0], title)
+        self.assertFalse(hw.notable({"kind": "filing", "items": ["2.02"]}, "INTC", "Intel")[0])
 
     def test_headlines(self):
         for sym, name, title, want in self.HEADLINES:
