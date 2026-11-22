@@ -125,6 +125,24 @@ The agent's first drift buy (Everpure, 20 Nov 2026) filled 0.64% above the quote
 212's own record shows it filled at 09:33:21 at $102.37 ("OTC", filled by Trading 212 itself), while the market
 traded at $101.10 to $101.68 in that minute (Yahoo 1-minute bars). That was a Practice account fill.
 
+**Buying in the opening minutes or later** (`research/open_timing.py`, 22 Nov 2026; Yahoo 1-minute prices,
+which reach back only about 30 days: 26 Oct to 20 Nov 2026, one earnings season). The first trade at each time
+against the first trade at 09:33 (when drift's order goes in); positive = waiting would have cost more:
+
+| | 09:45 | 10:00 | 10:30 |
+|---|---|---|---|
+| 106 drift buy days: average (give or take) | +0.18% (0.19) | +0.34% (0.26) | +0.20% (0.33) |
+| typical size of the gap, either way | 0.74% | 1.05% | 1.27% |
+| 1,936 days of 97 large shares: average (give or take) | -0.01% (0.04) | +0.03% (0.05) | -0.15% (0.07) |
+
+On drift buy days, waiting was if anything DEARER on average (the shares kept rising after a beat), though
+within chance on so few days. The gap for any single buy is large (0.7 to 1.3%, well over 0.3%), but it goes
+either way, so waiting is a coin toss for each trade, not a saving. The opening minutes are rougher: a single
+minute's high and low were 0.51% apart on drift days at 09:31-09:35 against 0.32% at 10:00. The first real fill
+(Everpure) was 0.97% above the highest trade in its minute, which no choice of time would have avoided: on that
+evidence the larger part of the slippage is Trading 212's own (Practice) pricing, not the open. One fill and
+one season: the evening fill checks will show whether that holds.
+
 **Chart labels at the buy: none held up.** In 2019-2023, drift trades whose chart was "falling apart"
 (under the 50-day average, down 10% in a week or at a 20-day low) did BETTER (+2.9% against +0.9%), and
 those in an uptrend did worse. In 2024-2026 neither gap was there (+2.3% against +2.2%). No label had a gap
@@ -194,6 +212,8 @@ python3 research/daily_fetch.py && python3 research/four_strategies.py     # fou
 python3 research/prices_fetch.py                                           # S&P 500 daily, 2017 on
 python3 research/earnings_fetch.py                                         # Nasdaq earnings, 2019 on (about 2 hours)
 python3 research/pead_stop.py && python3 research/pead_chart.py             # the drift stop and chart labels (22 Nov)
+python3 research/pead_stop.py --slip 0.3 --only none,3x,4x                   # the same at 0.3% slippage a side
+python3 research/open_timing.py                                             # opening minutes against later (last ~30 days)
 python3 research/three_strategies.py mom pull && python3 research/momentum_check.py
 python3 research/pead_run.py && python3 research/pead_tracker.py
 caffeinate -i -s nice -n 19 trader-kronos/.venv/bin/python research/kronos_backtest.py   # about 4 hours

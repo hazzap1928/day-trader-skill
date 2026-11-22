@@ -26,7 +26,7 @@ strategy or a feed, add it to "The parts" and give it its own section. Known loo
 - asking about a holding that left the universe or went on the blocked list (the review only says it would)
 - any approval step for drift (its verdicts are logged only)
 - removing the dormant ORB code, tests and limits
-- opening-range timing for drift and news buys (shadow): ask the owner before building it
+- the entry timing shadow is built (22 Nov, price-based); changing WHEN or HOW drift and news buy is the owner's decision
 - a serious filing triggering the existing "sell it?" approval: proposed 22 Nov, not built
 - the holiday list in `trader-alerts/alerts.py` covers 2026 and 2027 only
 
@@ -64,7 +64,8 @@ strategy or a feed, add it to "The parts" and give it its own section. Known loo
 | `trader-broker/shadow.py` | **review only**: Kronos's opinion of each drift and news buy, the stop shadow of each holding its stop sold, and the sell-rule replay and chart labels of each holding, written on the holdings pages (see "Kronos opinions and the stop shadow") |
 | `trader-broker/hold_watch.py` | **report only**: new SEC filings and headlines on each holding; serious ones in the briefing (see "Reworked tools for holds") |
 | `trader-broker/earnings_watch.py` | **report only**: each holding's next results date, flagged when it comes before the sell date |
-| `trader-broker/hold_slippage.py` | **report only**: fill prices against the price expected on drift and news trades, in the Friday report |
+| `trader-broker/hold_slippage.py` | **report only**: every drift and news fill against the price expected and the real market that minute, in the Friday report |
+| `trader-broker/entry_shadow.py` | **shadow only**: what each buy would have cost at 09:45, 10:00, 10:30 or with a limit order |
 | `trader-kronos/` | Kronos-small forecasts, **shadow only**: `kronos_daily.py` (the daily forecast to the sell date, used by `shadow.py` and the news runs) and `kronos_shadow.py` (the dormant day-trade one); own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
 | `research/checkpoint_review.py` | the review checkpoint in plain English (read-only; see "Review checkpoint") |
 | `research/` | backtest scripts and `README.md` with the results (data goes in `trader/research-data/`) |
@@ -89,6 +90,18 @@ The guard's protections:
 - trailing stop (intraday only, dormant while day trading is off): starts once 1R in profit (`activate_r`, default 1), then trails 1R under the high
 - end-of-day close at 15:50 New York: it cancels each stop, then sells at market. Which positions
   depends on the buy record in `trader/state/broker.json` (see "Strategy labels" below)
+
+## The owner's decisions of 22 Nov 2026 on the stop and on slippage
+
+- **The drift stop stays at 3 x ATR.** 4 x ATR was considered and REJECTED: its worst single trade in 2019-23
+  was -40.3% (EOG, which opened 26% down in the March 2020 oil crash, straight through the stop), over the
+  owner's limit of about -30%. Do not change `drift.atr_mult`, or the news stop, without the owner's written say.
+- **Drift's edge over the S&P 500 disappears at 0.3% slippage a side** (`research/pead_stop.py --slip 0.3`):
+  at the assumed 0.05% drift leads the S&P 500 over the same days by only +0.1 to +0.4 points a trade. Slippage
+  is now the owner's main concern: every real fill is measured (`hold_slippage.py`), and after 10 fills the
+  phone is told once whether it is consistently above 0.3% a side.
+- **The first real fill (Everpure, 20 Nov):** +0.64% against the quote; split, Trading 212's own price was
+  +0.97% above the real market in that minute (an "OTC" Practice fill) and the market had moved -0.32%.
 
 ## Reworked tools for holds (22 Nov 2026): the old day-trading tools, reused. ALL REPORT ONLY OR SHADOW
 
@@ -141,11 +154,24 @@ holdings record (`holdings.py`), never Trading 212 (except `hold_slippage.py`, w
   "falling apart" charts did better, in 2024-26 no difference). **The owner's decision (22 Nov): the labels stay
   on the holdings page and in the daily review for information only; they are used in no decision, and no
   labelled-against-unlabelled comparison goes into any report (Friday, briefing, review, checkpoint).**
-- **Slippage on held trades** (`trader-broker/hold_slippage.py`): each evening (after the review) it logs
-  every drift and news buy (fill against the quote just before the order) and sale (stop sale against the
-  stop; close or approved sale against the price the guard saw) to `trader/state/slippage.jsonl`, once each.
-  The Friday report (saved and phone) shows the averages beside the 0.05% assumed, with the note that
-  Practice account fills are simulated and may understate real slippage. The Yahoo quote can lag at 09:33.
+- **Every fill checked** (`trader-broker/hold_slippage.py`, `Pilot.fill_checks`, each evening after the review,
+  only with `"fill_checks": {"enabled": true}`, ON since 22 Nov): one row per drift and news buy and sale in
+  `trader/state/fills.json` (log `slippage.jsonl`): expected price (buy: the quote just before the order; stop
+  sale: the stop; close or approved sale: the price the guard saw), Trading 212's own fill time and price
+  (`holdings_t212.fill_finder`, the order history, READ-ONLY), and the real market in that minute (Yahoo 1-minute
+  bars, `drift.minute_bars`, kept about 30 days). `slip_pct` (fill against expected) splits into `move_pct`
+  (the market moving) and `market_gap_pct` (the broker's own pricing). Positive = worse for us.
+  - The Friday report lists every fill (the last 12 on the phone), the running average and the split. After
+    `JUDGE_AT` (10) measured fills the phone is told ONCE whether slippage is consistently above 0.3% a side
+    (average over 0.3% AND at least 7 in 10 fills over it); the Friday report repeats the verdict.
+  - Note on every report: Practice account fills are simulated and may understate real slippage.
+- **Entry timing shadow** (`trader-broker/entry_shadow.py`, version 1, after each buy day, same switch): for each
+  drift and news buy, the price at 09:45, 10:00 and 10:30 and a buy limit at the 09:32 price (good for the day;
+  in the order's own minute it fills at the limit only), each against the real market when we filled
+  (`vs_market_pct`, the timing alone) and against what we paid (`vs_fill_pct`). Never delays or changes a buy.
+  Friday report: "If I had bought at another time". Files: `trader/state/entry-shadow.json`, `.jsonl`.
+  `research/open_timing.py`: the same question on the last ~30 days of 1-minute prices (22 Nov: on 106 drift buy
+  days, waiting to 10:00 cost +0.34% more on average, within chance; the gap for one buy is about 1% either way).
 - **The daily review** shows, under each holding, one line per new item: chart labels and the replay (on the
   phone once, the day after they are worked out), new filings and headlines, and a results date in the hold.
 - **Not reused:** the ORB scan, the entry timer, the exit planner, trader-budget, the day-trade Kronos, the
@@ -698,8 +724,8 @@ The ORB keys below (`max_trades_per_day`, `min_reward_risk`, entry times, traili
 - **`autopilot`:** `auto_buy: true`, `evidence_mode: true`, `intraday_enabled: false` (day trading off since the evening of 17 Nov).
 - **`drift`:** `scan_enabled: true` since 10 Nov; `buy_enabled: true` since 12 Nov (the owner's decision).
   No drift buy yet: every shortlist so far was empty.
-- **`hold_watch`, `earnings_watch`:** `{"enabled": true}` since 22 Nov 2026 (report only; backups
-  `config.json.bak-20261122-before-hold-watch` and `-before-earnings-watch`).
+- **`hold_watch`, `earnings_watch`, `fill_checks`:** `{"enabled": true}` since 22 Nov 2026 (report only;
+  backups `config.json.bak-20261122-before-hold-watch`, `-before-earnings-watch`, `-before-fill-checks`).
 - **`news`:** `buy_enabled: true` and `buy_confidence: ["medium", "high"]` since 17 Nov 2026 (the owner's
   decision; backup `trader/backups/config/config.json.bak-*` from that day). Money: 10% cash always, drift up to 50% of the investable
   cash, news uses what drift and the other holdings leave.
@@ -770,7 +796,7 @@ report still runs and carries the drift and news sections. Old rows and results 
 | Path | What |
 |---|---|
 | `trader/logs/` | `guard.log`, `autopilot.log`, `briefing.log`, `news.log`, `universe.log`, `guard-alerts.jsonl`, `outages.jsonl`, `t212-orders-DATE.jsonl` |
-| `trader/state/` | `holdwatch/` (filings and headlines on holdings), `earnings-watch.json`, `slippage.jsonl`, `holdings.json` and `holdings-log.jsonl` (the holdings record, and the pause on new buys), `reviews/` (each day's review), `news/` (ideas, today's runs, buys, sell requests), `broker.json` (placements), `t212-guard.json` (stops, software stops, trail, end-of-day), `autopilot.json`, `risk.json`, `account-days.json`, `phone.json`, `phone-outbox.json`, `briefing.json`, `evidence/` |
+| `trader/state/` | `holdwatch/` (filings and headlines on holdings), `earnings-watch.json`, `fills.json` and `slippage.jsonl` (every fill), `entry-shadow.json`, `holdings.json` and `holdings-log.jsonl` (the holdings record, and the pause on new buys), `reviews/` (each day's review), `news/` (ideas, today's runs, buys, sell requests), `broker.json` (placements), `t212-guard.json` (stops, software stops, trail, end-of-day), `autopilot.json`, `risk.json`, `account-days.json`, `phone.json`, `phone-outbox.json`, `briefing.json`, `evidence/` |
 | `trader/briefings/`, `trader/reports/` | each day's briefing; closing and evidence reports |
 | `trader/universe/` | `tradable.json` (the universe), `changes.jsonl` (each refresh), `refresh.json` (last start) |
 | `research/` | scripts and results summary; data in `trader/research-data/` or `$RESEARCH_DATA` |
