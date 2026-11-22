@@ -135,6 +135,56 @@ class KronosOpinion(Base):
         self.assertIn("not set up", self.said[0])
 
 
+class Replay(Base):
+    """The Time Machine for holds on each drift and news page (shadow only)."""
+
+    def test_each_holding_gets_one_replay_from_bars_before_its_buy_day(self):
+        self.write([page("AAA-1", buy_price=100.0), page("BBB-1", strategy="news", buy_price=100.0),
+                    page("CCC-1", strategy="intraday", buy_price=100.0), page("DDD-1", status="waiting", buy_price=100.0)])
+        calls = []
+        self.assertEqual(sh.replay_pass(self.sd, bars_fn=bars_fn(calls=calls), say=self.say), 2)
+        pages = self.pages()
+        r = pages["AAA-1"]["replay"]
+        self.assertEqual((r["runs"], r["days"], r["stop"]), (1000, 20, 90.0))     # 20 Nov to 18 Dec, holiday out
+        self.assertEqual(set(r["rules"]), {"fixed", "rising", "none"})
+        self.assertLess(r["as_of"], "2026-11-20")
+        self.assertTrue(all(end < datetime.date(2026, 11, 20) for _, _, end in calls))   # no hindsight
+        self.assertNotIn("replay", pages["CCC-1"])
+        self.assertNotIn("replay", pages["DDD-1"])
+        self.assertEqual(sh.replay_pass(self.sd, bars_fn=bars_fn(), say=self.say), 0)    # once a page
+
+    def test_a_failure_is_tried_three_times_then_left(self):
+        self.write([page("AAA-1")])                                    # no buy price
+        for _ in range(4):
+            sh.replay_pass(self.sd, bars_fn=bars_fn(), say=self.say)
+        self.assertEqual(self.pages()["AAA-1"]["replay"]["tries"], 3)
+        self.assertIn("no buy price", self.pages()["AAA-1"]["replay"]["error"])
+
+    def test_it_changes_nothing_but_its_own_field(self):
+        self.write([page("AAA-1", buy_price=100.0)])
+        before = self.pages()["AAA-1"]
+        sh.replay_pass(self.sd, bars_fn=bars_fn(), say=self.say)
+        after = dict(self.pages()["AAA-1"])
+        after.pop("replay")
+        self.assertEqual(after, before)
+
+    def test_the_review_and_phone_words(self):
+        rv = load("trader-broker", "review")
+        M = load("trader-broker", "messages")
+        import time as _t
+        rp = {"rules": {"fixed": {"median_pct": 1.2}, "rising": {"median_pct": 0.4}, "none": {"median_pct": 1.9}},
+              "stop_first_pct": 31.4, "runs": 1000, "at": _t.time()}
+        got = rv._replay({"replay": rp})
+        self.assertTrue(got["new"])
+        self.assertEqual(M.replay_words(got), ". Replaying its own past ups and downs: the safety net was hit first 31% of "
+                         "the time; typical result after fees +1.2% with the safety net as set, +0.4% if it rose with the "
+                         "price, +1.9% with none (for information)")
+        old = rv._replay({"replay": dict(rp, at=_t.time() - 3 * 86400)})
+        self.assertFalse(old["new"])
+        self.assertEqual(M.replay_words(old), "")                      # told once on the phone
+        self.assertIsNone(rv._replay({"replay": {"error": "x", "tries": 1}}))
+
+
 class StopShadow(Base):
     stop_result = {"date": "2026-11-24", "price": 90.0, "why": "stop", "pl_gbp": -15.0, "qty": 2.0}
 

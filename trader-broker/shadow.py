@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Two review-only records on the holdings pages: Kronos's opinion of each drift and news buy, and the "stop
-shadow" of each holding its stop sold. SHADOW ONLY: nothing here places, cancels or changes an order,
-blocks a buy, or changes a stop, a sell date or a status. It only adds two fields to pages in
+"""Three review-only records on the holdings pages: Kronos's opinion of each drift and news buy, the "stop
+shadow" of each holding its stop sold, and the sell-rule replay of each holding. SHADOW ONLY: nothing here
+places, cancels or changes an order, blocks a buy, or changes a stop, a sell date or a status. It only adds three fields to pages in
 trader/state/holdings.json (and a line to holdings-log.jsonl).
 
   page["kronos"]       Kronos's forecast for the share over its planned holding, from the daily bars BEFORE
@@ -17,6 +17,12 @@ trader/state/holdings.json (and a line to holdings-log.jsonl).
                        diff = the sell-date close minus the stop's sale price (positive: the stop cost money;
                        negative: it saved money). diff_gbp is for the shares sold, at the day's exchange rate,
                        before fees (the same fee is paid either way, on a slightly different amount).
+
+  page["replay"]       the Time Machine for holds (trader-timemachine/holds.py): the holding replayed 1,000 times on
+                       its own past daily ups and downs (trend taken out; bars BEFORE the buy day), from its buy price to its sell
+                       date: how often the stop is hit first, and the typical result after fees with the stop as
+                       set ("fixed"), a stop raised as the price rises ("rising") and no stop ("none"). Once a page;
+                       after 3 failed tries: {"error", "tries"}.
 
 The autopilot starts `shadow.py run` once a day after the daily review, as a separate program, so a slow
 Kronos run never holds up the autopilot. Kronos needs trader-kronos/.venv; without it the opinion is skipped.
@@ -193,6 +199,61 @@ def kronos_pass(sd, bars_fn=None, run=None, budget_s=BUDGET_S, say=print):
     return n
 
 
+# ---------------------------------------------------------------- the sell-rule replay (Time Machine for holds)
+
+def _holds():
+    return _load("trader-timemachine", "holds")
+
+
+def wants_replay(page):
+    if page.get("strategy") not in HOLD or page.get("status") == "waiting":
+        return False
+    r = page.get("replay") or {}
+    return r.get("rules") is None and int(r.get("tries") or 0) < MAX_TRIES
+
+
+def replay_one(page, bars_fn):
+    """The replay for one page, from the daily bars strictly before its buy day. Raises when it cannot be done."""
+    buy, sell = _date(page.get("buy_date")), _date((page.get("sell_rule") or {}).get("date"))
+    entry, stop = page.get("buy_price"), page.get("stop")
+    if not buy or not sell or sell < buy:
+        raise ValueError("no buy date or sell date")
+    if not entry or not stop:
+        raise ValueError("no buy price or stop on the page")
+    bars = bars_fn(page["symbol"], buy - datetime.timedelta(days=BARS_BACK_DAYS), buy - datetime.timedelta(days=1))
+    rows = [tuple(v[:4]) for d, v in sorted(bars.items()) if d < buy]
+    out = _holds().noise_test(rows, float(entry), len(held_days(buy, sell)), stop=float(stop))
+    out["as_of"] = max(d for d in bars if d < buy).isoformat()
+    return out
+
+
+def replay_pass(sd, bars_fn=None, say=print):
+    """The sell-rule replay on every drift and news page that has none yet. Returns the number written."""
+    H = _hold()
+    pages = [p for p in H.load(sd)["pages"] if wants_replay(p)]
+    if not pages:
+        return 0
+    got = {}
+    for p in pages:
+        try:
+            got[p["id"]] = dict(replay_one(p, bars_fn or _bars_fn()), at=int(time.time()))
+        except Exception as e:
+            r = p.get("replay") or {}
+            got[p["id"]] = {"error": str(e)[:200], "tries": int(r.get("tries") or 0) + 1, "at": int(time.time())}
+    n = 0
+    with H.locked(sd):
+        doc = H.load(sd)
+        for page in doc["pages"]:
+            if page.get("id") in got and wants_replay(page):
+                page["replay"] = got[page["id"]]
+                H.log(sd, "replay", id=page["id"], symbol=page.get("symbol"), strategy=page.get("strategy"),
+                      replay=page["replay"])
+                n += 1
+        if n:
+            H.save(sd, doc)
+    return n
+
+
 # ---------------------------------------------------------------- the stop shadow
 
 def stop_sold(page, guard_state=None):
@@ -286,6 +347,10 @@ def run(sd, say=print):
     except Exception as e:
         say("shadow: stop shadow failed (%s)" % str(e)[:200])
     try:
+        say("shadow: %d sell-rule replay(s) written" % replay_pass(sd, say=say))
+    except Exception as e:
+        say("shadow: sell-rule replays failed (%s)" % str(e)[:200])
+    try:
         say("shadow: %d Kronos opinion(s) written" % kronos_pass(sd, say=say))
     except Exception as e:
         say("shadow: Kronos opinions failed (%s)" % str(e)[:200])
@@ -302,6 +367,7 @@ def show(sd):
                                                        p.get("buy_date"), kt))
         if s:
             print("       stop shadow: %s" % json.dumps(s, sort_keys=True))
+        print("       replay: %s" % _holds().words(p.get("replay")))
 
 
 def time_one(symbol):

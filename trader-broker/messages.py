@@ -954,8 +954,9 @@ def daily_review(r):
             read = ". Today's read: %s%s" % (_VERDICT[v["verdict"]], "" if not v.get("why") else " (%s)" % esc(_short(v["why"], 140)))
             if row.get("strategy") == "drift":
                 read += ". Noted only: this one is sold by its date rule"
-        items.append("%s (%s): %s%s; %s%s%s%s" % (company(row["symbol"]), _KIND.get(row.get("strategy"), "a label I don't know"),
-                                                 gain, mkt, net, sell, read, watch_words(row.get("watch"))))
+        items.append("%s (%s): %s%s; %s%s%s%s%s" % (company(row["symbol"]), _KIND.get(row.get("strategy"), "a label I don't know"),
+                                                   gain, mkt, net, sell, read, replay_words(row.get("replay")),
+                                                   watch_words(row.get("watch"))))
     if not r.get("rows"):
         items.append("Nothing is held")
     if r.get("due"):
@@ -995,6 +996,18 @@ def watch_item(i):
         what = [_8K_WORDS.get(x, "item %s" % x) for x in i.get("items") or [] if x != "9.01"]
         return "SEC filing (%s): %s" % (when, esc(", ".join(what) or "a company announcement"))
     return "Headline (%s): %s" % (when, esc(_short(i.get("title"), 140)))
+
+
+def replay_words(rp):
+    """The holding's sell-rule replay, told once (the review after it is worked out). For information only."""
+    if not rp or not rp.get("new") or rp.get("stop_first_pct") is None:
+        return ""
+    m = rp.get("median_pct") or {}
+    if None in (m.get("fixed"), m.get("rising"), m.get("none")):
+        return ""
+    return (". Replaying its own past ups and downs: the safety net was hit first %s%% of the time; typical result "
+            "after fees %s with the safety net as set, %s if it rose with the price, %s with none (for information)" % (
+                esc("%.0f" % rp["stop_first_pct"]), pct(m["fixed"], 1), pct(m["rising"], 1), pct(m["none"], 1)))
 
 
 def watch_words(w):

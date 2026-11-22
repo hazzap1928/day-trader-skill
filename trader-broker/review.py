@@ -201,7 +201,7 @@ def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None, watch=Non
                "buy_date": (page or {}).get("buy_date"), "reason": (page or {}).get("reason"),
                "sell_date": None, "status": (page or {}).get("status"), "market_pct": None,
                "verdict": (verdicts or {}).get(pos.get("symbol")) if page is not None and H.is_hold(page) else None,
-               "watch": _watch(watch, page)}
+               "watch": _watch(watch, page), "replay": _replay(page)}
         sell = H.sell_date(page) if page else None
         if sell:
             row["sell_date"] = sell.isoformat()
@@ -255,6 +255,20 @@ def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None, watch=Non
             "account_gbp": _num(v.get("account_gbp")), "problems": problems, "report_only": True}
 
 
+def _replay(page):
+    """The holding's sell-rule replay (shadow.py, page["replay"]): the figures, and whether it is new (worked out
+    in the last 36 hours, so the phone tells it once). None when there is none."""
+    r = (page or {}).get("replay") or {}
+    if not r.get("rules"):
+        return None
+    try:
+        new = (datetime.datetime.now().timestamp() - float(r.get("at") or 0)) < 36 * 3600
+    except (TypeError, ValueError):
+        new = False
+    return {"stop_first_pct": r.get("stop_first_pct"), "runs": r.get("runs"), "new": new,
+            "median_pct": {k: (r["rules"].get(k) or {}).get("median_pct") for k in ("fixed", "rising", "none")}}
+
+
 def _watch(watch, page):
     """A holding's new filings and headlines (trader-broker/hold_watch.py), or None. Shown only."""
     items = (watch or {}).get((page or {}).get("id"))
@@ -294,6 +308,11 @@ def text(r):
             L.append("         today's verdict from the news runs: %s (confidence %s): %s%s" % (
                 row["verdict"].get("verdict"), row["verdict"].get("confidence"), row["verdict"].get("why"),
                 "; written down only, the date rule decides" if row["strategy"] == "drift" else ""))
+        if row.get("replay"):
+            rp = row["replay"]
+            L.append("         replays (shadow): stop hit first in %s%% of %s; typical result after fees %+.1f%% as set, "
+                     "%+.1f%% rising, %+.1f%% no stop" % (rp["stop_first_pct"], rp["runs"], rp["median_pct"]["fixed"],
+                                                         rp["median_pct"]["rising"], rp["median_pct"]["none"]))
         for i in (row.get("watch") or {}).get("all") or []:
             L.append("         new: %s%s" % (_load("trader-broker", "hold_watch").item_line(i).strip(),
                                               "  [%s]" % i["why"] if i.get("why") else ""))
