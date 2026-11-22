@@ -1473,6 +1473,12 @@ class Pilot(object):
                    push=lambda text: phone_mod.push(self.sd, text, phone=self.phone),
                    asks=nw.load_asks(self.sd)["asks"], verdicts=nw.todays_verdicts(self.sd, _ny().date()),
                    watch=hw["by_page"], earnings=ew["by_page"])
+            try:            # the price got against the price expected on each drift and news buy and sale (local files)
+                n = len(mod("trader-broker", "hold_slippage").record(self.sd, _ny().date()))
+                if n:
+                    self.say("slippage: %d new row(s) in trader/state/slippage.jsonl" % n)
+            except Exception as e:
+                self.say("slippage: could not be recorded (%s)" % str(e)[:200])
         except Exception as e:
             self.say("daily review: could not be done (%s)" % t212.scrub(e, self.client._secrets))
 

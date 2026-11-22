@@ -757,7 +757,7 @@ def news_lines(sd, cfg):
 def send_report(client, sd, cfg, report_mod, phone=None, environ=None):
     r = build_report(client, sd, cfg, report_mod)
     text = report_text(r)
-    extra = drift_lines(sd, cfg, r["today"]) + news_lines(sd, cfg)
+    extra = drift_lines(sd, cfg, r["today"]) + news_lines(sd, cfg) + slippage_lines(sd)
     if extra:
         text = text + "\n" + "\n".join(extra)
     d = os.path.join(sd, "reports")
@@ -785,7 +785,25 @@ def phone_text(sd, cfg, r):
         news = None
     if news:
         drift = list(drift or []) + ([""] if drift else []) + list(news)
+    try:
+        slip = M.friday_slippage(_load("trader-broker", "hold_slippage").summary(sd))
+    except Exception:
+        slip = []
+    if slip:
+        drift = list(drift or []) + ([""] if drift else []) + slip
     return M.friday(r, drift)
+
+
+def slippage_lines(sd):
+    """Slippage on drift and news trades (trader-broker/hold_slippage.py) for the saved report. Never raises."""
+    try:
+        hs = _load("trader-broker", "hold_slippage")
+        s = hs.summary(sd)
+        if not any(s[k]["n"] or s[k]["unmeasured"] for k in ("buy", "sell")):
+            return []
+        return hs.lines(s)
+    except Exception as e:
+        return ["", "## Slippage on held trades: could not be read (%s)" % str(e)[:120]]
 
 
 def due(cfg, today_iso, weekday):

@@ -793,6 +793,28 @@ def friday(r, drift=None):
     return join(out)
 
 
+def friday_slippage(s):
+    """Prices actually got on drift and news trades against the price expected (hold_slippage.summary). [] when
+    nothing has been measured or logged yet."""
+    if not s or not any((s.get(k) or {}).get("n") or (s.get(k) or {}).get("unmeasured") for k in ("buy", "sell")):
+        return []
+    out = ["<b>Prices I actually got on held trades</b>"]
+    for key, what, against in (("buy", "Buys", "the price just before the order"),
+                               ("sell", "Sales", "the safety-net price or the price just before selling")):
+        g = s.get(key) or {}
+        if g.get("n"):
+            avg = g["avg_pct"]
+            line = "%s: %d measured, on average %.2f%% %s than %s (the plan assumes %.2f%%)" % (
+                what, g["n"], abs(avg), "worse" if avg >= 0 else "better", against, s.get("assumed_pct", 0.05))
+        else:
+            line = "%s: none measured yet" % what
+        if g.get("unmeasured"):
+            line += "; %d with no price to compare" % g["unmeasured"]
+        out.append("• " + line)
+    out.append("<i>%s</i>" % esc(s.get("note") or ""))
+    return out
+
+
 def friday_drift(real, shadow):
     """real/shadow: {"n", "avg", "vs", "status"} or None."""
     out = ["<b>Earnings trades (held a few weeks)</b>"]
