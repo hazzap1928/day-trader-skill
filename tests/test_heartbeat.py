@@ -11,6 +11,9 @@ from contextlib import redirect_stdout
 
 from _load import load, ROOT
 import test_autopilot
+import test_always_on
+import test_t212_place
+from test_t212_place import FakeResp
 
 hb = load("trader-broker", "heartbeat")
 ap = test_autopilot.ap
@@ -146,6 +149,62 @@ class InTheAutopilot(test_autopilot.PilotBase):
         self.assertIn("the outside check heard from this Mac again", log)
         self.assertNotIn("hc-ping", log)
         self.assertNotIn(URL, log)
+
+
+class AroundTheClock(test_always_on.Base):
+    """The heartbeat comes from the always-on loop itself: nights and weekends too, and only while it runs."""
+
+    def setUp(self):
+        super().setUp()
+        self._open = ap.heartbeat._open
+        self.pings = []
+        ap.heartbeat._open = lambda url, timeout: (self.pings.append(self.clock[0]), 200)[1]
+
+    def tearDown(self):
+        ap.heartbeat._open = self._open
+        super().tearDown()
+
+    def run_loop(self, start, minutes):
+        self.clock[0] = start
+        p = self.pilot()
+        p.hb = ap.heartbeat.Heartbeat(URL, clock=lambda: self.clock[0])
+        loops = int(minutes * 60 / ap.POLL_WAIT)            # each phone wait is 20 seconds
+        with redirect_stdout(io.StringIO()):
+            p.serve(max_loops=loops)
+        return p
+
+    def test_a_saturday_night_pings_every_five_minutes(self):
+        self.router.add("GET", "/equity/account/summary", FakeResp(test_t212_place.SUMMARY))
+        self.router.add("GET", "/equity/positions", FakeResp([]))
+        self.router.add("GET", "/equity/orders", FakeResp([]))
+        self.run_loop(test_always_on.utc(2026, 11, 7, 2, 0), 60)          # 2am to 3am UK, Saturday
+        self.assertFalse(any("serve:" in line for line in self.out), self.out[:5])   # a normal night
+        self.assertGreaterEqual(len(self.pings), 12)
+        gaps = [b - a for a, b in zip(self.pings, self.pings[1:])]
+        self.assertTrue(all(270 <= g <= 330 for g in gaps), gaps)
+
+    def test_a_weekday_night_pings_too(self):
+        self.router.add("GET", "/equity/account/summary", FakeResp(test_t212_place.SUMMARY))
+        self.router.add("GET", "/equity/positions", FakeResp([]))
+        self.router.add("GET", "/equity/orders", FakeResp([]))
+        self.run_loop(test_always_on.utc(2026, 11, 5, 23, 0), 30)         # 11pm UK, after the US close
+        self.assertGreaterEqual(len(self.pings), 6)
+
+    def test_trading_212_failing_all_night_is_not_a_down_alert(self):
+        # no fake replies at all: every pass of the loop fails reading the account, and "carries on"
+        self.run_loop(test_always_on.utc(2026, 11, 7, 2, 0), 30)
+        self.assertTrue(any("serve:" in line for line in self.out))       # it really was failing
+        self.assertGreaterEqual(len(self.pings), 5)
+
+    def test_a_stuck_loop_sends_nothing(self):
+        p = self.run_loop(test_always_on.utc(2026, 11, 7, 2, 0), 1)
+        n = len(self.pings)
+        self.clock[0] += 3600                               # an hour passes with the loop not running
+        self.assertEqual(len(self.pings), n)                # nothing else sends it: no thread, no timer
+        with open(os.path.join(ROOT, "trader-broker", "heartbeat.py")) as f:
+            src = f.read()
+        self.assertNotIn("threading", src)
+        self.assertNotIn("Timer(", src)
 
 
 class TheScript(unittest.TestCase):

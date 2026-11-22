@@ -295,7 +295,10 @@ The guard's protections:
   or the autopilot stuck or not starting).
 - **How:** `export HEALTHCHECK_URL=https://hc-ping.com/...` in `~/.zshrc`. `run-autopilot.sh` hands it to the
   autopilot as `AUTOPILOT_HEARTBEAT_URL` and unsets the original, so a terminal or a test run never pings;
-  `Pilot.listen` calls `Pilot.beat` (at most every 5 minutes). No address: nothing happens.
+  `Pilot.beat` (at most every 5 minutes) runs at the start of every pass of the always-on loop, of the
+  wait for the open and of the market-hours loop, and in `Pilot.listen`: 24/7, and a step that keeps failing
+  (Trading 212 down) does not stop it. It runs in the main loop (no thread), so a frozen autopilot stops it.
+  No address: nothing happens.
 - The address is private: never printed or logged. A failed ping is logged once until one gets through, and
   never stops anything. By hand: `python3 trader-broker/heartbeat.py ping`.
 - **Tests:** `tests/test_heartbeat.py`.

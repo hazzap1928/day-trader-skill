@@ -1822,6 +1822,7 @@ class Pilot(object):
         n = 0
         while max_loops is None or n < max_loops:
             n += 1
+            self.beat()          # first, so a step that keeps failing (e.g. Trading 212 down) never stops it
             try:
                 self.roll_day()
                 self.flush_phone()
@@ -1871,6 +1872,7 @@ class Pilot(object):
         if ny < open_at:
             self.say("waiting for the open (%s New York); answering the phone meanwhile" % st["opens"])
             while _ny() < open_at:
+                self.beat()
                 self.flush_phone()
                 self.catch_up_briefing()
                 self.catch_up_news()
@@ -1898,6 +1900,7 @@ class Pilot(object):
             ny = _ny()
             if ny >= summary_at:
                 break
+            self.beat()
             self.expire()
             if getattr(self, "net_down", False):
                 next_cycle = self.offline(next_cycle, step, last, summary_at)
