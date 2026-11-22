@@ -55,6 +55,7 @@ strategy or a feed, add it to "The parts" and give it its own section. Known loo
 | `trader-broker/account_budget.py` | budget and loss limits from the account value, every trading morning |
 | `trader-broker/day_risk.py` | writes the total-risk figures the buy checks read; the daily loss count is for day trades only: today's realised losses plus risk still open at the stops, for the daily loss limit (`state/day-risk.json`) |
 | `trader-broker/heartbeat.py` | the outside "is this Mac alive?" check: the always-on autopilot pings `HEALTHCHECK_URL` (healthchecks.io) every 5 minutes; when the pings stop, that service tells the owner. Off without the address |
+| `trader-broker/wallpaper.py` | the desktop wallpaper's status: the always-on autopilot POSTs running/stopped, value, day change, cash share, positions, last trade, a 30-value trend and up to 3 build items, every 15 minutes, after each trade and at shutdown. Off without the address and key |
 | `trader-broker/netwait.py` | no internet: check every 2 min for up to 30, then a BACK ONLINE message saying what was missed |
 | `trader-broker/go_live.py` | the user's own switch to live (checklist in `GO_LIVE.md`). **Claude never runs it** |
 | `trader-kronos/` | Kronos-small forecasts, **shadow only** (news runs may use it, `kronos_minutes`); own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
@@ -302,6 +303,24 @@ The guard's protections:
 - The address is private: never printed or logged. A failed ping is logged once until one gets through, and
   never stops anything. By hand: `python3 trader-broker/heartbeat.py ping`.
 - **Tests:** `tests/test_heartbeat.py`.
+
+## The wallpaper status (from 22 Nov 2026): `trader-broker/wallpaper.py`
+
+- **What:** the owner's desktop wallpaper shows the agent's status. The always-on autopilot sends an HTTPS
+  POST (`project: trading`, merged with what is stored) every 15 minutes (`Pilot.wallpaper`, from `Pilot.beat`),
+  at once after each buy or sale `watch_positions` sees (`last_trade`, UK time, e.g. "15:42 BUY NVDA"), and
+  `status: stopped` when `serve` ends (SIGTERM from launchd becomes a normal exit, `stop_on_sigterm`) or
+  starts not ready. Fields: status, mode (Practice on demo), value, day change since `start_value`, cash
+  share (`availableToTrade` + `reservedForOrders`), positions, a 30-value trend (`trader/state/wallpaper.json`),
+  `next` (up to 3 items: `"wallpaper": {"next": [...]}` in the config, else `wallpaper.NEXT`).
+- **Keys:** `WALLPAPER_URL` and `WALLPAPER_WRITE_KEY` in `trader/.env` (mode 600; `trader/` is git-ignored).
+  `run-autopilot.sh` reads only those two lines (never runs the file) and hands them over as
+  `AUTOPILOT_WALLPAPER_URL`/`_KEY`, so a shell or a test never sends. The key is never printed or logged;
+  the pre-push hook also refuses `WALLPAPER_WRITE_KEY=` lines and its value.
+- **Never slows trading:** the two account reads happen in the loop, the POST in a background thread (8 s
+  timeout, one at a time; a send while one is in flight is dropped). The shutdown send waits at most 4 s.
+  A failure is logged once until one gets through. By hand: `python3 trader-broker/wallpaper.py show`.
+- **Tests:** `tests/test_wallpaper.py`.
 
 ## The S&P 500 in reports (from 16 Nov 2026)
 

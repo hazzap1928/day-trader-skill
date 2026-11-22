@@ -30,11 +30,11 @@ BAD_LINE = [
     ("a Telegram bot token", re.compile(r"\b[0-9]{8,10}:[A-Za-z0-9_-]{35}\b")),
     ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("a key variable set to a value",
-     re.compile(r"(T212_API_KEY|T212_API_SECRET|TELEGRAM_BOT_TOKEN)\s*[=:]\s*[\"']?[A-Za-z0-9._+/-]{16,}")),
+     re.compile(r"(T212_API_KEY|T212_API_SECRET|TELEGRAM_BOT_TOKEN|WALLPAPER_WRITE_KEY)\s*[=:]\s*[\"']?[A-Za-z0-9._+/-]{16,}")),
     ("a long quoted key, secret or token",
      re.compile(r"(?i)(api[_-]?key|secret|token)[\"']?\s*[=:]\s*[\"'][A-Za-z0-9+/_.-]{24,}[\"']")),
 ]
-ENV_NAMES = ("T212_API_KEY", "T212_API_SECRET", "TELEGRAM_BOT_TOKEN")
+ENV_NAMES = ("T212_API_KEY", "T212_API_SECRET", "TELEGRAM_BOT_TOKEN", "WALLPAPER_WRITE_KEY")
 EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 OK_DOMAINS = ("users.noreply.github.com", "example.com", "example.org", "example.net", "sec.gov")
 

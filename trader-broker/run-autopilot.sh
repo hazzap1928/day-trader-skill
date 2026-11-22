@@ -19,6 +19,15 @@ fi
 hc="$(grep -E '^[[:space:]]*export[[:space:]]+HEALTHCHECK_URL=' "$envfile" | tail -1 || true)"
 if [[ -n "$hc" ]]; then eval "$hc"; export AUTOPILOT_HEARTBEAT_URL="${HEALTHCHECK_URL:-}"; unset HEALTHCHECK_URL; fi
 unset hc
+# optional: the desktop wallpaper's status (trader-broker/wallpaper.py). Only WALLPAPER_URL and
+# WALLPAPER_WRITE_KEY are read from trader/.env (git-ignored, owner only), never run as shell, and handed over under
+# other names so that only this launchd autopilot sends, never a shell or a test run.
+if [[ -f trader/.env ]]; then
+  wpu="$(grep -E '^[[:space:]]*(export[[:space:]]+)?WALLPAPER_URL=' trader/.env | tail -1 | cut -d= -f2- | tr -d "\"' \r" || true)"
+  wpk="$(grep -E '^[[:space:]]*(export[[:space:]]+)?WALLPAPER_WRITE_KEY=' trader/.env | tail -1 | cut -d= -f2- | tr -d "\"' \r" || true)"
+  if [[ -n "$wpu" && -n "$wpk" ]]; then export AUTOPILOT_WALLPAPER_URL="$wpu" AUTOPILOT_WALLPAPER_KEY="$wpk"; fi
+  unset wpu wpk
+fi
 if [[ "${T212_ENV:-demo}" != "demo" ]]; then
   echo "autopilot: T212_ENV is ${T212_ENV}; the autopilot runs on demo only. Not starting." >&2
   exit 2

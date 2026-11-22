@@ -45,6 +45,7 @@ import json
 import os
 import re
 import secrets as _rand
+import signal
 import subprocess
 import sys
 import time
@@ -90,6 +91,7 @@ net = t212.net_module()
 evidence = _load("trader-broker", "evidence")
 allocation = _load("trader-broker", "allocation")
 heartbeat = _load("trader-broker", "heartbeat")
+wallpaper = _load("trader-broker", "wallpaper")
 KRONOS_BUDGET = 9 * 60          # seconds of Kronos shadow verdicts a cycle at most (it never blocks a trade)
 KRONOS_NEEDS = 300              # one verdict takes about this long on this Mac: none starts with less time left
 tk = t212.ticket_module()
@@ -307,6 +309,7 @@ class Pilot(object):
         self.s = settings(self.cfg)
         self.state = self._load_state()
         self.hb = heartbeat.Heartbeat(None)     # main() gives serve the outside check's address (HEALTHCHECK_URL)
+        self.wp = wallpaper.Reporter(None, None)   # main() gives serve the wallpaper address and key (.env)
         M.use(self.sd)
 
     # ------------------------------------------------------------ files
@@ -966,6 +969,26 @@ class Pilot(object):
             self._hb_said = True
         elif res == "failed" and self.hb.fails == 1:
             self.say("heartbeat: the ping to the outside check failed; trying again every 5 minutes")
+        self.wallpaper()
+
+    def wallpaper(self, force=False, last_trade=None, positions=None):
+        """The desktop wallpaper's status (trader-broker/wallpaper.py): every 15 minutes, and at once after a
+        trade. Two reads from Trading 212 here, the send itself in the background. Never raises."""
+        if not self.wp.on or not (force or self.wp.due()):
+            return
+        fields = {"next": wallpaper.next_items(self.cfg)}
+        if last_trade:
+            fields["last_trade"] = last_trade
+        try:
+            summary = self.client.get(t212.SUMMARY) or {}
+            if positions is None:
+                positions = self.client.get(t212.POSITIONS) or []
+            start = self.state.get("start_value") if self.state.get("day") == _ny().date().isoformat() else None
+            fields.update(wallpaper.account_fields(summary, positions, start))
+        except Exception as e:
+            self.say("wallpaper: account not read (%s); sending the status without it"
+                     % t212.scrub(e, self.client._secrets))
+        self.wp.send(fields)
 
     def listen(self, wait):
         """Wait up to `wait` seconds for taps and commands from your phone, and act on them."""
@@ -1128,6 +1151,7 @@ class Pilot(object):
         self.save()
         if before is None:
             return
+        trade = None
         for t in sorted(set(before) | set(now)):
             b, n = (before.get(t) or {}).get("qty", 0), (now.get(t) or {}).get("qty", 0)
             if n > b + 1e-9:
@@ -1135,12 +1159,16 @@ class Pilot(object):
                 self.event("FILLED (demo): bought %s %s at about $%s; you hold %s"
                            % (t212._qty(n - b), t, t212._fmt((now[t] or {}).get("avg")), t212._qty(n)),
                            push=phone is not None, phone=phone)
+                trade = "BUY " + M.ticker(t)
             elif n + 1e-9 < b:
                 px = (now.get(t) or before.get(t) or {}).get("price")
                 phone = self.sale_message(t, b - n, px)
                 self.event("EXIT (demo): sold %s %s near $%s; you hold %s"
                            % (t212._qty(b - n), t, t212._fmt(px), t212._qty(n) if n else "none"),
                            push=phone is not None, phone=phone)
+                trade = "SELL " + M.ticker(t)
+        if trade:
+            self.wallpaper(force=True, last_trade="%s %s" % (_local(_now()).strftime("%H:%M"), trade), positions=pos)
 
     def _drift_ticker(self, t212_ticker):
         """True for a holding (drift, news, or an unknown label): its buy and sale have their own messages."""
@@ -1970,13 +1998,19 @@ def main(argv=None, environ=None):
         cfg = t212.with_universe(tk.read_config(os.path.join(a.state_dir, "config.json")), a.state_dir)
         problems = check_ready(cfg, client.env, phone)
         if problems and a.cmd == "serve" and phone is not None:
+            wallpaper_reporter(a.state_dir, environ, client, lambda text: None).stopped()   # not trading
             return serve_unready(a.state_dir, client, phone, problems, environ)
         if problems:
             raise PilotError("not starting:\n  - " + "\n  - ".join(problems))
         pilot = Pilot(client, phone, a.state_dir)
         if a.cmd == "serve":
             pilot.hb = heartbeat.Heartbeat(heartbeat.url_from(environ, heartbeat.SERVE_ENV))
-            pilot.serve()
+            pilot.wp = wallpaper_reporter(a.state_dir, environ, client, pilot.say)
+            stop_on_sigterm()
+            try:
+                pilot.serve()
+            finally:
+                pilot.wp.stopped()               # the wallpaper shows "stopped"; at most a few seconds
             return 0
         if a.cmd == "open-check":
             text = "\U0001f9ea <b>Test, not the real open</b>\n" + pilot.open_message()
@@ -2012,6 +2046,22 @@ def main(argv=None, environ=None):
         sys.stderr.write("autopilot: %s\n" % msg)
         phone_mod.push(a.state_dir, M.stopped(), environ=environ)
         return 2
+
+
+def wallpaper_reporter(state_dir, environ, client, log):
+    url, key = wallpaper.address(environ)
+    return wallpaper.Reporter(url, key, os.path.join(state_dir, "state", "wallpaper.json"), log=log,
+                              mode="Practice" if client.env == AUTOPILOT_ENV else "Live")
+
+
+def stop_on_sigterm():
+    """launchd stops the autopilot with SIGTERM: turn it into a normal exit, so the "stopped" status is sent."""
+    def stop(signum, frame):
+        raise SystemExit(0)
+    try:
+        signal.signal(signal.SIGTERM, stop)
+    except (ValueError, OSError):
+        pass
 
 
 def serve_unready(state_dir, client, phone, problems, environ, max_loops=None):
