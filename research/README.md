@@ -241,6 +241,40 @@ known for sudden crashes (2009 is the famous one).
 members (`trader/research-data/prices_removed.json`, `sp500-history/`) are kept for the next test: any
 backtest that picks from the S&P 500 should use the real index (`members(d, "pit")` in `momentum_12_1.py`).
 
+## Insider cluster buys, with the real index (22 Nov 2026): no edge
+
+`research/insider_cluster.py` (data: `form4_fetch.py`, `insider_extract.py`). The owner's rule: at least 2
+different directors or officers buying shares in the open market (Form 4 code P) within 30 days, $100k or more
+together, dated by the filing date (when it became public), bought at the next open, held 20, 40 or 60 trading
+days with the drift stop (3 x ATR), 0.2% costs each way. Sales, exercises, grants, joint filings, 10% owners who
+are not officers, and fund-like names left out. Universe: the S&P 500 as it was on the filing date, $5+, $20m a
+day. Rules set on 2019-2023, checked once on 2024 to 15 Sep 2026 (the SEC's newest quarter ends 30 Sep; no
+October data yet).
+
+- **Signals:** 588 in all, about 72 a year (of 10,682 clusters in all US companies, 94% were not in the S&P 500).
+  Lumpy: 100 in 2020 (51 in March 2020 alone), 36 in 2021.
+- **2019-2023, per trade, against the S&P 500 over the same days:** 20 days -0.34%, 40 days -0.90%, 60 days
+  +0.17% (95% range -1.5 to +1.9). None clearly above zero. Random S&P buys on the same days did almost as well
+  (cluster buys come after falls, and so does the rebound).
+- **The 10-slot book, 2019-2023:** +54% (20 days), +36% (40), +79% (60) against the tracker's +110%; worst drop
+  about -52% (March 2020) against the tracker's -34%. Worst single trade -47% (a gap through the stop).
+- **Chosen on 2019-2023: the 60-day hold.** Its one check on 2024-2026: **-1.09% a trade** against the S&P 500,
+  48% of trades made money (average win +14.0% against average loss -9.8%), book +24% against the tracker's
+  +60%. It failed.
+- The 20-day hold (not chosen) looked best on 2024-2026 (+0.37% a trade, 95% range -0.8 to +1.5; book +60.5%,
+  equal to the tracker); picking it after seeing that would be hindsight.
+- **At 0.3% slippage a side:** every hold is behind the S&P 500 in both periods (the chosen 60 days: -1.59% a
+  trade in 2024-2026, book +17% against +60%).
+- **A few winners:** in 5 of the 6 books (period x hold) the 5 best trades made more than the whole profit, so
+  without them the profit turns negative; the exception is 20 days in 2024-2026. Sectors: Financials (2019-2023) and companies that have
+  since left the index lost most; no single sector carried the result.
+- **Overlap with drift:** 5 to 8 signals a period landed on a stock drift's 10-slot book was holding (about 2 to
+  4%); about 40 a period fell within some drift signal's 20 days.
+- **Limits:** about half the companies that left the index have no Yahoo prices (63 signals had no prices or
+  failed the filters); a handful of very large "director" buys (Kraft Heinz, TransDigm, $60m to $420m) are
+  probably fund-linked; the filing date has no time of day, so the next open is used.
+- **Verdict: not worth a shadow trial.** No edge over the S&P 500 or random buys before slippage, worse after.
+
 ## Review checkpoint (from 22 Nov 2026)
 
 The agent's own trades decide what stays. At **20 or more completed drift + news trades**
@@ -285,6 +319,8 @@ python3 research/pead_stop.py --slip 0.3 --only none,3x,4x                   # t
 python3 research/open_timing.py                                             # opening minutes against later (last ~30 days)
 python3 research/three_strategies.py mom pull && python3 research/momentum_check.py
 python3 research/momentum_fetch_removed.py && python3 research/momentum_12_1.py   # 12-1 momentum, real index (22 Nov)
+SEC_USER_AGENT="name email" python3 research/form4_fetch.py                  # SEC Form 4 bulk data (contact required)
+python3 research/insider_extract.py && python3 research/insider_cluster.py   # insider cluster buys (22 Nov); --slip 0.3
 python3 research/pead_run.py && python3 research/pead_tracker.py
 caffeinate -i -s nice -n 19 trader-kronos/.venv/bin/python research/kronos_backtest.py   # about 4 hours
 python3 research/kronos_risk_check.py trader/research-data                 # from the Kronos cache
