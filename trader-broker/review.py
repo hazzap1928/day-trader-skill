@@ -203,7 +203,7 @@ def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None, watch=Non
                "sell_date": None, "status": (page or {}).get("status"), "market_pct": None,
                "verdict": (verdicts or {}).get(pos.get("symbol")) if page is not None and H.is_hold(page) else None,
                "watch": _watch(watch, page), "replay": _replay(page),
-               "earnings": (earnings or {}).get((page or {}).get("id"))}
+               "earnings": (earnings or {}).get((page or {}).get("id")), "chart": _chart(page)}
         sell = H.sell_date(page) if page else None
         if sell:
             row["sell_date"] = sell.isoformat()
@@ -271,6 +271,18 @@ def _replay(page):
             "median_pct": {k: (r["rules"].get(k) or {}).get("median_pct") for k in ("fixed", "rising", "none")}}
 
 
+def _chart(page):
+    """The chart labels at the buy (shadow.py, page["chart"]) and whether they are new (last 36 hours). Or None."""
+    c = (page or {}).get("chart") or {}
+    if c.get("tags") is None:
+        return None
+    try:
+        new = (datetime.datetime.now().timestamp() - float(c.get("at") or 0)) < 36 * 3600
+    except (TypeError, ValueError):
+        new = False
+    return {"tags": c["tags"], "falling": bool(c.get("falling")), "new": new}
+
+
 def _watch(watch, page):
     """A holding's new filings and headlines (trader-broker/hold_watch.py), or None. Shown only."""
     items = (watch or {}).get((page or {}).get("id"))
@@ -310,6 +322,8 @@ def text(r):
             L.append("         today's verdict from the news runs: %s (confidence %s): %s%s" % (
                 row["verdict"].get("verdict"), row["verdict"].get("confidence"), row["verdict"].get("why"),
                 "; written down only, the date rule decides" if row["strategy"] == "drift" else ""))
+        if row.get("chart"):
+            L.append("         chart when bought (labels only): %s" % (", ".join(row["chart"]["tags"]) or "no pattern"))
         if row.get("earnings"):
             L.append("         " + _load("trader-broker", "earnings_watch").words(row["earnings"]))
         if row.get("replay"):

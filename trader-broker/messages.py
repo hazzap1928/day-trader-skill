@@ -977,7 +977,8 @@ def daily_review(r):
             if row.get("strategy") == "drift":
                 read += ". Noted only: this one is sold by its date rule"
         items.append("%s (%s): %s%s; %s%s%s%s%s" % (company(row["symbol"]), _KIND.get(row.get("strategy"), "a label I don't know"),
-                                                   gain, mkt, net, sell, read, replay_words(row.get("replay")),
+                                                   gain, mkt, net, sell, read,
+                                                   chart_words(row.get("chart")) + replay_words(row.get("replay")),
                                                    watch_words(row.get("watch")) + earnings_words(row.get("earnings"))))
     if not r.get("rows"):
         items.append("Nothing is held")
@@ -1031,6 +1032,22 @@ def earnings_words(e):
     soon = "" if days is None else " today" if days == 0 else " in %d trading day%s" % (days, "" if days == 1 else "s")
     return ". \U0001f4c5 It reports results on %s%s%s%s, before its sell date: the share can move a lot that day" % (
         esc(short_day(e["date"])), when, soon, sure)
+
+
+_CHART = {"uptrend": "in an uptrend", "below_ma50": "under its 50-day average",
+          "down_10pct_5d": "down 10% or more in the week before", "new_20d_low": "at a 20-day low",
+          "breakout_20d": "at a new 20-day high", "bull_flag": "resting after a sharp run-up",
+          "reclaim_ma20": "just back above its 20-day average", "oversold": "oversold",
+          "oversold_bounce": "bouncing from oversold"}
+
+
+def chart_words(c):
+    """The chart labels at the buy, told once (the review after they are worked out). For information only."""
+    if not c or not c.get("new"):
+        return ""
+    tags = [_CHART.get(t, t) for t in c.get("tags") or []]
+    return ". %sChart when bought: %s (labels only, for information)" % (
+        "⚠️ " if c.get("falling") else "", esc(", ".join(tags) or "no clear pattern"))
 
 
 def replay_words(rp):

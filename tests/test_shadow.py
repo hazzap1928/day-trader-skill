@@ -142,7 +142,7 @@ class Replay(Base):
         self.write([page("AAA-1", buy_price=100.0), page("BBB-1", strategy="news", buy_price=100.0),
                     page("CCC-1", strategy="intraday", buy_price=100.0), page("DDD-1", status="waiting", buy_price=100.0)])
         calls = []
-        self.assertEqual(sh.replay_pass(self.sd, bars_fn=bars_fn(calls=calls), say=self.say), 2)
+        self.assertEqual(sh.replay_pass(self.sd, bars_fn=bars_fn(calls=calls), say=self.say), 4)   # 2 replays + 2 charts
         pages = self.pages()
         r = pages["AAA-1"]["replay"]
         self.assertEqual((r["runs"], r["days"], r["stop"]), (1000, 20, 90.0))     # 20 Nov to 18 Dec, holiday out
@@ -152,6 +152,23 @@ class Replay(Base):
         self.assertNotIn("replay", pages["CCC-1"])
         self.assertNotIn("replay", pages["DDD-1"])
         self.assertEqual(sh.replay_pass(self.sd, bars_fn=bars_fn(), say=self.say), 0)    # once a page
+
+    def test_chart_labels_come_with_the_replay_from_one_fetch(self):
+        self.write([page("AAA-1", buy_price=100.0)])
+        calls = []
+        self.assertEqual(sh.replay_pass(self.sd, bars_fn=bars_fn(calls=calls), say=self.say), 2)
+        self.assertEqual(len(calls), 1)
+        c = self.pages()["AAA-1"]["chart"]
+        self.assertEqual((c["version"], c["falling"]), (1, False))
+        self.assertLess(c["as_of"], "2026-11-20")
+        rv = load("trader-broker", "review")
+        M = load("trader-broker", "messages")
+        got = rv._chart({"chart": c})
+        self.assertTrue(got["new"])
+        self.assertIn("Chart when bought:", M.chart_words(got))
+        self.assertIn("⚠️", M.chart_words(dict(got, falling=True, tags=["below_ma50"])))
+        self.assertEqual(M.chart_words(dict(got, new=False)), "")
+        self.assertIsNone(rv._chart({}))
 
     def test_a_failure_is_tried_three_times_then_left(self):
         self.write([page("AAA-1")])                                    # no buy price
@@ -166,6 +183,7 @@ class Replay(Base):
         sh.replay_pass(self.sd, bars_fn=bars_fn(), say=self.say)
         after = dict(self.pages()["AAA-1"])
         after.pop("replay")
+        after.pop("chart")
         self.assertEqual(after, before)
 
     def test_the_review_and_phone_words(self):

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Three review-only records on the holdings pages: Kronos's opinion of each drift and news buy, the "stop
-shadow" of each holding its stop sold, and the sell-rule replay of each holding. SHADOW ONLY: nothing here
-places, cancels or changes an order, blocks a buy, or changes a stop, a sell date or a status. It only adds three fields to pages in
-trader/state/holdings.json (and a line to holdings-log.jsonl).
+"""Review-only records on the holdings pages: Kronos's opinion of each drift and news buy, the "stop shadow"
+of each holding its stop sold, and the sell-rule replay and the chart labels of each holding. SHADOW ONLY: nothing here
+places, cancels or changes an order, blocks a buy, or changes a stop, a sell date or a status. It only adds
+these fields to pages in trader/state/holdings.json (and a line to holdings-log.jsonl).
 
   page["kronos"]       Kronos's forecast for the share over its planned holding, from the daily bars BEFORE
                        the buy day (what it would have said that morning; no hindsight):
@@ -23,6 +23,8 @@ trader/state/holdings.json (and a line to holdings-log.jsonl).
                        date: how often the stop is hit first, and the typical result after fees with the stop as
                        set ("fixed"), a stop raised as the price rises ("rising") and no stop ("none"). Once a page;
                        after 3 failed tries: {"error", "tries"}.
+  page["chart"]        chart labels at the buy (trader-scanner/chart.py, version 1), from the daily closes BEFORE
+                       the buy day: {"version", "tags", "falling", "nums", "as_of"}. Once a page; labels only.
 
 The autopilot starts `shadow.py run` once a day after the daily review, as a separate program, so a slow
 Kronos run never holds up the autopilot. Kronos needs trader-kronos/.venv; without it the opinion is skipped.
@@ -227,28 +229,72 @@ def replay_one(page, bars_fn):
     return out
 
 
+def wants_chart(page):
+    if page.get("strategy") not in HOLD or page.get("status") == "waiting":
+        return False
+    c = page.get("chart") or {}
+    return c.get("tags") is None and int(c.get("tries") or 0) < MAX_TRIES
+
+
+def chart_one(page, bars_fn, bars=None):
+    """The chart labels (trader-scanner/chart.py) from the daily closes strictly before the buy day."""
+    buy = _date(page.get("buy_date"))
+    if not buy:
+        raise ValueError("no buy date")
+    if bars is None:
+        bars = bars_fn(page["symbol"], buy - datetime.timedelta(days=BARS_BACK_DAYS), buy - datetime.timedelta(days=1))
+    days = [d for d in sorted(bars) if d < buy]
+    out = _load("trader-scanner", "chart").labels([bars[d][3] for d in days])
+    out["as_of"] = days[-1].isoformat()
+    return out
+
+
+def _failed_field(page, field, e):
+    r = page.get(field) or {}
+    return {"error": str(e)[:200], "tries": int(r.get("tries") or 0) + 1, "at": int(time.time())}
+
+
 def replay_pass(sd, bars_fn=None, say=print):
-    """The sell-rule replay on every drift and news page that has none yet. Returns the number written."""
+    """The sell-rule replay and the chart labels on every drift and news page that lacks them. One daily-bar
+    fetch a page. Returns the number of fields written."""
     H = _hold()
-    pages = [p for p in H.load(sd)["pages"] if wants_replay(p)]
+    pages = [p for p in H.load(sd)["pages"] if wants_replay(p) or wants_chart(p)]
     if not pages:
         return 0
+    fn = bars_fn or _bars_fn()
     got = {}
     for p in pages:
+        g, bars = got.setdefault(p["id"], {}), None
+        buy = _date(p.get("buy_date"))
         try:
-            got[p["id"]] = dict(replay_one(p, bars_fn or _bars_fn()), at=int(time.time()))
+            if buy:
+                bars = fn(p["symbol"], buy - datetime.timedelta(days=BARS_BACK_DAYS), buy - datetime.timedelta(days=1))
         except Exception as e:
-            r = p.get("replay") or {}
-            got[p["id"]] = {"error": str(e)[:200], "tries": int(r.get("tries") or 0) + 1, "at": int(time.time())}
+            bars = e
+        def once(*a, _b=bars):
+            if isinstance(_b, Exception):
+                raise _b
+            return _b if _b is not None else fn(*a)
+        if wants_replay(p):
+            try:
+                g["replay"] = dict(replay_one(p, once), at=int(time.time()))
+            except Exception as e:
+                g["replay"] = _failed_field(p, "replay", e)
+        if wants_chart(p):
+            try:
+                g["chart"] = dict(chart_one(p, once), at=int(time.time()))
+            except Exception as e:
+                g["chart"] = _failed_field(p, "chart", e)
     n = 0
     with H.locked(sd):
         doc = H.load(sd)
         for page in doc["pages"]:
-            if page.get("id") in got and wants_replay(page):
-                page["replay"] = got[page["id"]]
-                H.log(sd, "replay", id=page["id"], symbol=page.get("symbol"), strategy=page.get("strategy"),
-                      replay=page["replay"])
-                n += 1
+            for field, wants in (("replay", wants_replay), ("chart", wants_chart)):
+                if field in got.get(page.get("id"), {}) and wants(page):
+                    page[field] = got[page["id"]][field]
+                    H.log(sd, field, id=page["id"], symbol=page.get("symbol"), strategy=page.get("strategy"),
+                          **{field: page[field]})
+                    n += 1
         if n:
             H.save(sd, doc)
     return n
@@ -347,7 +393,7 @@ def run(sd, say=print):
     except Exception as e:
         say("shadow: stop shadow failed (%s)" % str(e)[:200])
     try:
-        say("shadow: %d sell-rule replay(s) written" % replay_pass(sd, say=say))
+        say("shadow: %d sell-rule replay(s) and chart label(s) written" % replay_pass(sd, say=say))
     except Exception as e:
         say("shadow: sell-rule replays failed (%s)" % str(e)[:200])
     try:
@@ -368,6 +414,7 @@ def show(sd):
         if s:
             print("       stop shadow: %s" % json.dumps(s, sort_keys=True))
         print("       replay: %s" % _holds().words(p.get("replay")))
+        print("       chart when bought: %s" % _load("trader-scanner", "chart").words(p.get("chart")))
 
 
 def time_one(symbol):
