@@ -36,15 +36,21 @@ UTC_0935 = float(calendar.timegm((2026, 11, 5, 14, 35, 0)))
 NY_0935 = datetime.datetime(2026, 11, 5, 9, 35)
 TICKER = "TSLA_US_EQ"
 FULL = dict(test_t212_place.SUMMARY, cash={"availableToTrade": 5000.0, "reservedForOrders": 0, "inPies": 0})
-SRC = [{"title": "Tesla sets the robotaxi launch date", "url": "https://example.com/tsla", "date": "2026-11-03"}]
+SRC = [{"title": "Tesla sets the robotaxi launch date", "url": "https://example.com/tsla", "date": "2026-11-03"},
+       {"title": "Analysts expect a small robotaxi launch", "url": "https://example.com/tsla-analysts", "date": "2026-11-04"}]
 
 
 def idea(**over):
+    """A good idea as Claude would give it. `confidence=` sets the edge rating (the one that decides a buy)."""
+    if "confidence" in over:                 # the code ignores a bare "confidence" from Claude; kept for _idea_line
+        over["edge_confidence"] = over["confidence"]
     return dict({"symbol": "TSLA", "company": "Tesla", "summary": "Robotaxi launch in two weeks.",
                  "why": "The robotaxi launch could lift sales expectations.", "event": "Robotaxi launch event",
                  "event_date": "2026-11-19", "wrong_if": "The launch is delayed or cancelled.",
                  "sell_rule": "Sell a week after the launch.", "sell_date": "2026-11-27", "sources": list(SRC),
-                 "confidence": "high", "confidence_why": "The date is confirmed by the company.",
+                 "date_confidence": "high", "date_why": "The date is confirmed by the company.",
+                 "edge_confidence": "high", "edge_why": "Analysts expect a small launch against the published plan.",
+                 "edge_source": SRC[1]["url"], "confidence": "high",
                  "moved_pct": 1.0, "moved_note": "Up about 1% since the date was announced."}, **over)
 
 

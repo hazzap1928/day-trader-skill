@@ -159,7 +159,7 @@ class ARunMustSearch(NewsBase):
             web=web)
         self.assertEqual([r["symbol"] for r in doc["ideas"]], ["AAPL"])
         self.assertEqual([(x["title"], x["opened"]) for x in doc["ideas"][0]["sources"]], [("Opened", True)])
-        self.assertIn("none of its 1 source was opened in this run", doc["rejected"][0]["why_not"])
+        self.assertIn("none of its 2 sources was opened in this run", doc["rejected"][0]["why_not"])
         run = doc["runs"]["main"]["web"]
         self.assertEqual((run["searches"], run["opened"]), (2, ["https://example.com/aapl"]))
         self.assertIn("2 web searches, 1 page opened", " ".join(self.said_news))
@@ -255,9 +255,22 @@ class AVerdictOnEveryHolding(Holdings):
             self.assertIn("\"verdicts\"", q)
             self.assertIn("keep | watch | sell", q)
 
+    def test_a_verdicts_confidence_uses_the_same_scale_as_an_ideas_edge(self):
+        q = news.prompt(news.datetime.date(2026, 11, 5), {"TSLA": "Tesla"}, news.settings({}),
+                        held=[{"symbol": "TSLA", "strategy": "news"}])
+        self.assertIn("A verdict's \"confidence\" uses the same scale as an idea's edge", q)
+        self.assertIn("Most verdicts should be low; medium should be uncommon, high rare.", q)
+        web = {"searches": 2, "fetches": 1, "opened": ["https://example.com/e"], "failed": [], "seen": [SRC["url"]]}
+        self.run_news(answer(verdicts=[verdict(confidence="medium"),                       # its page was only seen
+                                       verdict("AAPL", "watch", why="Guidance was cut on Tuesday.", confidence="high",
+                                               sources=[dict(SRC, url="https://example.com/e")])]), web=web)
+        got_ = {r["symbol"]: r["confidence"] for r in self.rows()}
+        self.assertEqual(got_, {"TSLA": "low", "AAPL": "medium"})      # no opened page: low; one opened page: medium
+
     def test_each_verdict_is_written_down_with_its_reason_confidence_and_sources(self):
         doc = self.run_news(answer(verdicts=[verdict(), verdict("AAPL", "watch", why="Guidance was cut on Tuesday.",
-                                                                confidence="high")]))
+                                                                confidence="high",
+                                                                sources=[dict(SRC), dict(SRC, url="https://example.com/e")])]))
         got_ = {r["symbol"]: r for r in self.rows()}
         self.assertEqual({k: (r["verdict"], r["strategy"], r["confidence"], r["kind"], r["page"]) for k, r in got_.items()},
                          {"TSLA": ("keep", "news", "medium", "main", "p1"), "AAPL": ("watch", "drift", "high", "main", "p2")})

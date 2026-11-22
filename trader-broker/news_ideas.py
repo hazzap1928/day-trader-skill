@@ -63,6 +63,7 @@ DEFAULTS = {"enabled": True, "buy_enabled": False, "buy_at": "09:35", "max_ideas
 LAST_BUY = "15:30"               # New York: no news buy after this
 KINDS = ("main", "update")
 LEVELS = ("high", "medium", "low")
+DATE_LEVELS = ("medium", "high")      # an idea is bought only when its date is at least reported (22 Nov 2026)
 VERDICTS = ("keep", "watch", "sell")   # what a run says about each holding
 MAIN_FROM = "00:00"              # New York: the main run belongs to the day that has begun there
 STALE_AFTER = 20 * 60            # seconds past its time limit before a run marked "running" counts as dead
@@ -288,6 +289,43 @@ def log_run(sd, **fields):
         fh.write(json.dumps(dict(fields, at=int(_now())), sort_keys=True) + "\n")
 
 
+def recent_queries(sd, today, days=3, limit=30):
+    """The web searches of the runs on the last `days` run days before `today`, newest first, each once
+    (ignoring case). Shown to the next main run so it does not search the same words again."""
+    rows = []
+    try:
+        with open(os.path.join(_dir(sd), "runs.jsonl"), encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and str(r.get("day") or "") < str(today) and isinstance(r.get("web"), dict):
+                    rows.append(r)
+    except OSError:
+        return []
+    keep_days = sorted({r["day"] for r in rows}, reverse=True)[:days]
+    out, seen = [], set()
+    for r in sorted((r for r in rows if r["day"] in keep_days), key=lambda r: (r["day"], r.get("at") or 0), reverse=True):
+        for q in r["web"].get("queries") or []:
+            q = _text(q)
+            if q and q.lower() not in seen:
+                seen.add(q.lower())
+                out.append(q)
+    return out[:limit]
+
+
+# Kinds of event a main run starts with: two a day, in turn, so the searches do not settle into one rut
+EVENT_KINDS = ("drug and regulator decisions", "product and game launches", "contract wins and government awards",
+               "index additions and removals", "investor and analyst days", "court rulings and patent decisions",
+               "medical and industry conferences with new data", "mergers, spin-offs and shareholder votes")
+
+
+def kinds_for(day):
+    i = (day.toordinal() * 2) % len(EVENT_KINDS)
+    return EVENT_KINDS[i], EVENT_KINDS[(i + 1) % len(EVENT_KINDS)]
+
+
 def log_buy(sd, **fields):
     with open(os.path.join(_dir(sd), "buys.jsonl"), "a", encoding="utf-8") as fh:
         fh.write(json.dumps(dict(fields, at=int(_now())), sort_keys=True) + "\n")
@@ -366,10 +404,21 @@ def todays(rows, day):
     return [r for r in rows if r.get("day") == str(day)]
 
 
+def rated_to_buy(row, s):
+    """Both ratings high enough: the edge ("confidence") at a level news.buy_confidence asks for, AND the
+    date rated medium or high (DATE_LEVELS)."""
+    return row.get("confidence") in s["buy_levels"] and row.get("date_confidence") in DATE_LEVELS
+
+
+def held_back_by_date(row, s):
+    """The edge would be bought, but the date rating is low (or not given): logged, never bought."""
+    return row.get("confidence") in s["buy_levels"] and row.get("date_confidence") not in DATE_LEVELS
+
+
 def in_book(row, s):
     """Would this passed idea be bought with buying on? Only those count toward the pretend book and the
-    caps: the right confidence, and not dropped by the update."""
-    return (row.get("verdict") == "passed" and row.get("confidence") in s["buy_levels"]
+    caps: both ratings high enough, and not dropped by the update."""
+    return (row.get("verdict") == "passed" and rated_to_buy(row, s)
             and row.get("state") not in ("dropped", "unconfirmed"))
 
 
@@ -383,8 +432,7 @@ def buyable(doc, s):
             up.get("status") or "it did not run")
     if up.get("late"):
         return [], "the update finished after the buy time, so nothing is bought on news today"
-    return [r for r in doc.get("ideas") or [] if r.get("state") in ("kept", "new")
-            and r.get("confidence") in s["buy_levels"]], None
+    return [r for r in doc.get("ideas") or [] if r.get("state") in ("kept", "new") and rated_to_buy(r, s)], None
 
 
 # ---------------------------------------------------------------- the question for Claude
@@ -399,8 +447,9 @@ def names_for(sd, allowed):
     return {s: names.get(s, "") for s in sorted(allowed)}
 
 
-def prompt(day, names, s, held=(), topics=True):
-    """The whole question. The answer must be one JSON object and nothing else."""
+def prompt(day, names, s, held=(), topics=True, recent=()):
+    """The whole question. The answer must be one JSON object and nothing else. `recent`: the web searches
+    of the last few runs, so this one searches differently."""
     lines = [
         "Today is %s. You are a research assistant for a PRACTICE (demo) share account. Nothing you write places "
         "an order: a separate program checks every idea against fixed rules." % day.strftime("%A %d %B %Y"),
@@ -410,6 +459,20 @@ def prompt(day, names, s, held=(), topics=True):
         "product or game release, a drug or regulator decision, a launch, a contract, an index change, an investor "
         "day, a court ruling). Any kind of event. Read recent news, company reports, filings and event calendars."
         % s["max_ideas"],
+        "",
+        "WHERE TO LOOK.",
+        "- Prefer events that are large for the company's size: one drug decision can move a $10B company but "
+        "hardly a $150B one. Say in \"why\" roughly how big the event is next to the company (for example the "
+        "product's expected yearly sales against the company's yearly sales).",
+        "- Start today with these kinds of event, which change from day to day: %s and %s. Other kinds are "
+        "still welcome." % kinds_for(day),
+    ]
+    if recent:
+        lines += ["- Earlier runs already made the searches below. Do not repeat them word for word: use "
+                  "different words, other kinds of event and other companies, so you find what they missed. "
+                  "Searching again for news on one company is fine when you are checking a specific idea.",
+                  "  " + " | ".join(recent)]
+    lines += [
         "",
         "RULES.",
         "- Only companies from the list, by their ticker. Fewer good ideas beat more weak ones; none is a fine answer.",
@@ -425,8 +488,22 @@ def prompt(day, names, s, held=(), topics=True):
         "and at most %d days from today." % s["max_hold_days"],
         "- The sell date should be within %d trading days after the event. If you want to hold longer, say why "
         "in \"long_hold_reason\"; without a reason a longer hold is turned down." % s["max_days_after_event"],
-        "- \"confidence\" is low, medium or high: how sure you are that the event happens as dated AND that it "
-        "is not already in the price. \"confidence_why\" is one line. Be strict: high should be rare.",
+        "- Rate each idea twice, each low, medium or high with a one-line reason:",
+        "  - \"date_confidence\" (reason in \"date_why\"): how sure you are that the event happens on the date "
+        "given. high: the company or the regulator has confirmed the date. medium: reliable reports give the date "
+        "but it is not confirmed. low: the date is an estimate or a window.",
+        "  - \"edge_confidence\" (reason in \"edge_why\", and in \"edge_source\" the exact URL of the opened page "
+        "that backs that reason): how sure you are that the market is underestimating the event, so the price is "
+        "not fully set for it. Only this rating decides whether the idea is bought.",
+        "    - low: you cannot name a specific, sourced reason the market is underestimating it.",
+        "    - medium: you can name ONE specific reason, backed by a page you opened in this run, that the market "
+        "may be underestimating the event (for example, analyst expectations that look low against the "
+        "published data). \"The shares fell recently\" or \"the outcome is uncertain\" alone are not enough.",
+        "    - high: as medium, and the evidence is clear and comes from more than one source you opened.",
+        "    - That an event is public does not by itself make it low, but a widely expected event needs a "
+        "specific reason it is not fully in the price. General market mood (a falling or jumpy market) is not "
+        "part of either rating: say it in \"notes\".",
+        "  - Most ideas should be low; medium should be uncommon, high rare.",
         "- \"moved_pct\" is your best estimate of how far the share price has ALREADY moved because of this news "
         "(a number, percent, negative for a fall; 0 if not at all), with one line in \"moved_note\" saying since "
         "when and where you saw it.",
@@ -443,7 +520,13 @@ def prompt(day, names, s, held=(), topics=True):
                   "reason is broken, or dated news makes holding it clearly worse). Give a one-line reason in "
                   "\"why\", a \"confidence\" (low, medium or high) and at least one dated source you opened in this "
                   "run. Say \"sell\" only with such a source. You decide nothing: the owner is asked, or the verdict "
-                  "is only written down."]
+                  "is only written down.",
+                  "A verdict's \"confidence\" uses the same scale as an idea's edge: low unless you can name ONE "
+                  "specific new reason for the verdict, given in \"why\" and backed by a page you opened in this run "
+                  "(medium); high only when the evidence is clear and comes from more than one source you opened. "
+                  "\"Nothing new\", \"the shares fell recently\" or \"the outcome is uncertain\" alone are low. "
+                  "General market mood is not part of it. Most verdicts should be low; medium should be uncommon, "
+                  "high rare."]
         for h in held:
             kind = ("bought by a fixed earnings rule (it beat its forecast) and sold on a fixed date"
                     if h.get("strategy") == "drift" else "bought on a news idea")
@@ -462,7 +545,9 @@ def prompt(day, names, s, held=(), topics=True):
                                "event": "what happens", "event_date": "YYYY-MM-DD",
                                "wrong_if": "what would prove it wrong", "sell_rule": "when to sell, in words",
                                "sell_date": "YYYY-MM-DD", "long_hold_reason": "",
-                               "confidence": "low | medium | high", "confidence_why": "one line",
+                               "date_confidence": "low | medium | high", "date_why": "one line",
+                               "edge_confidence": "low | medium | high", "edge_why": "one line",
+                               "edge_source": "https://... (a page you opened)",
                                "moved_pct": 0.0, "moved_note": "one line",
                                "sources": [{"title": "...", "url": "https://...", "date": "YYYY-MM-DD"}]}],
                     "verdicts": [{"symbol": "TICK", "verdict": "keep | watch | sell", "why": "one line",
@@ -818,11 +903,32 @@ def validate(raw, today, s, allowed, blocked, web=None):
     if after > s["max_days_after_event"] and len(idea["long_hold_reason"]) < 8:
         return None, ("the sell date %s is %d trading days after the event, over the %d allowed, and no reason "
                       "was given for holding longer" % (sell.isoformat(), after, s["max_days_after_event"]))
-    conf = _text(raw.get("confidence")).lower()
+    date_conf, edge_conf, edge_why, edge_note = level(raw.get("date_confidence")), level(raw.get("edge_confidence")), \
+        _text(raw.get("edge_why"))[:240], None
+    edge_src = _text(raw.get("edge_source"))
+    if edge_conf in ("medium", "high"):
+        if web is not None:
+            backed = bool(url_keys(edge_src) & set().union(*[url_keys(u) for u in web.get("opened") or []] or [set()]))
+        else:
+            backed = bool(re.match(r"^https?://[^\s]+$", edge_src))
+        if len(edge_why) < 8 or not backed:
+            edge_conf, edge_note = "low", ("it said %s without a reason backed by a page it opened, so this counts as "
+                                           "low" % edge_conf)
+        elif edge_conf == "high" and sum(1 for x in src if x.get("opened", True)) < 2:
+            edge_conf, edge_note = "medium", "it said high with only one source it opened, so this counts as medium"
     idea.update(event_date=ev.isoformat(), sell_date=sell.isoformat(), sources=src[:6], days_after_event=after,
-                confidence=conf if conf in LEVELS else "unknown", confidence_why=_text(raw.get("confidence_why"))[:240],
+                date_confidence=date_conf, date_why=_text(raw.get("date_why"))[:240],
+                edge_confidence=edge_conf, edge_why=edge_why, edge_source=edge_src[:500], edge_note=edge_note,
+                # "confidence" is the edge rating: the one that decides a buy (news.buy_confidence), as before
+                confidence=edge_conf, confidence_why=edge_why,
                 moved_pct=_num(raw.get("moved_pct")), moved_note=_text(raw.get("moved_note"))[:240])
     return idea, None
+
+
+def level(x):
+    """low, medium or high from Claude's answer; anything else is "unknown" (logged, never bought)."""
+    x = _text(x).lower()
+    return x if x in LEVELS else "unknown"
 
 
 def trading_days_after(event, sell):
@@ -1227,7 +1333,12 @@ def take_verdicts(sd, got, today, kind, web=None, rate=None, env="demo"):
         if verdict == "sell" and (len(why) < 8 or not any(x.get("opened", True) for x in src)):
             verdict, note = "watch", ("it said sell without a reason and a dated source it had opened, so this counts "
                                       "as watch and nothing is asked")
-        r = row(page, verdict, why, conf if conf in LEVELS else "unknown", src, note, said)
+        conf, opened = level(conf), sum(1 for x in src if x.get("opened", True))
+        if conf in ("medium", "high") and (len(why) < 8 or not opened):
+            conf = "low"                     # the same scale as an idea's edge: medium needs a reason and an opened page
+        elif conf == "high" and opened < 2:
+            conf = "medium"
+        r = row(page, verdict, why, conf, src, note, said)
         rows.append(r)
         if verdict == "sell" and page.get("strategy") == "news":
             sells.append({"symbol": sym, "broken": True, "why": why, "sources": src})
@@ -1673,7 +1784,7 @@ def run(sd, cfg, client=None, today=None, now_utc=None, claude=None, bars_fn=Non
                   model=s.get("update_model") or s.get("model"))
     try:
         names = names_for(sd, sym_of.values())
-        question = prompt(today, names, s, held) if kind == "main" else \
+        question = prompt(today, names, s, held, recent=recent_queries(sd, today)) if kind == "main" else \
             update_prompt(today, names, s, held, morning, "%s UK time" % s["main_at"])
         answer_text = (claude or run_claude)(question, ks)
         try:                                      # kept, so a failed answer can be looked at later
@@ -1877,7 +1988,7 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None, b
     def skip(row, why, **kw):
         out["skipped"].append((row["symbol"], why))
         log_buy(sd, idea=row.get("id"), symbol=row["symbol"], day=day.isoformat(), status="skipped", why=why,
-                confidence=row.get("confidence"), **kw)
+                confidence=row.get("confidence"), date_confidence=row.get("date_confidence"), **kw)
 
     done = bought_ids(sd)
     ok, why_none = buyable(doc, s)
@@ -1891,6 +2002,10 @@ def buy_today(client, sd, cfg, ny, rate, quote, paused, say, push, place=None, b
             continue
         if r.get("state") not in ("kept", "new"):
             skip(r, "not kept by the update before the open (%s): %s" % (r.get("state"), r.get("update_why") or "no reason"))
+        elif held_back_by_date(r, s):
+            skip(r, "held back by its date rating: the date is rated %s, and only ideas whose date is rated medium "
+                    "or high are bought (its confidence is %s)" % (r.get("date_confidence") or "unknown",
+                                                                  r.get("confidence")), held_back="date")
         else:
             skip(r, "its confidence is %s: only %s confidence ideas are bought" % (r.get("confidence") or "unknown", s["buy_confidence"]))
     todo = [r for r in ok if r.get("id") not in done]
@@ -2037,10 +2152,11 @@ def show(sd):
                                                                     v.get("confidence"), v.get("why"),
                                                                     " [asked on the phone]" if v.get("asked") else ""))
     for r in doc.get("ideas") or []:
-        lines.append("  PASSED %s [%s run, %s, confidence %s: %s; already moved %s%%]: %s | event: %s on %s | wrong if: %s "
+        lines.append("  PASSED %s [%s run, %s, edge %s: %s; date %s; already moved %s%%]: %s | event: %s on %s | wrong if: %s "
                      "| sell: %s (%s) | stop $%.2f, %s shares, cost GBP %.2f"
                      % (r["symbol"], r.get("from", "main"), r.get("state") or "proposed", r.get("confidence"),
-                        r.get("confidence_why") or "no reason", "?" if r.get("moved_pct") is None else "%g" % r["moved_pct"],
+                        r.get("confidence_why") or "no reason", r.get("date_confidence") or "not given",
+                        "?" if r.get("moved_pct") is None else "%g" % r["moved_pct"],
                         r["why"], r["event"], r["event_date"], r["wrong_if"], r["sell_rule"],
                         r["sell_date"], r.get("stop") or 0, r.get("qty"), r.get("cost_gbp") or 0))
         if r.get("update_why"):

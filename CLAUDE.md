@@ -217,9 +217,29 @@ The guard's protections:
   (`news_ideas.buyable`). No finished update means no news buy that day.
 - **Each idea needs:** company, `why`, `event`, `event_date` (today or later), `wrong_if`, `sell_rule`,
   `sell_date` (after today, at most `max_hold_days` 120 away, moved back to a trading day), and at least one
-  source with a URL and a date. Anything missing is rejected. Also logged: `confidence` (low, medium, high;
-  anything else is "unknown") with `confidence_why`, and `moved_pct` with `moved_note` (how far the share
-  has already moved on the news, Claude's estimate).
+  source with a URL and a date. Anything missing is rejected. Also logged: `moved_pct` with `moved_note`
+  (how far the share has already moved on the news, Claude's estimate).
+- **Two ratings (from 22 Nov 2026, the owner's decision):** `date_confidence` (with `date_why`: is the date
+  confirmed?) and `edge_confidence` (with `edge_why` and `edge_source`: is the market underestimating the
+  event?). Each is low, medium or high; anything else is "unknown". **Only the edge decides a buy:** it is
+  stored as `confidence` (and `edge_why` as `confidence_why`), which everything else reads as before.
+  - The prompt defines the levels: low = no specific, sourced reason the market is underestimating it;
+    medium = ONE specific reason backed by a page the run opened ("the shares fell recently" or "the outcome
+    is uncertain" alone are not enough); high = as medium, clear and from more than one opened source.
+    "Most ideas should be low; medium should be uncommon, high rare." Market mood goes in `notes`, not the
+    rating. A bare `confidence` from Claude is ignored (the edge is then "unknown").
+  - **The date must be rated too:** an idea is bought (and counts toward the pretend book and the caps,
+    `in_book`) only when its edge is at a `buy_confidence` level AND its `date_confidence` is medium or high
+    (`DATE_LEVELS`, `rated_to_buy`). An idea held back by a low or missing date rating is logged in
+    `buys.jsonl` as skipped with `"held_back": "date"`, and the phone line says "its date is not confirmed".
+  - **By code:** medium or high without an `edge_why` or with an `edge_source` the run did not open counts
+    as low; high with fewer than two opened sources counts as medium. Either is written in `edge_note`.
+  - Before 22 Nov one rating mixed the two ("happens as dated AND not already in the price", "Be strict"):
+    all 10 ideas of 18 to 20 Nov were low.
+- **Where to look (from 22 Nov):** the main prompt asks for events that are large for the company's size,
+  names two kinds of event to start with each day (`EVENT_KINDS`, `kinds_for`: all eight in four days),
+  and lists the last 3 run days' searches (`recent_queries`, from `runs.jsonl`, up to 30) so they are not
+  repeated word for word. The update run gets neither list.
 - **Hold length (by code):** the sell date may be at most `max_days_after_event` (10) trading days after the
   event date, unless Claude gives a `long_hold_reason`.
 - **Which confidence may be bought** is the setting `buy_confidence`: one level (`"high"`, the code's
@@ -249,7 +269,9 @@ The guard's protections:
 - **A verdict on every holding** (`take_verdicts`, both runs): each open news AND drift page gets `keep`,
   `watch` or `sell` with a one-line reason, a confidence and dated sources (checked like an idea's). Logged
   in `trader/state/news/verdicts.jsonl`; today's are in `today.json` (`verdicts`). A holding the run did not
-  mention is logged `none`; a `sell` without a reason and an opened source counts as `watch`.
+  mention is logged `none`; a `sell` without a reason and an opened source counts as `watch`. Its
+  `confidence` uses the idea edge's scale (from 22 Nov): medium needs a reason and an opened page, high two
+  opened pages, or it is lowered by code.
   - **News holding, `sell`:** a request in `trader/state/news/asks.json`; the autopilot sends it with
     Approve and Reject (`sa:`/`sr:` buttons). Approve sets the page to `selling` and the guard sells it soon
     after the next US open (see "Strategy labels"). Reject keeps it. No answer keeps it: the next day's run

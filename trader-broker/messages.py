@@ -1052,14 +1052,16 @@ def _idea_line(r, buying, want="high"):
     if len(what) > 220:
         what = what[:217].rstrip() + "..."
     what = esc(what)
-    mine = buying and r.get("confidence") in _levels(want)
+    date_ok = r.get("date_confidence") in ("medium", "high")      # news_ideas.DATE_LEVELS
+    mine = buying and r.get("confidence") in _levels(want) and date_ok
     size = ""
     if r.get("cost_gbp"):
         size = " %s about %s, most it could lose about %s." % (
             "I'd buy" if mine else "Would buy", gbp(r["cost_gbp"]), gbp(r.get("max_loss_gbp")))
     conf = _STARS.get(r.get("confidence"), "confidence not given")
     if buying and not mine:
-        conf += ", so it is only watched"
+        conf += (", but its date is not confirmed, so it is only watched" if r.get("confidence") in _levels(want)
+                 else ", so it is only watched")
     moved = _num(r.get("moved_pct"))
     return "%s (%s): %s Event: %s. %s by %s.%s%s" % (
         "<b>%s</b>" % company(r["symbol"]), conf, what if what.endswith((".", "!", "?")) else what + ".",
@@ -1092,7 +1094,7 @@ def news_ideas(doc, tally=None):
             n = len(rejected)
             out.append("%d other idea%s didn't pass the checks." % (n, "" if n == 1 else "s"))
     out.append("Buying is on: I look again about an hour before the US market opens, and buy only the %s-confidence "
-               "ideas that still hold, each with a safety net." % esc(level_words(want)) if buying
+               "ideas with a confirmed or reported date that still hold, each with a safety net." % esc(level_words(want)) if buying
                else "Practice only: nothing is bought. I just keep score.")
     if _score(tally):
         out.append(_score(tally))
@@ -1160,7 +1162,7 @@ def news_update(doc, changes):
     kept = [r for r in doc.get("ideas") or [] if r.get("state") == "kept"]
     if kept:
         out.append("Still standing from this morning: %s." % ", ".join(company(r["symbol"]) for r in kept))
-    out.append("Buying is on: only the %s-confidence ideas still standing are bought, soon after the open."
+    out.append("Buying is on: only the %s-confidence ideas with a confirmed or reported date still standing are bought, soon after the open."
                % esc(level_words(doc.get("buy_levels") or "high")) if buying else "Practice only: nothing is bought.")
     changed = [v for v in changes.get("verdicts") or [] if v.get("verdict") in ("watch", "sell")]
     if changed:

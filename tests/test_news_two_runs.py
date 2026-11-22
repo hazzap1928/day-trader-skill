@@ -368,20 +368,95 @@ class Quality(unittest.TestCase):
     def check(self, **over):
         return news.validate(idea(**over), DAY, S, self.ALLOWED, set())
 
-    def test_claude_is_asked_for_confidence_what_has_moved_and_a_reason_for_a_long_hold(self):
+    def test_claude_is_asked_for_two_ratings_what_has_moved_and_a_reason_for_a_long_hold(self):
         q = news.prompt(DAY, {"TSLA": "Tesla"}, S)
-        for word in ('"confidence"', '"confidence_why"', '"moved_pct"', '"moved_note"', '"long_hold_reason"',
-                     "within 10 trading days after the event", "high should be rare"):
+        for word in ('"date_confidence"', '"date_why"', '"edge_confidence"', '"edge_why"', '"edge_source"',
+                     '"moved_pct"', '"moved_note"', '"long_hold_reason"', "within 10 trading days after the event",
+                     "Only this rating decides whether the idea is bought",
+                     "\"The shares fell recently\" or \"the outcome is uncertain\" alone are not enough",
+                     "Most ideas should be low; medium should be uncommon, high rare.",
+                     "General market mood (a falling or jumpy market) is not part of either rating"):
             self.assertIn(word, q)
+        self.assertNotIn('"confidence_why"', q)
+        self.assertNotIn("Be strict", q)
 
-    def test_confidence_and_the_move_so_far_are_logged(self):
-        got, why = self.check(confidence=" High ", moved_pct="3.5")
+    def test_both_ratings_are_logged_and_the_edge_decides(self):
+        got, why = self.check(edge_confidence=" High ", date_confidence="medium", moved_pct="3.5")
         self.assertIsNone(why)
-        self.assertEqual((got["confidence"], got["confidence_why"], got["moved_pct"], got["moved_note"]),
-                         ("high", "The date is confirmed by the company.", 3.5, "Up about 1% since the date was announced."))
+        self.assertEqual((got["confidence"], got["edge_confidence"], got["date_confidence"], got["edge_note"]),
+                         ("high", "high", "medium", None))
+        self.assertEqual((got["confidence_why"], got["date_why"], got["moved_pct"]),
+                         ("Analysts expect a small launch against the published plan.",
+                          "The date is confirmed by the company.", 3.5))
         for odd in (None, "", "certain", 9):
-            self.assertEqual(self.check(confidence=odd)[0]["confidence"], "unknown", odd)     # logged, never bought
+            self.assertEqual(self.check(edge_confidence=odd)[0]["confidence"], "unknown", odd)     # logged, never bought
+            self.assertEqual(self.check(date_confidence=odd)[0]["date_confidence"], "unknown", odd)
         self.assertIsNone(self.check(moved_pct="a lot")[0]["moved_pct"])
+
+    def test_a_bare_confidence_without_an_edge_rating_is_never_bought(self):
+        raw = idea()
+        for k in ("edge_confidence", "edge_why", "edge_source"):
+            raw.pop(k)
+        got, why = news.validate(dict(raw, confidence="high"), DAY, S, self.ALLOWED, set())
+        self.assertEqual((why, got["confidence"]), (None, "unknown"))
+
+    def test_medium_needs_a_reason_backed_by_a_page_the_run_opened(self):
+        web = TN.searched(json.dumps(idea())).web                       # every address in the idea was opened
+        ok = news.validate(idea(confidence="medium"), DAY, S, self.ALLOWED, set(), web=web)[0]
+        self.assertEqual((ok["confidence"], ok["edge_note"]), ("medium", None))
+        for over in ({"edge_source": "https://example.com/never-opened"}, {"edge_source": ""}, {"edge_why": "low"}):
+            got = news.validate(idea(confidence="medium", **over), DAY, S, self.ALLOWED, set(), web=web)[0]
+            self.assertEqual(got["confidence"], "low", over)
+            self.assertIn("without a reason backed by a page it opened", got["edge_note"])
+        self.assertEqual(self.check(confidence="medium", edge_source="not a link")[0]["confidence"], "low")  # no record
+
+    def test_high_needs_more_than_one_opened_source(self):
+        one = [TN.SRC[1]]
+        web = TN.searched(json.dumps(idea(sources=one))).web
+        got = news.validate(idea(sources=one), DAY, S, self.ALLOWED, set(), web=web)[0]
+        self.assertEqual((got["confidence"], got["edge_note"]),
+                         ("medium", "it said high with only one source it opened, so this counts as medium"))
+        self.assertEqual(news.validate(idea(), DAY, S, self.ALLOWED, set(), web=TN.searched(json.dumps(idea())).web)[0]
+                         ["confidence"], "high")
+
+    def test_a_low_edge_is_kept_as_it_is(self):
+        got = self.check(confidence="low", edge_source="")[0]
+        self.assertEqual((got["confidence"], got["edge_note"]), ("low", None))
+
+    def test_the_prompt_favours_big_events_and_rotates_the_kinds_of_event(self):
+        q = news.prompt(DAY, {"TSLA": "Tesla"}, S)
+        self.assertIn("Prefer events that are large for the company's size", q)
+        a, b = news.kinds_for(DAY)
+        self.assertIn("Start today with these kinds of event, which change from day to day: %s and %s." % (a, b), q)
+        days = [DAY + datetime.timedelta(days=i) for i in range(4)]
+        self.assertEqual(len({k for d in days for k in news.kinds_for(d)}), len(news.EVENT_KINDS))   # all in 4 days
+        self.assertNotIn("Earlier runs already made the searches below", q)
+
+    def test_the_last_runs_searches_are_shown_so_they_are_not_repeated(self):
+        import tempfile
+        sd = tempfile.mkdtemp()
+        rows = [{"day": "2026-10-28", "kind": "main", "at": 1, "web": {"queries": ["very old"]}},
+                {"day": "2026-11-02", "kind": "main", "at": 2, "web": {"queries": ["PDUFA date December 2026", "a"]}},
+                {"day": "2026-11-02", "kind": "update", "at": 3, "web": {"queries": ["b"]}},
+                {"day": "2026-11-03", "kind": "main", "at": 4, "web": {"queries": ["pdufa DATE december 2026", "c"]}},
+                {"day": "2026-11-04", "kind": "main", "at": 5, "web": {"queries": ["d"]}},
+                {"day": "2026-11-04", "kind": "main", "at": 6, "status": "failed"},
+                {"day": DAY.isoformat(), "kind": "main", "at": 7, "web": {"queries": ["today's own"]}}]
+        with open(os.path.join(news._dir(sd), "runs.jsonl"), "w") as fh:
+            fh.write("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+        got = news.recent_queries(sd, DAY)
+        self.assertEqual(got, ["d", "pdufa DATE december 2026", "c", "b", "a"])     # 3 run days, newest first, once
+        self.assertEqual(news.recent_queries(sd, DAY, limit=2), ["d", "pdufa DATE december 2026"])
+        self.assertEqual(news.recent_queries(tempfile.mkdtemp(), DAY), [])
+        q = news.prompt(DAY, {"TSLA": "Tesla"}, S, recent=got)
+        self.assertIn("Earlier runs already made the searches below. Do not repeat them word for word", q)
+        self.assertIn("  d | pdufa DATE december 2026 | c | b | a", q)
+
+    def test_the_main_run_is_given_the_recent_searches_and_the_update_is_not(self):
+        upd = news.update_prompt(DAY, {"TSLA": "Tesla"}, S, morning=[idea()])
+        self.assertNotIn("Earlier runs already made the searches below", upd)
+        self.assertIn('"edge_confidence"', upd)
+        json.loads(upd.split("ANSWER with exactly one JSON object and no other text, in this shape:\n")[1].split("\n")[0])
 
     def test_the_sell_date_is_at_most_ten_trading_days_after_the_event_unless_a_reason_is_given(self):
         got, why = self.check()                                          # the event on the 19th, sold on the 27th
@@ -437,6 +512,31 @@ class OnlyHighIsBought(TN.Buying):
         self.assertIn("Would buy", line)
         self.assertIn("I'd buy", M._idea_line(dict(idea(), cost_gbp=900.0, max_loss_gbp=30.0), True))
         self.assertIn("Already moved about", M._idea_line(dict(idea(moved_pct=4.0)), False))
+
+    def test_a_low_date_rating_holds_back_a_high_edge_and_is_logged(self):
+        self.morning(idea(date_confidence="low"))
+        res = self.buy()
+        self.assertEqual(res["bought"], [])
+        self.assertEqual(self.router.calls, [])                          # Trading 212 was not even asked
+        self.assertIn("held back by its date rating: the date is rated low", res["skipped"][0][1])
+        with open(os.path.join(self.dir, "state", "news", "buys.jsonl")) as fh:
+            row = json.loads(fh.readline())
+        self.assertEqual((row["status"], row["held_back"], row["date_confidence"], row["confidence"]),
+                         ("skipped", "date", "low", "high"))
+
+    def test_the_date_gate_also_decides_the_pretend_book(self):
+        s = news.settings({"news": {"buy_confidence": ["medium", "high"]}})
+        row = {"verdict": "passed", "state": "kept", "confidence": "medium"}
+        for date, want in (("high", True), ("medium", True), ("low", False), (None, False)):
+            self.assertEqual(news.in_book(dict(row, date_confidence=date), s), want, date)
+        self.assertFalse(news.in_book(dict(row, confidence="low", date_confidence="high"), s))
+        self.assertTrue(news.held_back_by_date(dict(row, date_confidence="low"), s))
+        self.assertFalse(news.held_back_by_date(dict(row, confidence="low", date_confidence="low"), s))
+
+    def test_the_message_says_when_the_date_holds_an_idea_back(self):
+        line = M._idea_line(dict(idea(date_confidence="low"), cost_gbp=900.0, max_loss_gbp=30.0), True)
+        self.assertIn("high confidence, but its date is not confirmed, so it is only watched", line)
+        self.assertIn("Would buy", line)
 
     def test_a_dropped_idea_is_never_bought(self):
         self.morning(update=json.dumps({"checks": [{"symbol": "TSLA", "keep": False, "why": "results missed"}],
