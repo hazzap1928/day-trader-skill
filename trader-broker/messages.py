@@ -956,7 +956,7 @@ def daily_review(r):
                 read += ". Noted only: this one is sold by its date rule"
         items.append("%s (%s): %s%s; %s%s%s%s%s" % (company(row["symbol"]), _KIND.get(row.get("strategy"), "a label I don't know"),
                                                    gain, mkt, net, sell, read, replay_words(row.get("replay")),
-                                                   watch_words(row.get("watch"))))
+                                                   watch_words(row.get("watch")) + earnings_words(row.get("earnings"))))
     if not r.get("rows"):
         items.append("Nothing is held")
     if r.get("due"):
@@ -996,6 +996,19 @@ def watch_item(i):
         what = [_8K_WORDS.get(x, "item %s" % x) for x in i.get("items") or [] if x != "9.01"]
         return "SEC filing (%s): %s" % (when, esc(", ".join(what) or "a company announcement"))
     return "Headline (%s): %s" % (when, esc(_short(i.get("title"), 140)))
+
+
+def earnings_words(e):
+    """A holding's results date inside its hold, when the phone should hear it (first seen, moved, or close)."""
+    if not e or not e.get("in_hold") or not e.get("tell") or not e.get("date"):
+        return ""
+    when = {"after the close": " after the US market closes", "before the open": " before the US market opens"}.get(
+        e.get("when"), "")
+    sure = " (the company's date)" if e.get("sure") == "expected" else " (an estimate from past dates)"
+    days = e.get("days_to")
+    soon = "" if days is None else " today" if days == 0 else " in %d trading day%s" % (days, "" if days == 1 else "s")
+    return ". \U0001f4c5 It reports results on %s%s%s%s, before its sell date: the share can move a lot that day" % (
+        esc(short_day(e["date"])), when, soon, sure)
 
 
 def replay_words(rp):

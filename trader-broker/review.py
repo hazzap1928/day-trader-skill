@@ -12,7 +12,8 @@ judgement.
   5. Is a rule sale due? A holding at its sell date (the guard's 15:50 close sells it: an existing rule).
   6. Does a reason look broken? The stock left the universe or went on the blocked list, or the news run
      asked about it. The review only SAYS it would ask. New SEC filings and headlines on each holding since
-     the last review (trader-broker/hold_watch.py, when "hold_watch" is on) are shown beside it.
+     the last review (trader-broker/hold_watch.py, when "hold_watch" is on) are shown beside it, and its next
+     results date when it falls before the sell date (trader-broker/earnings_watch.py, when "earnings_watch" is on).
   7. How is each holding doing? Its gain in pounds after fees, the S&P 500 beside it for information.
   8. One message.
 
@@ -149,7 +150,7 @@ def limits(cfg, view, risk, cost):
     return out
 
 
-def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None, watch=None):
+def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None, watch=None, earnings=None):
     """The review from a daily-match result (holdings_t212.daily_match). Pure but for the SPY bars
     (`bars_fn`, information only; a failure just leaves the market figure out). Changes nothing."""
     H, D = _hold(), _drift()
@@ -201,7 +202,8 @@ def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None, watch=Non
                "buy_date": (page or {}).get("buy_date"), "reason": (page or {}).get("reason"),
                "sell_date": None, "status": (page or {}).get("status"), "market_pct": None,
                "verdict": (verdicts or {}).get(pos.get("symbol")) if page is not None and H.is_hold(page) else None,
-               "watch": _watch(watch, page), "replay": _replay(page)}
+               "watch": _watch(watch, page), "replay": _replay(page),
+               "earnings": (earnings or {}).get((page or {}).get("id"))}
         sell = H.sell_date(page) if page else None
         if sell:
             row["sell_date"] = sell.isoformat()
@@ -308,6 +310,8 @@ def text(r):
             L.append("         today's verdict from the news runs: %s (confidence %s): %s%s" % (
                 row["verdict"].get("verdict"), row["verdict"].get("confidence"), row["verdict"].get("why"),
                 "; written down only, the date rule decides" if row["strategy"] == "drift" else ""))
+        if row.get("earnings"):
+            L.append("         " + _load("trader-broker", "earnings_watch").words(row["earnings"]))
         if row.get("replay"):
             rp = row["replay"]
             L.append("         replays (shadow): stop hit first in %s%% of %s; typical result after fees %+.1f%% as set, "
@@ -329,11 +333,11 @@ def text(r):
     return "\n".join(L)
 
 
-def run(sd, cfg, res, today, bars_fn=None, say=None, push=None, asks=None, verdicts=None, watch=None):
+def run(sd, cfg, res, today, bars_fn=None, say=None, push=None, asks=None, verdicts=None, watch=None, earnings=None):
     """Build, save, log and (when worth it) send the review. Never raises; never changes an order or a page."""
     T = _t212()
     try:
-        r = build(sd, cfg, res, today, bars_fn=bars_fn, asks=asks, verdicts=verdicts, watch=watch)
+        r = build(sd, cfg, res, today, bars_fn=bars_fn, asks=asks, verdicts=verdicts, watch=watch, earnings=earnings)
     except Exception as e:
         r = could_not(today, e)
     try:

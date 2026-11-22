@@ -1235,6 +1235,12 @@ def info_for(sd, row, budget_s):
     left = budget_s - (_now() - start)
     if left > 10:
         out["analyst"] = _tool(["trader-analyst/facts.py", sym, "--config", cfgp, "--quarters", "4"], min(60, left))[:1500]
+    try:            # does its next results date fall inside the hold? (trader-broker/earnings_watch.py; logged only)
+        ew = _load("trader-broker", "earnings_watch")
+        e = ew.lookup(sym)
+        out["earnings"] = dict(e, in_hold=ew.in_window(e, row.get("day"), row.get("sell_date")))
+    except Exception as e:
+        out["earnings"] = {"error": str(e)[:120]}
     return out
 
 

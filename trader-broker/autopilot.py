@@ -1467,10 +1467,12 @@ class Pilot(object):
             cfg = self.drift_cfg()
             # new SEC filings and headlines on each holding (report only; off unless "hold_watch" is on)
             hw = mod("trader-broker", "hold_watch").run(self.sd, cfg, "review", say=self.say)
+            # each holding's next results date, flagged when it falls before the sell date (report only; off unless on)
+            ew = mod("trader-broker", "earnings_watch").run(self.sd, cfg, _ny().date(), say=self.say)
             rv.run(self.sd, cfg, res, _ny().date(), bars_fn=nw.drift.daily_bars, say=self.say,
                    push=lambda text: phone_mod.push(self.sd, text, phone=self.phone),
                    asks=nw.load_asks(self.sd)["asks"], verdicts=nw.todays_verdicts(self.sd, _ny().date()),
-                   watch=hw["by_page"])
+                   watch=hw["by_page"], earnings=ew["by_page"])
         except Exception as e:
             self.say("daily review: could not be done (%s)" % t212.scrub(e, self.client._secrets))
 
