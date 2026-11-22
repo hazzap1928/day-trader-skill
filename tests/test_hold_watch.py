@@ -266,6 +266,13 @@ class PastExamples(unittest.TestCase):
         self.assertEqual(hw.filing_text_rule(fixture("boeing-0000012927-24-000068"), ["1.01", "2.03", "9.01"], "Boeing"),
                          [])                                                        # a loan agreement
 
+    def test_a_real_late_filing_notice(self):
+        with open(os.path.join(ROOT, "tests", "fixtures", "hold-watch", "smci-nt-10k-2024-08-30.xml"), "rb") as fh:
+            items = hw.news().parse_sec_atom(fh.read(), "SMCI")                  # Super Micro, 30 Aug 2024
+        self.assertEqual([i["form"] for i in items], ["NT 10-K"])
+        self.assertEqual(hw.serious(items[0], "SMCI", "Super Micro Computer"),
+                         (True, "SEC filing: a late-filing notice (it cannot file its accounts on time)"))
+
     def test_role_and_sentence_edges(self):
         rule = hw.filing_text_rule
         self.assertTrue(rule("Item 5.02 John Smith, Chief Financial Officer of The Boeing Company, will resign.", ["5.02"], "Boeing"))

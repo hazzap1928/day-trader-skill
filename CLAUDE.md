@@ -133,7 +133,9 @@ holdings record (`holdings.py`), never Trading 212 (except `hold_slippage.py`, w
   `uptrend`, `below_ma50`, `down_10pct_5d`, `new_20d_low` ("falling apart" = any of the last three). From
   closes before the buy day only. `shadow.py` writes `page["chart"]` once; `research/pead_chart.py` compares
   past drift trades with and without each label (22 Nov: no label held up in both periods; in 2019-23 the
-  "falling apart" charts did better, in 2024-26 no difference).
+  "falling apart" charts did better, in 2024-26 no difference). **The owner's decision (22 Nov): the labels stay
+  on the holdings page and in the daily review for information only; they are used in no decision, and no
+  labelled-against-unlabelled comparison goes into any report (Friday, briefing, review, checkpoint).**
 - **Slippage on held trades** (`trader-broker/hold_slippage.py`): each evening (after the review) it logs
   every drift and news buy (fill against the quote just before the order) and sale (stop sale against the
   stop; close or approved sale against the price the guard saw) to `trader/state/slippage.jsonl`, once each.

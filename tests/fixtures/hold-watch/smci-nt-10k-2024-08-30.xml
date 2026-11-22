@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+  <feed xmlns="http://www.w3.org/2005/Atom">
+    <author>
+      <email>webmaster@sec.gov</email>
+      <name>Webmaster</name>
+    </author>
+    <company-info>
+      <addresses>
+        <address type="mailing">
+          <city>SAN JOSE</city>
+          <state>CA</state>
+          <street1>980 ROCK AVENUE</street1>
+          <zip>95131</zip>
+        </address>
+        <address type="business">
+          <city>SAN JOSE</city>
+          <phone>408-503-8000</phone>
+          <state>CA</state>
+          <street1>980 ROCK AVENUE</street1>
+          <zip>95131</zip>
+        </address>
+      </addresses>
+      <assigned-sic>3571</assigned-sic>
+      <assigned-sic-desc>ELECTRONIC COMPUTERS</assigned-sic-desc>
+      <assigned-sic-href>https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&amp;SIC=3571&amp;owner=include&amp;count=10</assigned-sic-href>
+      <cik>0001375365</cik>
+      <cik-href>https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&amp;CIK=0001375365&amp;owner=include&amp;count=10</cik-href>
+      <conformed-name>Super Micro Computer, Inc.</conformed-name>
+      <fiscal-year-end>0630</fiscal-year-end>
+      <state-location>CA</state-location>
+      <state-location-href>https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&amp;State=CA&amp;owner=include&amp;count=10</state-location-href>
+      <state-of-incorporation>CA</state-of-incorporation>
+    </company-info>
+    <entry>
+      <category label="form type" scheme="https://www.sec.gov/" term="NT 10-K" />
+      <content type="text/xml">
+        <accession-number>0001375365-24-000031</accession-number>
+        <act>34</act>
+        <file-number>001-33383</file-number>
+        <file-number-href>https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&amp;filenum=001-33383&amp;owner=include&amp;count=10</file-number-href>
+        <filing-date>2024-08-30</filing-date>
+        <filing-href>https://www.sec.gov/Archives/edgar/data/1375365/000137536524000031/0001375365-24-000031-index.htm</filing-href>
+        <filing-type>NT 10-K</filing-type>
+        <film-number>241269940</film-number>
+        <form-name>Notification of inability to timely file Form 10-K 405, 10-K, 10-KSB 405, 10-KSB, 10-KT, or 10-KT405</form-name>
+        <size>38 KB</size>
+      </content>
+      <id>urn:tag:sec.gov,2008:accession-number=0001375365-24-000031</id>
+      <link href="https://www.sec.gov/Archives/edgar/data/1375365/000137536524000031/0001375365-24-000031-index.htm" rel="alternate" type="text/html" />
+      <summary type="html">&amp;lt;b&amp;gt;Filed:&amp;lt;/b&amp;gt; 2024-08-30 &amp;lt;b&amp;gt;AccNo:&amp;lt;/b&amp;gt; 0001375365-24-000031  &amp;lt;b&amp;gt;Size:&amp;lt;/b&amp;gt; 38 KB</summary>
+      <title>NT 10-K  - Notification of inability to timely file Form 10-K 405, 10-K, 10-KSB 405, 10-KSB, 10-KT, or 10-KT405</title>
+      <updated>2024-08-30T16:06:43-04:00</updated>
+    </entry>
+</feed>
