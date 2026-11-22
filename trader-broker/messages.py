@@ -1030,7 +1030,7 @@ def earnings_words(e):
     sure = " (the company's date)" if e.get("sure") == "expected" else " (an estimate from past dates)"
     days = e.get("days_to")
     soon = "" if days is None else " today" if days == 0 else " in %d trading day%s" % (days, "" if days == 1 else "s")
-    return ". \U0001f4c5 It reports results on %s%s%s%s, before its sell date: the share can move a lot that day" % (
+    return "\n    ↳ \U0001f4c5 It reports results on %s%s%s%s, before its sell date: the share can move a lot that day" % (
         esc(short_day(e["date"])), when, soon, sure)
 
 
@@ -1046,7 +1046,7 @@ def chart_words(c):
     if not c or not c.get("new"):
         return ""
     tags = [_CHART.get(t, t) for t in c.get("tags") or []]
-    return ". %sChart when bought: %s (labels only, for information)" % (
+    return "\n    ↳ %sChart when bought: %s (labels only, for information)" % (
         "⚠️ " if c.get("falling") else "", esc(", ".join(tags) or "no clear pattern"))
 
 
@@ -1057,7 +1057,7 @@ def replay_words(rp):
     m = rp.get("median_pct") or {}
     if None in (m.get("fixed"), m.get("rising"), m.get("none")):
         return ""
-    return (". Replaying its own past ups and downs: the safety net was hit first %s%% of the time; typical result "
+    return ("\n    ↳ Replaying its own past ups and downs: the safety net was hit first %s%% of the time; typical result "
             "after fees %s with the safety net as set, %s if it rose with the price, %s with none (for information)" % (
                 esc("%.0f" % rp["stop_first_pct"]), pct(m["fixed"], 1), pct(m["rising"], 1), pct(m["none"], 1)))
 
@@ -1071,7 +1071,7 @@ def watch_words(w):
     rest = sum(1 for i in w.get("all") or [] if i.get("kind") != "filing" and not i.get("serious"))
     if rest:
         parts.append("%d other headline%s" % (rest, "" if rest == 1 else "s"))
-    return ". New since the last review: " + "; ".join(parts) if parts else ""
+    return "\n    ↳ New since the last review: " + "; ".join(parts) if parts else ""
 
 
 def hold_watch_briefing(by_page):

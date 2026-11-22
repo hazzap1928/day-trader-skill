@@ -114,7 +114,7 @@ class Check(unittest.TestCase):
 class Words(unittest.TestCase):
     def test_phone_words(self):
         e = {"date": "2026-12-09", "in_hold": True, "tell": "new", "when": "after the close", "sure": "expected", "days_to": 11}
-        self.assertEqual(M.earnings_words(e), ". \U0001f4c5 It reports results on Wed 9 Dec after the US market closes in 11 "
+        self.assertEqual(M.earnings_words(e), "\n    ↳ \U0001f4c5 It reports results on Wed 9 Dec after the US market closes in 11 "
                                               "trading days (the company's date), before its sell date: the share can move a lot that day")
         self.assertIn("(an estimate from past dates)", M.earnings_words(dict(e, sure="estimated")))
         self.assertIn(" today", M.earnings_words(dict(e, days_to=0)))

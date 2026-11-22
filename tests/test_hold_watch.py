@@ -304,7 +304,7 @@ class Words(unittest.TestCase):
                  {"kind": "headline", "title": "a", "day": "2026-11-20", "serious": False},
                  {"kind": "headline", "title": "b <x>", "day": "2026-11-20", "serious": False}]
         w = M.watch_words(hw.summary(items))
-        self.assertEqual(w, ". New since the last review: \U0001f6a9 Headline (Fri 20 Nov): Everpure CFO resigns; "
+        self.assertEqual(w, "\n    ↳ New since the last review: \U0001f6a9 Headline (Fri 20 Nov): Everpure CFO resigns; "
                             "SEC filing (Sat 21 Nov): a director or senior manager joining or leaving; 2 other headlines")
         self.assertEqual(M.watch_words(None), "")
         self.assertIn("&lt;x&gt;", M.watch_item(items[3]))

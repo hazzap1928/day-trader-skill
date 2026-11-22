@@ -194,7 +194,7 @@ class Replay(Base):
               "stop_first_pct": 31.4, "runs": 1000, "at": _t.time()}
         got = rv._replay({"replay": rp})
         self.assertTrue(got["new"])
-        self.assertEqual(M.replay_words(got), ". Replaying its own past ups and downs: the safety net was hit first 31% of "
+        self.assertEqual(M.replay_words(got), "\n    ↳ Replaying its own past ups and downs: the safety net was hit first 31% of "
                          "the time; typical result after fees +1.2% with the safety net as set, +0.4% if it rose with the "
                          "price, +1.9% with none (for information)")
         old = rv._replay({"replay": dict(rp, at=_t.time() - 3 * 86400)})
