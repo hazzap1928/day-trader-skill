@@ -43,6 +43,43 @@ The strategy beat 80% of portfolios built on random earnings reports, which is n
 **Conclusion:** after Trading 212's costs, none of these strategies beat simply holding an S&P 500
 tracker over these periods.
 
+## Kronos and low volatility (17 to 18 Nov 2026)
+
+**Kronos as a stock picker** (`kronos_backtest.py`, Kronos-small on daily bars, run 17 to 18 Nov):
+- 50 random S&P 500 stocks (seed 42); on the first trading day of each month, Kronos forecast each
+  one 20 trading days ahead (5 paths, median). Buy its top 10 at the next open, sell at the close 20
+  trading days later, 0.15% FX + 0.05% slippage each way.
+- 22 months, 2025-01 to 2026-10 (after the model's training data, which may run to mid-2024).
+- This tests Kronos ranking stocks on price history alone. It did **not** test Kronos as a filter on
+  drift or news picks; there are too few of those so far to test.
+
+| | Total, 22 months | Average a month | Worst fall |
+|---|---|---|---|
+| Kronos top 10 | +14.0% | +0.7% | 9.8% |
+| The other 40 | +13.0% | +0.6% | |
+| 10 random of the 50 (median of 1,000) | +12.3% | | |
+| SPY | +25.7% | +1.1% | 8.5% |
+
+Kronos beat 56% of random portfolios (a coin flip), SPY in 8 of 22 months and the other 40 in 11.
+The rank correlation between its forecast and the actual 20-day return averaged +0.04 (t 1.0,
+positive in 13 of 22 months): no reliable skill.
+
+**Kronos as a risk forecast** (`kronos_risk_check.py`, from the same cached forecasts): the spread of
+its 5 paths does track how much a stock will move, but the 14-day ATR does it far better (rank
+correlation with next-month volatility +0.66 against +0.38), and with ATR known Kronos adds nothing
+to forecasting the worst fall. A stop sized from Kronos at the same average distance as 3xATR was
+hit more often (37% against 30%). Side finding: on these 1,100 random 20-day holdings, a 3xATR stop
+cut the average from +0.63% (no stop) to +0.23% after costs. That is random stocks, not drift or news
+picks, but the stop's cost is worth watching.
+
+**Verdict:** no evidence Kronos improves picks or stops after costs. It stays shadow only (logged,
+never deciding).
+
+**Low-volatility stocks** (`lowvol_backtest.py`): each month hold the 20 S&P 500 members with the
+lowest one-year volatility. 2019 to 2023: +44.7% against SPY +105.5% (beat 10% of random portfolios);
+2024 to Oct 2026: +32.9% against SPY +65.2% (beat 51%). It fell far less in 2022 (-3.5% against
+-18.7%) but trailed the index badly overall. Not a candidate.
+
 ## Caveats
 
 - **Survivorship bias:** the universe is today's S&P 500, each stock counted from the day it joined.
@@ -69,6 +106,9 @@ python3 research/prices_fetch.py                                           # S&P
 python3 research/earnings_fetch.py                                         # Nasdaq earnings, 2019 on (about 2 hours)
 python3 research/three_strategies.py mom pull && python3 research/momentum_check.py
 python3 research/pead_run.py && python3 research/pead_tracker.py
+caffeinate -i -s nice -n 19 trader-kronos/.venv/bin/python research/kronos_backtest.py   # about 4 hours
+python3 research/kronos_risk_check.py trader/research-data                 # from the Kronos cache
+python3 research/lowvol_backtest.py trader/research-data
 ```
 
 Yahoo Finance (unofficial) and Nasdaq's public calendar supply the data; both can lag or change.
