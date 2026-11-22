@@ -36,4 +36,6 @@ unset T212_ENV
 mkdir -p trader/logs
 echo "---- $(date -u +%Y-%m-%dT%H:%M:%SZ) autopilot start (demo)"
 if [[ $# -eq 0 ]]; then set -- serve; fi        # always on: launchd keeps it running (KeepAlive)
+# The evening Kronos opinions and stop shadows (trader-broker/shadow.py) start only from here, never from a test.
+export AUTOPILOT_SHADOW=1
 exec /usr/bin/python3 trader-broker/autopilot.py "$@"

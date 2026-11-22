@@ -80,6 +80,21 @@ lowest one-year volatility. 2019 to 2023: +44.7% against SPY +105.5% (beat 10% o
 2024 to Oct 2026: +32.9% against SPY +65.2% (beat 51%). It fell far less in 2022 (-3.5% against
 -18.7%) but trailed the index badly overall. Not a candidate.
 
+## Review checkpoint (from 22 Nov 2026)
+
+The agent's own trades decide what stays. At **20 or more completed drift + news trades**
+(`python3 research/checkpoint_review.py`; it runs at any count and says when there are too few):
+
+- **Kronos:** Kronos's forecast to the sell date is written on each drift and news holding before the buy
+  (`trader-broker/shadow.py`). Compare the trades it rated highly (top half) with those it rated poorly. If the
+  highly rated ones have not clearly done better (at least 1 percentage point a trade after fees), remove Kronos.
+- **Stops:** each holding sold by its stop is followed to its planned sell date (the "stop shadow"). If, on
+  average, the shares were worth clearly more by then than the stop sold them for, the stops are costing money:
+  consider widening them. If clearly less, they helped.
+- **Benchmark:** each strategy against zero and against holding the S&P 500 over the same days.
+- **Timing:** drift trades will be rare until the next earnings season (mid to late January), so most early
+  evidence will come from news trades. Twenty trades is still a small sample: luck can swing it either way.
+
 ## Caveats
 
 - **Survivorship bias:** the universe is today's S&P 500, each stock counted from the day it joined.
@@ -109,6 +124,7 @@ python3 research/pead_run.py && python3 research/pead_tracker.py
 caffeinate -i -s nice -n 19 trader-kronos/.venv/bin/python research/kronos_backtest.py   # about 4 hours
 python3 research/kronos_risk_check.py trader/research-data                 # from the Kronos cache
 python3 research/lowvol_backtest.py trader/research-data
+/usr/bin/python3 research/checkpoint_review.py                             # the review checkpoint (reads the holdings record)
 ```
 
 Yahoo Finance (unofficial) and Nasdaq's public calendar supply the data; both can lag or change.

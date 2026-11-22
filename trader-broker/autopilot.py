@@ -118,6 +118,12 @@ def _now():
     return time.time()
 
 
+def _spawn(cmd, out):
+    """Start a program in the background, not waited for (the tests replace this)."""
+    subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=ROOT,
+                     start_new_session=True)
+
+
 def _sleep(s):
     time.sleep(s)
 
@@ -1372,6 +1378,22 @@ class Pilot(object):
         self.drift_resolve()
         self.drift_sells()
         self.daily_review(self.holdings_match())
+        self.shadow_start()
+
+    def shadow_start(self):
+        """Kronos's opinion of each new drift and news buy, and the stop shadow of each holding its stop sold
+        (trader-broker/shadow.py): review only, never an order. Started as a separate program and not waited
+        for, so a slow Kronos run never holds up the autopilot. Never raises."""
+        if os.environ.get("AUTOPILOT_SHADOW") != "1":
+            return                        # set only by run-autopilot.sh: a terminal or a test starts nothing
+        try:
+            logs = os.path.join(self.sd, "logs")
+            os.makedirs(logs, exist_ok=True)
+            with open(os.path.join(logs, "shadow.log"), "a") as out:
+                _spawn([sys.executable, os.path.join(HERE, "shadow.py"), "run", "--state-dir", self.sd], out)
+            self.say("shadow: Kronos opinions and stop shadows started (trader/logs/shadow.log)")
+        except Exception as e:
+            self.say("shadow: not started (%s)" % t212.scrub(e, self.client._secrets))
 
     # ------------------------------------------------------------ the holdings record and the news strategy
 

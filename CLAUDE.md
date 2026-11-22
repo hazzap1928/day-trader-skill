@@ -58,7 +58,9 @@ strategy or a feed, add it to "The parts" and give it its own section. Known loo
 | `trader-broker/wallpaper.py` | the desktop wallpaper's status: the always-on autopilot POSTs running/stopped, value, day change, cash share, positions, last trade, a 30-value trend and up to 3 build items, every 15 minutes, after each trade and at shutdown. Off without the address and key |
 | `trader-broker/netwait.py` | no internet: check every 2 min for up to 30, then a BACK ONLINE message saying what was missed |
 | `trader-broker/go_live.py` | the user's own switch to live (checklist in `GO_LIVE.md`). **Claude never runs it** |
-| `trader-kronos/` | Kronos-small forecasts, **shadow only** (news runs may use it, `kronos_minutes`); own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
+| `trader-broker/shadow.py` | **review only**: Kronos's opinion of each drift and news buy, and the stop shadow of each holding its stop sold, written on the holdings pages (see "Kronos opinions and the stop shadow") |
+| `trader-kronos/` | Kronos-small forecasts, **shadow only**: `kronos_daily.py` (the daily forecast to the sell date, used by `shadow.py` and the news runs) and `kronos_shadow.py` (the dormant day-trade one); own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
+| `research/checkpoint_review.py` | the review checkpoint in plain English (read-only; see "Review checkpoint") |
 | `research/` | backtest scripts and `README.md` with the results (data goes in `trader/research-data/`) |
 | `docs/hold-agent-spec.md` | the hold-and-review spec and the owner's decisions of 16 Nov 2026 |
 
@@ -277,6 +279,45 @@ The guard's protections:
   proof, the confidence setting, verdicts, the approval step, the guard's sale, topics). `tests/test_news.py`
   is the older trader-news tool. A fake Claude answer in a test must carry a search record
   (`test_news_ideas.searched`).
+
+## Kronos opinions and the stop shadow (from 22 Nov 2026): `trader-broker/shadow.py`, REVIEW ONLY
+
+- **Why:** the Kronos backtest (`research/README.md`, 18 Nov) found no skill, so Kronos stays shadow only and is
+  judged on the agent's own trades at the review checkpoint. Before 22 Nov no drift buy asked Kronos, and every
+  news idea's Kronos verdict failed ("no time left before 15:50": the day-trade forecaster cannot look past a close).
+- **Kronos's opinion** (`page["kronos"]`): for each drift and news page (not waiting, not intraday), the median of
+  5 Kronos-small paths of the change from the last close BEFORE the buy day to the close on the sell date (daily
+  bars, 256 of them; `trader-kronos/kronos_daily.py`, the backtest's forecast). No hindsight: bars from the buy day
+  on are never given. Once per page; a failure is tried 3 times, then left (`{"error", "tries"}`). Kronos's
+  forecasts lean negative (median -2.3% in the backtest), so the review compares halves, not up against down.
+  News ideas get the same forecast at the 06:00 run (`news_ideas.kronos_for`, idea row `kronos`, verdict up/down).
+- **The stop shadow** (`page["stop_shadow"]`): for a drift or news page closed by its stop (`result.why` "stop", or
+  the guard's software-stop sale in `t212-guard.json` "sold"): stop exit price and date, planned sell date, and,
+  once that date's close is final, the price then, the difference per share, in % and in pounds (shares sold, at
+  `trader/fx.json`'s rate, before fees). Positive: the stop cost money.
+- **When:** the autopilot starts `shadow.py run` after the daily review, as a separate program, not waited for
+  (log `trader/logs/shadow.log`). Only when `run-autopilot.sh` sets `AUTOPILOT_SHADOW=1`, so a shell or a test
+  starts nothing. It changes no order, stop, sell date or status, and blocks nothing (a test reads the source).
+- **Timing on the 2017 MacBook (22 Nov):** model load 27 s cold (about 4 s warm), then about 14 s a share
+  (5 paths x 20 days). A run of 5 holdings: about 1.5 minutes, once a day after the close, in its own program.
+  The 06:00 news run: about 45 s an idea (the model is loaded per idea), inside `kronos_minutes` (10).
+  (The dormant day-trade verdict took about 5 minutes each.)
+- **By hand:** `python3 trader-broker/shadow.py show|run|time SYMBOL`.
+- **Tests:** `tests/test_shadow.py`.
+
+## Review checkpoint (written 22 Nov 2026; the owner's rules)
+
+At **20 or more completed drift + news trades** (`python3 research/checkpoint_review.py` prints all three; it
+works with fewer and says when there are too few):
+- **Kronos:** compare the trades Kronos rated highly (the top half of its forecasts) with those it rated poorly.
+  If the highly rated ones have not clearly done better (the script's bar: at least 1 percentage point more a
+  trade after fees), **remove Kronos from the agent**.
+- **Stops:** from the stop shadows, did the stops help or hurt on average? Recommend whether to widen them
+  (the script: over +1% on average means they cost money; under -1% means they saved money).
+- **Benchmark:** each strategy against zero AND against holding the S&P 500 over the same days.
+- Drift trades are likely to be rare until the next earnings season (mid to late January), so most early
+  evidence will come from news trades.
+Changing a stop or removing Kronos is the owner's decision after the checkpoint, never Claude's on its own.
 
 ## Market holidays and 1:00 p.m. early closes (from 21 Nov 2026)
 

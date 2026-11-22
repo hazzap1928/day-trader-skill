@@ -1133,12 +1133,20 @@ def info_for(sd, row, budget_s):
 
 
 def kronos_for(row, timeout):
-    ev = _load("trader-broker", "evidence")
-    risk = float(row["price"]) - float(row["stop"])
-    sig = {"symbol": row["symbol"], "at": _now(), "entry": row["price"], "stop": row["stop"],
-           "target": round(float(row["price"]) + 2 * risk, 2)}
-    v = ev.kronos_verdict(sig, timeout=int(timeout))
-    return dict(v, note="Kronos looks hours ahead, an idea is held for weeks: information only")
+    """Kronos's opinion of one idea, shadow only (trader-broker/shadow.py): its forecast from the last close
+    before the idea's day to the close on its sell date, the forecast research/kronos_backtest.py tested.
+    (Until 22 Nov this asked the day-trade forecaster, which looks only hours ahead and failed every time.)"""
+    sh = _load("trader-broker", "shadow")
+    if not sh.kronos_available():
+        return {"verdict": "unavailable", "why": "trader-kronos is not set up (see trader-kronos/README.md)"}
+    page = {"id": row.get("id") or row["symbol"], "symbol": row["symbol"], "buy_date": row.get("day"),
+            "sell_rule": {"date": row.get("sell_date")}}
+    ans = sh.run_kronos([sh.kronos_item(page, sh._bars_fn())], budget_s=max(60, int(timeout) - 60))
+    r = (ans.get("results") or [{}])[0]
+    if r.get("score") is None:
+        return {"verdict": "error", "why": r.get("error") or "no forecast inside the time budget"}
+    return dict(r, verdict="up" if r["score"] > 0 else "down", model=ans.get("model"),
+                note="Kronos's forecast to the sell date: information only, it never decides")
 
 
 def add_info(sd, s, info_fn=None, kronos_fn=None, day=None, kronos=True):
@@ -1154,7 +1162,7 @@ def add_info(sd, s, info_fn=None, kronos_fn=None, day=None, kronos=True):
             r["info"] = {"error": str(e)[:120]}
     for r in mine:
         left = budget - (_now() - start) if kronos else 0
-        if left < 240:
+        if left < 120:          # one daily forecast takes about 45 s on the 2017 MacBook, model load included
             r["kronos"] = {"verdict": "skipped", "why": "time budget"}
             continue
         try:
