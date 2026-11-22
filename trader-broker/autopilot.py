@@ -1464,9 +1464,13 @@ class Pilot(object):
             nw = self.news()
             rv = mod("trader-broker", "review")
             rv.t212, rv.drift, rv.holdings, rv.holdings_t212 = t212, nw.drift, nw.holdings, nw.holdings_t212
-            rv.run(self.sd, self.drift_cfg(), res, _ny().date(), bars_fn=nw.drift.daily_bars, say=self.say,
+            cfg = self.drift_cfg()
+            # new SEC filings and headlines on each holding (report only; off unless "hold_watch" is on)
+            hw = mod("trader-broker", "hold_watch").run(self.sd, cfg, "review", say=self.say)
+            rv.run(self.sd, cfg, res, _ny().date(), bars_fn=nw.drift.daily_bars, say=self.say,
                    push=lambda text: phone_mod.push(self.sd, text, phone=self.phone),
-                   asks=nw.load_asks(self.sd)["asks"], verdicts=nw.todays_verdicts(self.sd, _ny().date()))
+                   asks=nw.load_asks(self.sd)["asks"], verdicts=nw.todays_verdicts(self.sd, _ny().date()),
+                   watch=hw["by_page"])
         except Exception as e:
             self.say("daily review: could not be done (%s)" % t212.scrub(e, self.client._secrets))
 

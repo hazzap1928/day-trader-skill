@@ -954,8 +954,8 @@ def daily_review(r):
             read = ". Today's read: %s%s" % (_VERDICT[v["verdict"]], "" if not v.get("why") else " (%s)" % esc(_short(v["why"], 140)))
             if row.get("strategy") == "drift":
                 read += ". Noted only: this one is sold by its date rule"
-        items.append("%s (%s): %s%s; %s%s%s" % (company(row["symbol"]), _KIND.get(row.get("strategy"), "a label I don't know"),
-                                               gain, mkt, net, sell, read))
+        items.append("%s (%s): %s%s; %s%s%s%s" % (company(row["symbol"]), _KIND.get(row.get("strategy"), "a label I don't know"),
+                                                 gain, mkt, net, sell, read, watch_words(row.get("watch"))))
     if not r.get("rows"):
         items.append("Nothing is held")
     if r.get("due"):
@@ -974,6 +974,52 @@ def daily_review(r):
     out += bullets(items)
     out.append("<i>This review sells nothing and changes nothing. A sale needs its sell date or your Approve.</i>")
     return join(out)
+
+
+# ---------------------------------------------------------------- new filings and headlines on holdings (report only)
+
+_8K_WORDS = {"1.01": "a major agreement", "1.02": "an agreement ended", "1.03": "bankruptcy",
+             "1.05": "a cyber attack", "2.01": "buying or selling a business", "2.02": "its results",
+             "2.03": "new borrowing", "2.04": "a lender demanding early repayment", "2.05": "restructuring costs",
+             "2.06": "a write-down of what its assets are worth", "3.01": "a delisting notice",
+             "3.02": "new shares sold privately", "3.03": "shareholder rights changed", "4.01": "a change of auditor",
+             "4.02": "past accounts no longer reliable", "5.01": "a change of control",
+             "5.02": "a director or senior manager joining or leaving", "5.03": "its rules or year end changed",
+             "5.07": "shareholder vote results", "7.01": "a public statement", "8.01": "other news"}
+
+
+def watch_item(i):
+    """One filing or headline in plain words: "SEC filing (Fri 20 Nov): bankruptcy" or the headline."""
+    when = esc(short_day(i.get("day"))) if i.get("day") else "date not given"
+    if i.get("kind") == "filing":
+        what = [_8K_WORDS.get(x, "item %s" % x) for x in i.get("items") or [] if x != "9.01"]
+        return "SEC filing (%s): %s" % (when, esc(", ".join(what) or "a company announcement"))
+    return "Headline (%s): %s" % (when, esc(_short(i.get("title"), 140)))
+
+
+def watch_words(w):
+    """A holding's new items for the daily review: the serious ones, then the other filings, then a headline count."""
+    if not w:
+        return ""
+    parts = ["\U0001f6a9 " + watch_item(i) for i in w.get("serious") or []]
+    parts += [watch_item(i) for i in w.get("filings") or [] if not i.get("serious")]
+    rest = sum(1 for i in w.get("all") or [] if i.get("kind") != "filing" and not i.get("serious"))
+    if rest:
+        parts.append("%d other headline%s" % (rest, "" if rest == 1 else "s"))
+    return ". New since the last review: " + "; ".join(parts) if parts else ""
+
+
+def hold_watch_briefing(by_page):
+    """The briefing's lines for SERIOUS new filings or headlines on what is held. [] when there are none."""
+    rows = [i for items in (by_page or {}).values() for i in items if i.get("serious")]
+    if not rows:
+        return []
+    out = ["\U0001f6a9 <b>News that may affect what I hold</b>"]
+    for i in rows:
+        out.append("• %s: %s" % (company(i.get("symbol")), watch_item(i)))
+    out.append("<i>Report only: nothing is sold or asked because of this. Worth a look at whether the reason for "
+               "buying still holds.</i>")
+    return out
 
 
 # ---------------------------------------------------------------- news ideas (bought for a reason, held until a rule)

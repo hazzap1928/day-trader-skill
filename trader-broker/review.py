@@ -11,7 +11,8 @@ judgement.
      cash, risk at the stops at or under each strategy's cap.
   5. Is a rule sale due? A holding at its sell date (the guard's 15:50 close sells it: an existing rule).
   6. Does a reason look broken? The stock left the universe or went on the blocked list, or the news run
-     asked about it. The review only SAYS it would ask.
+     asked about it. The review only SAYS it would ask. New SEC filings and headlines on each holding since
+     the last review (trader-broker/hold_watch.py, when "hold_watch" is on) are shown beside it.
   7. How is each holding doing? Its gain in pounds after fees, the S&P 500 beside it for information.
   8. One message.
 
@@ -148,7 +149,7 @@ def limits(cfg, view, risk, cost):
     return out
 
 
-def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None):
+def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None, watch=None):
     """The review from a daily-match result (holdings_t212.daily_match). Pure but for the SPY bars
     (`bars_fn`, information only; a failure just leaves the market figure out). Changes nothing."""
     H, D = _hold(), _drift()
@@ -199,7 +200,8 @@ def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None):
                "gain_gbp": gain, "stop": st.get("stop"), "stop_how": st.get("how"), "risk_gbp": st.get("risk_gbp"),
                "buy_date": (page or {}).get("buy_date"), "reason": (page or {}).get("reason"),
                "sell_date": None, "status": (page or {}).get("status"), "market_pct": None,
-               "verdict": (verdicts or {}).get(pos.get("symbol")) if page is not None and H.is_hold(page) else None}
+               "verdict": (verdicts or {}).get(pos.get("symbol")) if page is not None and H.is_hold(page) else None,
+               "watch": _watch(watch, page)}
         sell = H.sell_date(page) if page else None
         if sell:
             row["sell_date"] = sell.isoformat()
@@ -253,6 +255,14 @@ def build(sd, cfg, res, today, bars_fn=None, asks=None, verdicts=None):
             "account_gbp": _num(v.get("account_gbp")), "problems": problems, "report_only": True}
 
 
+def _watch(watch, page):
+    """A holding's new filings and headlines (trader-broker/hold_watch.py), or None. Shown only."""
+    items = (watch or {}).get((page or {}).get("id"))
+    if not items:
+        return None
+    return _load("trader-broker", "hold_watch").summary(items)
+
+
 def worth_sending(r, sd=None):
     """A message only when something is held or something is wrong. A failed check is told only when the
     record says something should be held."""
@@ -284,6 +294,9 @@ def text(r):
             L.append("         today's verdict from the news runs: %s (confidence %s): %s%s" % (
                 row["verdict"].get("verdict"), row["verdict"].get("confidence"), row["verdict"].get("why"),
                 "; written down only, the date rule decides" if row["strategy"] == "drift" else ""))
+        for i in (row.get("watch") or {}).get("all") or []:
+            L.append("         new: %s%s" % (_load("trader-broker", "hold_watch").item_line(i).strip(),
+                                              "  [%s]" % i["why"] if i.get("why") else ""))
     if not r["rows"]:
         L.append("  nothing is held")
     if r["due"]:
@@ -297,11 +310,11 @@ def text(r):
     return "\n".join(L)
 
 
-def run(sd, cfg, res, today, bars_fn=None, say=None, push=None, asks=None, verdicts=None):
+def run(sd, cfg, res, today, bars_fn=None, say=None, push=None, asks=None, verdicts=None, watch=None):
     """Build, save, log and (when worth it) send the review. Never raises; never changes an order or a page."""
     T = _t212()
     try:
-        r = build(sd, cfg, res, today, bars_fn=bars_fn, asks=asks, verdicts=verdicts)
+        r = build(sd, cfg, res, today, bars_fn=bars_fn, asks=asks, verdicts=verdicts, watch=watch)
     except Exception as e:
         r = could_not(today, e)
     try:

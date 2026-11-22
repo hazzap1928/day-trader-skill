@@ -391,7 +391,19 @@ def build(client, state_dir):
     b["todo"] = todo(b)
     b["drift"] = drift_line(state_dir, session, "briefing")
     b["ideas"] = news_ideas_data(state_dir, session)
+    b["holdwatch"] = hold_watch_data(state_dir, cfg)
     return b
+
+
+def hold_watch_data(state_dir, cfg):
+    """SERIOUS new SEC filings and headlines on what is held, each told once (trader-broker/hold_watch.py).
+    Report only; off unless "hold_watch" is on in the config. A fault is logged and leaves the section out."""
+    try:
+        return _load("trader-broker", "hold_watch").run(state_dir, cfg, "briefing",
+                                                        say=lambda t: sys.stderr.write("briefing: %s\n" % t))
+    except Exception as e:
+        sys.stderr.write("briefing: hold watch failed: %s: %s\n" % (type(e).__name__, str(e)[:300]))
+        return None
 
 
 def news_ideas_data(state_dir, session):
@@ -598,6 +610,13 @@ def full_text(b):
     if b.get("drift_rows"):
         L += ["", "## Drift positions (demo, held up to 20 trading days; expected overnight)"]
         L += ["- " + _drift_buy().holding_line(r) for r in b["drift_rows"]]
+    hw = b.get("holdwatch") or {}
+    if hw.get("on"):
+        L += ["", "## New filings and headlines on what is held (serious only; report only)"]
+        rows = [i for items in (hw.get("by_page") or {}).values() for i in items]
+        L += ["- %s %s: %s [%s] %s" % (i.get("symbol"), i.get("day"), i.get("title"), i.get("why"), i.get("link") or "")
+              for i in rows] or ["- none new"]
+        L += ["- note: %s" % e for e in hw.get("errors") or []]
     if b.get("allocation"):
         L += ["", "## Cash allocation (demo)", "- " + b["allocation"]]
     L += ["", "## 5. To do, most urgent first"]
@@ -703,6 +722,9 @@ def phone_text(b, path, state_dir):
         watch = []
     if b.get("drift_rows"):
         watch = M.drift_holdings(b["drift_rows"]) + ([""] if watch else []) + watch
+    flags = M.hold_watch_briefing((b.get("holdwatch") or {}).get("by_page"))
+    if flags:
+        watch = flags + ([""] if watch else []) + list(watch)
     ideas = M.news_briefing(b.get("ideas"))
     if ideas:
         watch = list(watch) + ([""] if watch else []) + ideas
