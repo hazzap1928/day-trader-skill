@@ -14,19 +14,26 @@ It never places, cancels or changes an order, never sends a question or buttons,
 and blocks nothing. Off unless the config has "hold_watch": {"enabled": true}. Broker-neutral: it reads the
 holdings record (trader-broker/holdings.py) only, so an Interactive Brokers version can reuse it.
 
-The "serious" rule (version 1, fixed in advance; changing it starts version 2):
-  - an 8-K with one of SERIOUS_8K's items (bankruptcy, a cyber attack, a lender demanding early repayment,
-    a write-down, a delisting notice, a new auditor, past accounts no longer reliable, a change of control)
-  - a headline whose TITLE names the company (its name, or its ticker in capitals) AND matches one of
-    SERIOUS_WORDS (bankruptcy, fraud, a restatement, SEC charges, a halt, a CEO or CFO leaving, a forecast
-    cut, a takeover, a recall, a hack...)
-  Routine 8-Ks (results, director changes, votes, agreements) and other headlines are shown in the review only.
+The "serious" rule (version 2, the owner's of 22 Nov 2026; changing it starts version 3):
+  - SEC filings: a late-filing notice (NT 10-K, NT 10-Q); an 8-K with one of SERIOUS_8K's items (a major
+    agreement ended, bankruptcy, a cyber attack, a lender demanding early repayment, a write-down, a delisting
+    notice, new shares sold privately, a new auditor, past accounts no longer reliable, a change of control);
+    an 8-K whose own words (items 5.02, 1.01, 8.01, read from the SEC) show the company's CEO or CFO leaving
+    or a new share offering. Other director or officer changes are shown in the evening review only.
+  - Headlines: the TITLE names the company (its name, its first word when distinctive, or its ticker in
+    capitals) AND it matches SERIOUS_WORDS (bankruptcy, a halt, fraud or a restatement, a short-seller report,
+    the CEO or CFO leaving, a forecast cut, a takeover, a new share offering, a recall or hack, a regulator
+    saying no), or it names the company as a takeover target, or the SEC, the Justice Department, the FTC or
+    prosecutors are named as acting. Shareholder law-firm notices ("investigates claims", class actions)
+    never count unless one of those authorities is named.
+  Routine 8-Ks and other headlines are shown in the evening review only.
 
 Files (trader/state/holdwatch/): state.json (the SEC ticker list, every item found, what each place has
 shown), items.jsonl (every new item once, for judging the rule later).
 
     python3 trader-broker/hold_watch.py show            # what has been found for each holding
     python3 trader-broker/hold_watch.py check           # look now (network: Yahoo and SEC), print what is new
+    python3 trader-broker/hold_watch.py briefed --since 2026-11-23   # everything that reached the briefing
 
 Headlines are leads, not facts. Education and tooling, not financial advice.
 """
@@ -42,7 +49,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-RULE_VERSION = 1
+RULE_VERSION = 2              # 2 (22 Nov 2026): the owner's changes to the first draft
 MAX_BRIEFING = 3              # serious items a holding in one briefing
 MAX_KEEP = 200                # items kept a holding
 CIK_DAYS = 7                  # the SEC ticker list is fetched again after this many days
@@ -50,29 +57,63 @@ SHOW_PLACES = ("review", "briefing")
 WATCHED = ("open", "sell_asked", "selling", "mismatch")       # bought and held (not "waiting", not "closed")
 
 SERIOUS_8K = {
+    "1.02": "a major agreement ended",
     "1.03": "bankruptcy",
     "1.05": "a cyber attack",
     "2.04": "a lender demanding early repayment",
     "2.06": "a write-down of what its assets are worth",
     "3.01": "a delisting notice",
+    "3.02": "new shares sold privately",
     "4.01": "a change of auditor",
     "4.02": "past accounts no longer reliable",
     "5.01": "a change of control",
 }
+LATE_FILING = "a late-filing notice (it cannot file its accounts on time)"
+READ_ITEMS = ("5.02", "1.01", "8.01")      # 8-Ks whose text is read: a CEO or CFO leaving, a new share offering
 
+# ---- the filing's own words (items 5.02, 1.01, 8.01), one sentence at a time
+_ROLE = re.compile(r"\b(?:chief executive officer|chief financial officer|principal executive officer|"
+                   r"principal financial officer|CEO|CFO)\b", re.I)
+_GOING = re.compile(r"\b(?:resign(?:ed|s|ation)?|(?:will|to|decided to|intends? to|plans? to|decision to) retire|"
+                    r"retire[sd]? from|retirement from|step(?:s|ped)? down|stepping down|terminat(?:ed|ion of)|"
+                    r"depart(?:ed|ure|s)? from|will depart|will leave|leave the company|cease[sd]? to serve|"
+                    r"no longer serv\w+|separation from)\b", re.I)
+_OFFER = re.compile(r"\b(?:underwriting agreement|underwritten (?:public )?offering|public offering|registered direct "
+                    r"offering|at[- ]the[- ]market|equity distribution agreement|sales agreement)\b", re.I)
+_SHARES = re.compile(r"\b(?:shares of (?:its |the company.s )?common stock|common shares|ordinary shares|"
+                     r"depositary shares)\b", re.I)
+
+# ---- headlines
 SERIOUS_WORDS = [
     ("bankruptcy", r"\bbankrupt\w*|\bchapter 11\b|\bgoing concern\b|\binsolven\w*"),
     ("delisting or halt", r"\bdelist\w*|\btrading (?:halt|pause|suspen)\w*|\bhalt(?:s|ed)? trading\b|\bshares? halted\b"),
     ("fraud or accounting", r"\bfraud\w*|\brestate(?:s|d|ment)?\b|\baccounting (?:irregularit\w*|probe|issues?|errors?)\b"),
-    ("charges or probe", r"\bSEC charges?\b|\bsubpoena\w*|\bindict\w*|\b(?:DOJ|SEC|FTC|criminal) (?:probe|investigation)\b|\braid(?:s|ed)?\b"),
     ("short seller report", r"\bshort[- ]sell(?:er|ers|ing) report\b|\bshort report\b"),
-    ("CEO or CFO leaving", r"\b(?:CEO|CFO|chief executive|chief financial officer)\b[^.]{0,40}\b(?:resign\w*|steps? down|stepping down|ousted|fired|departs?|departure|exits?|leav(?:es|ing)|to leave)\b"),
+    ("CEO or CFO leaving", r"\b(?:CEO|CFO|chief executive|chief financial officer)\b[^.]{0,40}\b(?:resign\w*|retir\w*|steps? down|stepping down|ousted|fired|departs?|departure|exits?|out|leav(?:es|ing)|to leave)\b"
+                           r"|\b(?:replaces?|replaced|ousts?|ousted|fires?|fired|names? (?:a )?new|appoints? (?:a )?new|search(?:es|ing)? for (?:a )?new)\s+(?:its\s+)?(?:interim\s+)?(?:CEO|CFO|chief executive|chief financial officer)\b"),
     ("forecast cut", r"\b(?:cuts?|lowers?|slashes|withdraws?|pulls?|suspends?)\b[^.]{0,30}\b(?:guidance|forecast|outlook)\b|\bprofit warning\b|\bwarns on (?:profit|sales|revenue)\b"),
     ("takeover", r"\b(?:to be acquired|agrees? to be (?:bought|acquired)|takeover (?:bid|offer|approach)|buyout (?:offer|bid)|hostile bid)\b"),
+    ("new share offering", r"\b(?:public|secondary|follow-on|equity|common stock|share) offering\b|\bshare sales?\b"),
     ("recall or hack", r"\brecall\w*\b|\bdata breach\b|\bcyber ?attack\w*|\bransomware\b|\bhack(?:ed|ers?)\b"),
     ("regulator says no", r"\bFDA (?:rejects?|declines?)\b|\bcomplete response letter\b|\bclinical hold\b|\bblocks? (?:the )?(?:deal|merger)\b"),
 ]
 _SERIOUS_RX = [(label, re.compile(rx, re.I)) for label, rx in SERIOUS_WORDS]
+# the SEC, the Justice Department, the FTC or prosecutors acting (named as doing it). Case matters: "sec" is not the SEC
+_AGENCY = r"(?:SEC|Securities and Exchange Commission|DOJ|Justice Department|Department of Justice|FTC|Federal Trade Commission|federal prosecutors|prosecutors)"
+_GOV = re.compile(r"\b%s\b[^.]{0,40}?\b(?:charges?|charged|sues|sued|opens?|launch(?:es|ed)?|probe\w*|investigat\w*|subpoena\w*|raid\w*|indict\w*|fines?|fined)\b"
+                  r"|\b(?:probe|investigation|subpoena|charges?|lawsuit) (?:by|from) (?:the )?%s\b|\bindict(?:s|ed|ment)\b" % (_AGENCY, _AGENCY))
+# shareholder law-firm notices ("INVESTOR ALERT: ... Law Firm Investigates Claims ...", class-action deadlines)
+_LAW_FIRM = re.compile(
+    r"\blaw firm\b|\bclass action\b|\bsecurities (?:fraud )?(?:lawsuit|litigation|class)\b|\binvestors? (?:who|that) "
+    r"(?:lost|purchased|bought)\b|\bon behalf of (?:investors|shareholders)\b|\blead plaintiff\b|\b(?:shareholder|investor) "
+    r"(?:alert|rights|notice|reminder)\b|\binvestigates? (?:claims|potential)\b|\bsecure counsel\b|\b(?:Rosen|Pomerantz|"
+    r"Levi & Korsinsky|Bragar Eagel|Faruqi|Glancy|Robbins|Kessler Topaz|Bernstein Liebhard|Schall|Gross Law|Hagens Berman|"
+    r"Kirby McInerney|Johnson Fistel|Bronstein|Rigrodsky|Halper Sadeh|Kahn Swick|Block & Leviton|Holzer|Portnoy|Frank R\. Cruz)\b",
+    re.I)
+_TAKEOVER_VERB = (r"\b(?:to buy|to acquire|agrees? to (?:buy|acquire)|buys|acquires|bids? for|offers? to buy|takeover of|"
+                  r"approach(?:ed|es)?|nears? (?:a )?deal (?:for|to buy)|in talks to (?:buy|acquire))\b[^.]{0,30}?")
+_CLICKBAIT = re.compile(r"\b(?:time to buy|should you buy|stocks? to buy|reasons? to buy|good (?:stock )?to buy|buy now|"
+                        r"worth buying|best \w+ (?:stocks? )?to buy)\b|\?\s*$", re.I)
 
 _MODS = {}
 
@@ -214,18 +255,103 @@ def names_company(title, sym, name):
     return len(sym) >= 3 and re.search(r"(?<![A-Za-z])%s(?![A-Za-z])" % re.escape(sym), title) is not None
 
 
-def serious(item, sym, name=None):
-    """(True, why) when the item meets the serious rule (version RULE_VERSION), else (False, None)."""
-    if item.get("kind") == "filing":
-        hit = [SERIOUS_8K[i] for i in item.get("items") or [] if i in SERIOUS_8K]
-        return (True, "SEC filing: " + ", ".join(hit)) if hit else (False, None)
-    title = item.get("title") or ""
+def _company_rx(sym, name):
+    alts = [r"\b%s\b" % re.escape(n).replace(r"\ ", r"[\s-]+") for n in _name_forms(name)]
+    sym = str(sym or "").upper()
+    if len(sym) >= 3:
+        alts.append(r"(?<![A-Za-z])%s(?![A-Za-z])" % re.escape(sym))
+    alts.append(r"\(%s\)" % re.escape(sym))
+    return "(?:%s)" % "|".join(alts)
+
+
+def headline_rule(title, sym, name=None):
+    """(True, why) when a headline meets the serious rule, else (False, None or the reason it was let go)."""
+    title = str(title or "")
     if not names_company(title, sym, name):
         return False, None
+    gov = _GOV.search(title)
+    if gov is None and re.search(r"\b%s\b" % _AGENCY, title) is None and _LAW_FIRM.search(title):
+        return False, "a shareholder law-firm notice"
+    if gov is not None:
+        return True, "headline: charges or a probe by the authorities"
     for label, rx in _SERIOUS_RX:
         if rx.search(title):
             return True, "headline: " + label
+    if not _CLICKBAIT.search(title) and re.search(_TAKEOVER_VERB + r"\b" + _company_rx(sym, name), title, re.I):
+        return True, "headline: takeover"
     return False, None
+
+
+def _sentences(text):
+    # a full stop after Inc, Corp, Co, Mr, Ms, Mrs, Dr, Jr, No or a single letter (N.A.) does not end a sentence
+    split = r"(?<!\bInc\.)(?<!\bCorp\.)(?<!\bCo\.)(?<!\bMr\.)(?<!\bMs\.)(?<!\bMrs\.)(?<!\bDr\.)(?<!\bJr\.)" \
+            r"(?<!\bNo\.)(?<!\b[A-Z]\.)(?<=[.;])\s+"
+    return [x for x in re.split(split, re.sub(r"\s+", " ", text or "")) if x]
+
+
+def section(body, item):
+    """An 8-K's "Item 5.02" part, up to the next item or the signatures; "" when it has none."""
+    m = re.search(r"\bItem\s+%s\b" % re.escape(item), body or "", re.I)
+    if not m:
+        return ""
+    end = re.search(r"\bItem\s+\d\.\d\d\b|\bSIGNATURES?\b", body[m.end():])
+    return body[m.start():m.end() + (end.start() if end else 6000)]
+
+
+def _company_role(sentence, m, name):
+    """A role that is the company's own CEO or CFO, not "Chief Executive Officer of the Intel Products business"."""
+    after = sentence[m.end():m.end() + 60]
+    of = re.match(r"\s*(?:\([^)]{1,12}\)\s*)?,?\s*of\s+(.{0,40})", after)
+    if not of:
+        return True
+    rest = of.group(1)
+    if re.match(r"(?:the )?(?:Company|Registrant|Corporation)\b", rest, re.I):
+        return True
+    # "of Intel Corporation" is the company; "of Boeing Defense, Space & Security" is a division
+    tail = r"(?:,?\s+(?:Company|Corporation|Corp|Inc|Co|plc|Holdings?|Group)\b\.?)?(?!\s+[A-Z&])"
+    rest = re.sub(r"^the\s+", "", rest, flags=re.I)
+    return any(re.match(re.escape(n) + tail, rest) or re.match(re.escape(n) + tail, rest, re.I)
+               and not re.match(re.escape(n) + r"\s+[A-Z&]", rest, re.I) for n in _name_forms(name))
+
+
+def filing_text_rule(body, items, name=None):
+    """What a filing's own words show: ["its CEO or CFO is leaving", "a new share offering"] (or [])."""
+    out = []
+    if "5.02" in items:
+        for s in _sentences(section(body, "5.02")):
+            if _GOING.search(s) and any(_company_role(s, m, name) for m in _ROLE.finditer(s)):
+                out.append("its CEO or CFO is leaving")
+                break
+    for it in ("1.01", "8.01"):
+        if it in items and any(_OFFER.search(s) and _SHARES.search(s) for s in _sentences(section(body, it))):
+            out.append("a new share offering")
+            break
+    return out
+
+
+def serious(item, sym, name=None):
+    """(True, why) when the item meets the serious rule (version RULE_VERSION), else (False, None)."""
+    if item.get("kind") == "filing":
+        hit = []
+        if str(item.get("form") or "").upper().startswith("NT "):
+            hit.append(LATE_FILING)
+        hit += [SERIOUS_8K[i] for i in item.get("items") or [] if i in SERIOUS_8K]
+        hit += [w for w in item.get("text_why") or [] if w not in hit]
+        return (True, "SEC filing: " + ", ".join(hit)) if hit else (False, None)
+    ok, why = headline_rule(item.get("title"), sym, name)
+    return (True, why) if ok else (False, None)
+
+
+def doc_url(cik, accession):
+    return "https://www.sec.gov/Archives/edgar/data/%d/%s/%s.txt" % (int(cik), accession.replace("-", ""), accession)
+
+
+def read_filing(fetcher, cik, accession):
+    """The filing's text with the markup taken out (the SEC's full submission file)."""
+    import html as _html
+    raw = fetcher.get(doc_url(cik, accession), "sec-doc-%s.txt" % accession, sec=True)
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    return re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", text)))
 
 
 def _ny_day(t):
@@ -294,11 +420,13 @@ def check(sd, cfg, now=None, fetcher=None, environ=None):
             if not cik:
                 out["errors"].append("no SEC company number for %s" % sym)
             else:
-                try:
-                    data = fetcher.get(N.SEC_FEED % (cik, "8-K", 10), "sec-8-K-%s.xml" % cik, sec=True)
-                    items += [i for i in N.parse_sec_atom(data, sym) if str(i.get("form") or "").upper().startswith("8-K")]
-                except Exception as e:
-                    out["errors"].append("SEC filings for %s: %s" % (sym, str(e)[:160]))
+                for form, keep in (("8-K", "8-K"), ("NT", "NT ")):
+                    try:
+                        data = fetcher.get(N.SEC_FEED % (cik, form, 10), "sec-%s-%s.xml" % (form, cik), sec=True)
+                        items += [dict(i, cik=cik) for i in N.parse_sec_atom(data, sym)
+                                  if str(i.get("form") or "").upper().startswith(keep)]
+                    except Exception as e:
+                        out["errors"].append("SEC %s filings for %s: %s" % (form, sym, str(e)[:160]))
         items = N.dedupe(N.tag(items, {sym: nm.get(sym)}))
         rec = doc["pages"].setdefault(p["id"], {"symbol": sym, "strategy": _hold().strategy_of(p), "items": []})
         have = {i["id"] for i in rec["items"]}
@@ -306,11 +434,20 @@ def check(sd, cfg, now=None, fetcher=None, environ=None):
             day = _ny_day(it["time"])
             if it["id"] in have or day is None or (buy and day < buy) or it["time"] > now + datetime.timedelta(minutes=10):
                 continue
+            if it["kind"] == "filing" and set(it.get("items") or []) & set(READ_ITEMS):
+                try:
+                    body = read_filing(fetcher, it["cik"], it["id"].split(":", 1)[1])
+                    it["text_why"] = filing_text_rule(body, it.get("items") or [], nm.get(sym))
+                    it["text_read"] = True
+                except Exception as e:
+                    it["text_read"] = False
+                    out["errors"].append("could not read the %s filing of %s: %s" % (it.get("day") or day, sym, str(e)[:120]))
             hit, why = serious(it, sym, nm.get(sym))
             row = {"id": it["id"], "page": p["id"], "symbol": sym, "strategy": rec["strategy"], "kind": it["kind"],
                    "form": it.get("form"), "items": it.get("items") or [], "title": it.get("title") or "",
                    "link": it.get("link") or "", "time": it["time"].isoformat(), "day": day.isoformat(),
                    "tags": it.get("tags") or [], "serious": hit, "why": why, "rule": RULE_VERSION,
+                   "text_read": it.get("text_read"),
                    "found_at": now.isoformat(), "shown": []}
             rec["items"].append(row)
             have.add(it["id"])
@@ -390,13 +527,31 @@ def show(sd):
     return "\n".join(L)
 
 
+def briefed(sd, since=None):
+    """Every item that reached the briefing (found on or after `since`, a date), oldest first."""
+    rows = []
+    for rec in (load(sd).get("pages") or {}).values():
+        for i in rec.get("items") or []:
+            if "briefing" in (i.get("shown") or []) and (since is None or str(i.get("found_at"))[:10] >= str(since)):
+                rows.append(i)
+    return sorted(rows, key=lambda i: (i.get("found_at") or "", i.get("symbol") or ""))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="New SEC filings and headlines on what is held (report only).")
-    ap.add_argument("cmd", choices=("show", "check"))
+    ap.add_argument("cmd", choices=("show", "check", "briefed"))
     ap.add_argument("--state-dir", default=os.path.join(ROOT, "trader"))
+    ap.add_argument("--since", help="briefed: from this date (YYYY-MM-DD)")
     a = ap.parse_args(argv)
     if a.cmd == "show":
         print(show(a.state_dir))
+        return 0
+    if a.cmd == "briefed":
+        rows = briefed(a.state_dir, a.since)
+        for i in rows:
+            print("%s found %s  %-6s %s  [%s]  %s" % (i.get("day"), str(i.get("found_at"))[:16], i.get("symbol"),
+                                                    i.get("title"), i.get("why"), i.get("link") or ""))
+        print("%d item(s) reached the briefing%s" % (len(rows), " since %s" % a.since if a.since else ""))
         return 0
     try:
         with open(os.path.join(a.state_dir, "config.json"), encoding="utf-8") as fh:
