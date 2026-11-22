@@ -18,7 +18,7 @@ import importlib.util, json, random, statistics as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-exec(open(os.path.join(HERE, "pead_stop.py")).read().split('if __name__ == "__main__":')[0])
+exec(open(os.path.join(HERE, "pead_stop.py")).read().rsplit('\nif __name__ == "__main__":', 1)[0])
 
 _spec = importlib.util.spec_from_file_location("chart", os.path.join(ROOT, "trader-scanner", "chart.py"))
 chart = importlib.util.module_from_spec(_spec)

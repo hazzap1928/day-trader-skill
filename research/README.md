@@ -80,6 +80,62 @@ lowest one-year volatility. 2019 to 2023: +44.7% against SPY +105.5% (beat 10% o
 2024 to Oct 2026: +32.9% against SPY +65.2% (beat 51%). It fell far less in 2022 (-3.5% against
 -18.7%) but trailed the index badly overall. Not a candidate.
 
+## The drift stop and chart labels (22 Nov 2026)
+
+`research/pead_stop.py` and `research/pead_chart.py`, on the daily-bar Time Machine for holds
+(`trader-timemachine/holds.py`). Every signal of the tested drift rule (ranking B, 10 slots), bought at the open
+of the 2nd trading day after the report, held 20 trading days, 0.2% costs each way. 2,624 signals in
+2019-2023 and 1,387 in 2024-2026, each period reported on its own. The no-stop book reproduces the
+original drift research exactly on the same data (2019-2023 +96.7% against the tracker's +109.5%); 2024-2026
+now reads +48.1% (was +46.5%) because Nasdaq's figures changed since the first download (the original code
+gives the same +48.1% on today's data).
+
+**The live stop (3 x ATR, about 8 to 9% under the buy for a typical share) cost money in both periods.**
+
+| Sell rule | Avg a trade after costs, 2019-23 | vs no stop | Avg, 2024-26 | vs no stop | Stopped |
+|---|---|---|---|---|---|
+| No stop (the tested rule) | +1.53% | | +2.20% | | 0% |
+| 2 x ATR | +0.88% | -0.65 | +1.45% | -0.75 | 32-40% |
+| **3 x ATR (live)** | +1.35% | **-0.18** | +1.91% | **-0.29** | 16-22% |
+| 4 x ATR | +1.57% | +0.04 | +1.97% | -0.22 | 8-12% |
+| Rising 3 x ATR | +1.15% | -0.38 | +1.49% | -0.71 | 32-39% |
+
+As the 10-slot book against holding the tracker: no stop -12.7 and -12.6 points; 3 x ATR -28.7 and -35.2;
+4 x ATR -27.2 and -23.1. A stop cut the worst single trade (-75.6% to -21.5% in 2019-2023) and the largest
+fall of the book a little (40.3% to 36.9%), but on average it sold shares on ordinary dips that then
+recovered. The "rising" stop (raised as the price rises) was worse than the fixed one in both periods.
+In plain words: on this history, the stop protected against a few disasters and paid for it with many
+small, unnecessary sales.
+
+**Chart labels at the buy: none held up.** In 2019-2023, drift trades whose chart was "falling apart"
+(under the 50-day average, down 10% in a week or at a 20-day low) did BETTER (+2.9% against +0.9%), and
+those in an uptrend did worse. In 2024-2026 neither gap was there (+2.3% against +2.2%). No label had a gap
+of the same sign in both periods that random groups of trades rarely match. So "skip a drift buy whose
+chart looks bad" has no support here, and on 2019-2023 it would have skipped the better trades.
+
+**Shares that were delisted, taken over or went bust.** The price data is TODAY's S&P 500 list (each
+company counted only from the day it joined), so a company that was in the index in 2019-2026 and has since
+left it (taken over, shrank, or went bust) is missing entirely: its signals are not in the test. With about
+20-25 index changes a year, very roughly one in seven of the companies in the index over the period is
+missing. Those are more often companies that fell, which is exactly where a stop helps most. So the cost
+of the stop is probably overstated a little. The 3 x ATR cost (-0.18 and -0.29 points a trade) is small
+enough that the missing companies could cancel it; the larger costs of 2 x ATR and the rising stop are less
+likely to be overturned. A fair test of the stop needs point-in-time index membership with delisted prices,
+which free sources do not give.
+
+**No data it could not have had at the time:** the ATR uses the 14 days before the buy day only (a test
+checks the buy day never counts); the stop is set from the buy-day open; a day that opens under the stop sells
+at that open, and a day whose low reaches it sells at the stop; the chart labels use closes before the buy
+day; S&P membership is as of the report day. Two known exceptions: the ranking uses the buy-day open (known
+at the moment of buying, as live), and the surprise figures are Nasdaq's as shown today (they may have been
+revised since). Prices are adjusted for dividends and splits, which scales levels but not the results.
+Trades overlap, so the 95% ranges in the script's output are too narrow.
+
+**What it means for the agent (the owner decides; nothing was changed):** the review checkpoint already
+compares the stops on the agent's own trades (the stop shadow). This backtest suggests a wider stop (4 x ATR)
+or none would have done better for drift on this history, with the survivorship caveat above. News ideas
+have no history, so none of this applies to them.
+
 ## Review checkpoint (from 22 Nov 2026)
 
 The agent's own trades decide what stays. At **20 or more completed drift + news trades**
@@ -119,6 +175,7 @@ python3 research/orb_costs.py                                              # ORB
 python3 research/daily_fetch.py && python3 research/four_strategies.py     # four strategies, USD vs GBP costs
 python3 research/prices_fetch.py                                           # S&P 500 daily, 2017 on
 python3 research/earnings_fetch.py                                         # Nasdaq earnings, 2019 on (about 2 hours)
+python3 research/pead_stop.py && python3 research/pead_chart.py             # the drift stop and chart labels (22 Nov)
 python3 research/three_strategies.py mom pull && python3 research/momentum_check.py
 python3 research/pead_run.py && python3 research/pead_tracker.py
 caffeinate -i -s nice -n 19 trader-kronos/.venv/bin/python research/kronos_backtest.py   # about 4 hours
