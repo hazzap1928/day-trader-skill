@@ -789,6 +789,11 @@ def phone_text(sd, cfg, r):
         slip = M.friday_slippage(_load("trader-broker", "hold_slippage").summary(sd))
     except Exception:
         slip = []
+    try:
+        es = M.friday_entry_shadow(_load("trader-broker", "entry_shadow").summary(sd))
+        slip = list(slip) + ([""] if slip and es else []) + list(es)
+    except Exception:
+        pass
     if slip:
         drift = list(drift or []) + ([""] if drift else []) + slip
     return M.friday(r, drift)
@@ -799,9 +804,9 @@ def slippage_lines(sd):
     try:
         hs = _load("trader-broker", "hold_slippage")
         s = hs.summary(sd)
-        if not any(s[k]["n"] or s[k]["unmeasured"] for k in ("buy", "sell")):
+        if not s["rows"]:
             return []
-        return hs.lines(s)
+        return hs.lines(s) + _load("trader-broker", "entry_shadow").lines(_load("trader-broker", "entry_shadow").summary(sd))
     except Exception as e:
         return ["", "## Slippage on held trades: could not be read (%s)" % str(e)[:120]]
 

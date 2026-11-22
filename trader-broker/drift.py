@@ -276,6 +276,32 @@ def daily_bars(symbol, start, end):
     return out
 
 
+MINUTES = "https://query2.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1m"
+
+
+def minute_bars(symbol, day):
+    """{New York minute (naive datetime): (open, high, low, close, volume)} for one trading day, 09:30 to 16:00,
+    from Yahoo (unofficial; 1-minute bars are kept about 30 days). Raises on failure. Used by the reviews of
+    fill prices (hold_slippage.py, entry_shadow.py), never by a buy."""
+    tk = mod("trader-broker", "ticket")
+    d = _date(day)
+    a = tk.eastern_to_utc(datetime.datetime.combine(d, datetime.time(9, 30)))
+    b = tk.eastern_to_utc(datetime.datetime.combine(d, datetime.time(16, 1)))
+    a, b = [x.replace(tzinfo=datetime.timezone.utc) if x.tzinfo is None else x for x in (a, b)]
+    url = MINUTES % (urllib.parse.quote(yahoo_symbol(symbol)), int(a.timestamp()), int(b.timestamp()))
+    res = json.loads(_get(url).decode("utf-8"))["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
+    out = {}
+    for t, o, h, l, c, v in zip(res.get("timestamp") or [], q["open"], q["high"], q["low"], q["close"],
+                                q.get("volume") or [0] * len(res.get("timestamp") or [])):
+        if None in (o, h, l, c):
+            continue
+        m = tk.to_eastern(datetime.datetime.utcfromtimestamp(t)).replace(second=0, microsecond=0)
+        if m.date() == d:
+            out[m] = (float(o), float(h), float(l), float(c), float(v or 0))
+    return out
+
+
 # ---------------------------------------------------------------- the rule
 
 def universe(cfg, state_dir):

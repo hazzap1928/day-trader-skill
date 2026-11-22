@@ -793,25 +793,82 @@ def friday(r, drift=None):
     return join(out)
 
 
-def friday_slippage(s):
-    """Prices actually got on drift and news trades against the price expected (hold_slippage.summary). [] when
-    nothing has been measured or logged yet."""
-    if not s or not any((s.get(k) or {}).get("n") or (s.get(k) or {}).get("unmeasured") for k in ("buy", "sell")):
+def _slip_fill(r):
+    """One real fill for the Friday report: what was paid or got against the price expected, and the split."""
+    verb = "Bought" if r.get("kind") == "buy" else "Sold"
+    m = r.get("market") or {}
+    head = "%s %s %s" % (verb, company(r.get("symbol")), esc(short_day(r.get("day")))) if r.get("day") else verb
+    if r.get("slip_pct") is None:
+        return "%s: no price to compare" % head
+    sp = r["slip_pct"]
+    line = "%s: %.2f%% %s than expected" % (head, abs(sp), "worse" if sp >= 0 else "better")
+    if m.get("market_gap_pct") is not None:
+        gap, move = m["market_gap_pct"], m.get("move_pct")
+        line += " (Trading 212's price against the real market that minute: %s%s)" % (
+            pct(gap, 2), "" if move is None else "; the market moving: %s" % pct(move, 2))
+    return line
+
+
+def friday_slippage(s, max_lines=12):
+    """Every real fill on drift and news trades, the running average and the 0.3% verdict (hold_slippage.summary).
+    [] when there are no fills yet."""
+    if not s or not s.get("rows"):
         return []
     out = ["<b>Prices I actually got on held trades</b>"]
-    for key, what, against in (("buy", "Buys", "the price just before the order"),
-                               ("sell", "Sales", "the safety-net price or the price just before selling")):
-        g = s.get(key) or {}
-        if g.get("n"):
-            avg = g["avg_pct"]
-            line = "%s: %d measured, on average %.2f%% %s than %s (the plan assumes %.2f%%)" % (
-                what, g["n"], abs(avg), "worse" if avg >= 0 else "better", against, s.get("assumed_pct", 0.05))
-        else:
-            line = "%s: none measured yet" % what
-        if g.get("unmeasured"):
-            line += "; %d with no price to compare" % g["unmeasured"]
+    rows = s["rows"]
+    if len(rows) > max_lines:
+        out.append("• (%d earlier fills are in the saved report)" % (len(rows) - max_lines))
+    out += ["• " + _slip_fill(r) for r in rows[-max_lines:]]
+    avg = s.get("avg_pct")
+    if avg is not None:
+        line = "Running average: %.2f%% %s than expected a fill, over %d fill%s (the plan assumes %.2f%%; at %.2f%% the " \
+               "earnings trades' lead over the S&amp;P 500 disappears)" % (
+                   abs(avg), "worse" if avg >= 0 else "better", s["n"], "" if s["n"] == 1 else "s", s["assumed_pct"], s["bar_pct"])
+        if s.get("avg_market_gap_pct") is not None:
+            line += ". Of that, Trading 212's own price: %s; the market moving: %s" % (
+                pct(s["avg_market_gap_pct"], 2), "?" if s.get("avg_move_pct") is None else pct(s["avg_move_pct"], 2))
         out.append("• " + line)
+    if s.get("judged"):
+        out.append("• %s" % ("⚠️ <b>Consistently above %.2f%% a side</b> (%d of %d fills over it)" % (s["bar_pct"], s["over_bar"], s["n"])
+                             if s.get("consistent") else "Not consistently above %.2f%% a side (%d of %d fills over it)"
+                             % (s["bar_pct"], s["over_bar"], s["n"])))
+    else:
+        out.append("• %d of 10 fills measured so far: too few to judge" % s.get("n", 0))
     out.append("<i>%s</i>" % esc(s.get("note") or ""))
+    return out
+
+
+def slippage_judged(s):
+    """Once, when 10 fills have been measured: is slippage consistently above 0.3% a side?"""
+    head = "\U0001f4cf <b>Slippage after %d fills</b>" % s["n"]
+    if s.get("consistent"):
+        body = ("⚠️ It is consistently above %.2f%% a side: on average %.2f%% worse than expected, %d of %d fills over "
+                "it. On the backtest, at that level the earnings trades no longer beat the S&amp;P 500." % (
+                    s["bar_pct"], s["avg_pct"], s["over_bar"], s["n"]))
+    else:
+        body = ("It is not consistently above %.2f%% a side: on average %s, %d of %d fills over it." % (
+            s["bar_pct"], pct(s["avg_pct"], 2), s["over_bar"], s["n"]))
+    split = ""
+    if s.get("avg_market_gap_pct") is not None:
+        split = " Trading 212's own price against the real market: %s on average; the market moving: %s." % (
+            pct(s["avg_market_gap_pct"], 2), "?" if s.get("avg_move_pct") is None else pct(s["avg_move_pct"], 2))
+    return join([head, body + split, "<i>%s Nothing was changed.</i>" % esc(s.get("note") or "")])
+
+
+def friday_entry_shadow(s):
+    """What the buys would have cost later or with a limit order (entry_shadow.summary). [] before the first."""
+    if not s or not s.get("n"):
+        return []
+    out = ["<b>If I had bought at another time (practice only, %d buy%s)</b>" % (s["n"], "" if s["n"] == 1 else "s")]
+    for t, g in sorted((s.get("times") or {}).items()):
+        if g.get("n"):
+            out.append("• At %s: %s against the market price when I bought (%d of %d cheaper)" % (
+                esc(t), pct(g["avg_vs_market_pct"], 2), g["cheaper"], g["n"]))
+    lm = s.get("limit") or {}
+    if lm.get("n"):
+        out.append("• A limit order at the 09:32 price would have filled %d of %d times%s" % (
+            lm["filled"], lm["n"], "" if lm.get("avg_vs_fill_pct") is None else ", %s against what I paid" % pct(lm["avg_vs_fill_pct"], 2)))
+    out.append("<i>Nothing is bought differently because of this.</i>")
     return out
 
 

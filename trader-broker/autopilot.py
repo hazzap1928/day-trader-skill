@@ -1473,14 +1473,39 @@ class Pilot(object):
                    push=lambda text: phone_mod.push(self.sd, text, phone=self.phone),
                    asks=nw.load_asks(self.sd)["asks"], verdicts=nw.todays_verdicts(self.sd, _ny().date()),
                    watch=hw["by_page"], earnings=ew["by_page"])
-            try:            # the price got against the price expected on each drift and news buy and sale (local files)
-                n = len(mod("trader-broker", "hold_slippage").record(self.sd, _ny().date()))
-                if n:
-                    self.say("slippage: %d new row(s) in trader/state/slippage.jsonl" % n)
-            except Exception as e:
-                self.say("slippage: could not be recorded (%s)" % str(e)[:200])
+            self.fill_checks(nw)
         except Exception as e:
             self.say("daily review: could not be done (%s)" % t212.scrub(e, self.client._secrets))
+
+    def fill_checks(self, nw):
+        """Each evening, REPORT ONLY: every drift and news fill against the price expected and the real market in the
+        same minute (hold_slippage.py, Trading 212's order history read-only), then what each buy would have cost
+        at 09:45, 10:00, 10:30 or with a limit order (entry_shadow.py). Never changes an order; never stops the day."""
+        fc = self.drift_cfg().get("fill_checks")
+        if not (isinstance(fc, dict) and fc.get("enabled") is True):
+            return                  # off unless "fill_checks": {"enabled": true} (reads Trading 212's history and Yahoo)
+        cache = {}
+
+        def minutes(sym, day):
+            key = (sym, str(day))
+            if key not in cache:
+                cache[key] = nw.drift.minute_bars(sym, day)
+            return cache[key]
+        today = _ny().date()
+        try:
+            hs = mod("trader-broker", "hold_slippage")
+            got = hs.record(self.sd, today, fill_fn=nw.holdings_t212.fill_finder(self.client), minutes_fn=minutes,
+                            say=self.say)
+            if got.get("flag"):
+                M = t212.messages()
+                M.use(self.sd)
+                phone_mod.push(self.sd, M.slippage_judged(got["flag"]), phone=self.phone)
+        except Exception as e:
+            self.say("slippage: could not be recorded (%s)" % t212.scrub(e, self.client._secrets))
+        try:
+            mod("trader-broker", "entry_shadow").run(self.sd, today, minutes, say=self.say)
+        except Exception as e:
+            self.say("entry shadow: could not be worked out (%s)" % str(e)[:200])
 
     def news_buy_due(self, ny):
         if self.state.get("news_buy") == self.state.get("day"):

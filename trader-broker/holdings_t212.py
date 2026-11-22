@@ -166,6 +166,35 @@ def sales_since(client, since_day, report_mod, guard_state=None):
     return out
 
 
+def fill_finder(client):
+    """fn(row) -> {"at", "price", "method", "order_id"} or None: Trading 212's own fill of a drift or news buy or
+    sale (row from hold_slippage: "ref", "kind", "day", "qty"), from the order history. READ-ONLY. One history
+    read per ticker per evening (cached); the client keeps to the rate limit."""
+    T, tk, cache = _t212(), _load("trader-broker", "ticket"), {}
+
+    def find(row):
+        ref = row.get("ref")
+        if not ref:
+            return None
+        if ref not in cache:
+            cache[ref] = (client.get(T.HISTORY, {"ticker": ref, "limit": 50}) or {}).get("items") or []
+        want_side = "BUY" if row.get("kind") == "buy" else "SELL"
+        best = None
+        for it in cache[ref]:
+            o, f = it.get("order") or {}, it.get("fill") or {}
+            if str(o.get("side") or "").upper() != want_side or not f.get("filledAt") or not T._num(f.get("price")):
+                continue
+            at = datetime.datetime.fromisoformat(str(f["filledAt"]).replace("Z", "+00:00"))
+            if tk.to_eastern(at.astimezone(datetime.timezone.utc).replace(tzinfo=None)).date().isoformat() != str(row.get("day")):
+                continue
+            gap = abs((T._num(f.get("quantity")) or 0) - abs(T._num(row.get("qty")) or 0))
+            if best is None or gap < best[0]:
+                best = (gap, {"at": at.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                              "price": T._num(f["price"]), "method": f.get("tradingMethod"), "order_id": o.get("id")})
+        return best[1] if best else None
+    return find
+
+
 def daily_match(client, sd, rate, today, report_mod=None, ideas=None, pause=True):
     """daily_match, holding the record's lock (holdings.locked): the news runs save it too."""
     with _hold_locked(sd):
