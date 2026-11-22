@@ -22,7 +22,7 @@ nothing here places an order or changes the autopilot. Not financial advice.
 | ORB variant (stop at the opening-range low, 2R target, above the 50-day average) | same | -0.38R (GBP account), -0.13R (USD) | Loses before costs |
 | Trend swing (55-day high, 2xATR stop, up to 20 days) | 2022 to 2026, 5 years of daily bars | +0.09R (GBP account), +0.17R (USD) | Beat only 76% of random uptrend entries: market drift, not skill |
 | Pullback (RSI(2) under 10 in an uptrend, out above the 5-day average) | same | -0.01R (GBP account), +0.04R (USD) | Real but tiny edge, only without the FX fee |
-| 12-month momentum, top 10, monthly | develop 2019-2023, test 2024-2026 | S&P only: +107% (SPY +109%), then +99% (SPY +60%), drawdowns 41-50% | Not proven: 84% of the 2024-2026 profit came from 5 trades |
+| 12-month momentum, top 10, monthly | develop 2019-2023, test 2024-2026 | S&P only: +107% (SPY +109%), then +99% (SPY +60%), drawdowns 41-50% | Not proven: 84% of the 2024-2026 profit came from 5 trades (redone 22 Nov with the real index: see below) |
 | Pullback, 20-day hold | same | +56%, then -13% (random entries +24%) | No edge; the exit was picked from 4 tries |
 | Post-earnings drift, 20-day hold (signal level) | same | +2.4% a trade, both periods, about 1-1.6 points better than random reports | Real signal |
 | Post-earnings drift on top of an S&P 500 tracker | same | 2019-2023: +96.7% vs tracker +109.5%; **2024-2026: +46.5% vs tracker +60.7%** | **Does not beat the index on the unseen period** |
@@ -172,6 +172,75 @@ compares the stops on the agent's own trades (the stop shadow). This backtest su
 or none would have done better for drift on this history, with the survivorship caveat above. News ideas
 have no history, so none of this applies to them.
 
+## 12-1 momentum on our stock list, with the real index (22 Nov 2026)
+
+`research/momentum_12_1.py` (and `momentum_fetch_removed.py` for the companies that left the index).
+The rule: at each month-end close, rank the S&P 500 members that pass the live universe's filters ($5+,
+$20m+ a day traded) by their return from 12 months ago to 1 month ago (the latest month skipped). Buy the
+top 10 in equal amounts at the next open, rebalance a month later (only the difference is traded). Costs
+0.15% FX + 0.05% slippage on every pound bought or sold; the S&P 500 tracker pays 0.05% only. Rules set on
+2019-2023, checked once on Jan 2024 to Oct 2026. No stop.
+
+**Two lists.** "Today's list" is today's S&P 500, each company counted from the day it joined (as in all
+earlier research). "The real index" is the index as it was each month (github.com/fja05680/sp500), with the
+companies that have since left added back where Yahoo still has their prices: 78 of 191. The other 113
+(mostly takeovers such as Activision or Xilinx, plus failures such as SVB and First Republic) have no prices
+anywhere free, so even the real index is missing about 55 members a month in 2019-2023 and 17 in 2024-2026.
+Nine old tickers that Yahoo has since given to other companies (FB, LB, STI and others) were dropped.
+
+| | 2019-2023 total | a year | worst drop | months up | 2024 to Oct 2026 total | a year | worst drop | months up |
+|---|---|---|---|---|---|---|---|---|
+| Momentum, today's list | +129.1% | +18.0% | 40.9% | 60% | +145.9% | +37.4% | 36.5% | 65% |
+| same at 0.3% slippage a side | +105.2% | +15.5% | 41.0% | 60% | +132.1% | +34.6% | 36.6% | 65% |
+| **Momentum, the real index** | **+85.4%** | +13.1% | 38.5% | 55% | **+159.0%** | +39.9% | 36.6% | 65% |
+| S&P 500 tracker (SPY) | +109.5% | +15.9% | 33.7% | 65% | +65.1% | +19.4% | 18.8% | 68% |
+| Equal-weight S&P 500 (RSP) | +91.5% | +13.9% | 39.0% | 62% | +45.2% | +14.1% | 17.8% | 68% |
+
+By year (today's list): 2019 +47.3, 2020 +5.8, 2021 +4.9, 2022 +10.7, 2023 +26.6; 2024 +19.6 (SPY +25.7),
+2025 +26.2 (SPY +17.7), 2026 to Oct +63.0 (SPY +11.6). It beat the S&P 500 in 55% and 59% of months.
+
+**Setting the rules on 2019-2023.** Eight versions were tried on 2019-2023 only: look-back 6 or 12 months,
+top 10 or 20, and a market filter (hold cash when the S&P 500 is under its 200-day average) off or on.
+The filter was a disaster in every version (+13% to +18% against +101% to +165%: it sold out after the
+2020 and 2022 falls and missed the rebounds). The best on 2019-2023 was 6 months, top 10 (+165%); on the
+unseen years it made +136%, a little LESS than the owner's 12-month rule (+146%). So 2019-2023 gave no
+reason to change the rule, and tuning would not have helped.
+
+**Against luck.** Random sets of 10 from the same list, with the same turnover: momentum beat 82% of them in
+2019-2023 (not significant) and all 200 in 2024-2026.
+
+**Concentration.** About two-thirds of the profit came from 5 names in each period: AMD, Devon, Nvidia,
+Chipotle and FICO in 2019-2023; Micron, Sandisk, Seagate, Western Digital and Palantir in 2024-2026. Four of
+those five are one theme (memory and storage chips, 2026), and 2026 alone (+63%) made most of the lead.
+
+**Survivorship bias, measured.** It hits momentum harder than the index, because momentum buys yesterday's
+high-flyers and some of those later crash out of the index:
+- 2019-2023: on the real index the result falls from +129% to +85%, from 20 points AHEAD of the S&P 500 to
+  24 points BEHIND it. The picks only the real index had (71 of the 600 slots) averaged -1.7% a month:
+  Enphase held 10 months (-64% in all), Penn, Bath & Body Works, MarketAxess, EPAM. They are no longer in
+  the S&P 500, so today's list never sees them. The 113 departed companies with no prices are still
+  missing; they are mostly takeovers (usually bought at a premium), so the true figure could be a little
+  higher or lower than +85%; the size of the bias (about 40 points over 5 years) is the solid finding.
+- For the whole index the same bias is smaller: an equal-weight portfolio of today's list made +91.9%
+  against +76.5% for the real index (RSP, the real fund: +91.7%).
+- 2024-2026: the two lists agree (+146% and +159%): few companies have left the index yet. That does not
+  mean this period is clean: the bias appears in hindsight, when today's high-flyers that later collapse
+  drop out of the index. By the 2019-2023 evidence, a figure measured today on recent years flatters
+  momentum the most.
+
+**Risks the totals hide.** Worst drop 36 to 41%, about twice the S&P 500's in 2024-2026. One month lost
+25%. With 10 stocks, no stop and the money fully invested, it would not fit the agent's risk caps (2% of
+the account at risk at the stops for each strategy; a position with no stop counts its whole value).
+
+**Verdict:** mixed. On the fairest data, 2019-2023 trailed the S&P 500 (+85% against +110%), and 2024-2026
+beat it by a wide margin (+146% to +159% against +65%), even at 0.3% slippage, but on the back of one
+theme in one year. Momentum is one of the best-documented effects in published research, and it is also
+known for sudden crashes (2009 is the famous one).
+
+**The owner's decision (22 Nov 2026): momentum is a no-go.** No shadow log, no buying. The prices of past index
+members (`trader/research-data/prices_removed.json`, `sp500-history/`) are kept for the next test: any
+backtest that picks from the S&P 500 should use the real index (`members(d, "pit")` in `momentum_12_1.py`).
+
 ## Review checkpoint (from 22 Nov 2026)
 
 The agent's own trades decide what stays. At **20 or more completed drift + news trades**
@@ -215,6 +284,7 @@ python3 research/pead_stop.py && python3 research/pead_chart.py             # th
 python3 research/pead_stop.py --slip 0.3 --only none,3x,4x                   # the same at 0.3% slippage a side
 python3 research/open_timing.py                                             # opening minutes against later (last ~30 days)
 python3 research/three_strategies.py mom pull && python3 research/momentum_check.py
+python3 research/momentum_fetch_removed.py && python3 research/momentum_12_1.py   # 12-1 momentum, real index (22 Nov)
 python3 research/pead_run.py && python3 research/pead_tracker.py
 caffeinate -i -s nice -n 19 trader-kronos/.venv/bin/python research/kronos_backtest.py   # about 4 hours
 python3 research/kronos_risk_check.py trader/research-data                 # from the Kronos cache
