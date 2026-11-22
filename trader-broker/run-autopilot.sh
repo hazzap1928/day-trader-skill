@@ -2,7 +2,8 @@
 # The autopilot, always on (DEMO ONLY): it answers /status, /pause and /resume at any hour and runs
 # each trading day. launchd starts it at login and restarts it if it stops; see trader-broker/PHONE.md.
 # Like run-guard.sh it reads only these export lines from T212_ENV_FILE (default ~/.zshrc):
-# T212_API_KEY, T212_API_SECRET, T212_ENV and TELEGRAM_BOT_TOKEN. Nothing else in that file is run.
+# T212_API_KEY, T212_API_SECRET, T212_ENV, TELEGRAM_BOT_TOKEN and (optional) HEALTHCHECK_URL. Nothing else
+# in that file is run.
 # With T212_ENV=live it refuses to start: there is no live path in the autopilot.
 set -eu
 cd "${0:A:h}/.."
@@ -13,6 +14,11 @@ fi
 if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
   eval "$(grep -E '^[[:space:]]*export[[:space:]]+TELEGRAM_BOT_TOKEN=' "$envfile" || true)"
 fi
+# optional: the outside "is this Mac alive?" check (trader-broker/heartbeat.py). Handed over under another
+# name so that only this launchd autopilot pings it, never a shell or a test run.
+hc="$(grep -E '^[[:space:]]*export[[:space:]]+HEALTHCHECK_URL=' "$envfile" | tail -1 || true)"
+if [[ -n "$hc" ]]; then eval "$hc"; export AUTOPILOT_HEARTBEAT_URL="${HEALTHCHECK_URL:-}"; unset HEALTHCHECK_URL; fi
+unset hc
 if [[ "${T212_ENV:-demo}" != "demo" ]]; then
   echo "autopilot: T212_ENV is ${T212_ENV}; the autopilot runs on demo only. Not starting." >&2
   exit 2

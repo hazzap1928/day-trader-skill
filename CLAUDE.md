@@ -54,6 +54,7 @@ strategy or a feed, add it to "The parts" and give it its own section. Known loo
 | `trader-broker/allocation.py` | demo cash allocation (drift reserves its slots first; the intraday reservations are dormant): per-trade cap, morning reservations, free pool, max open positions |
 | `trader-broker/account_budget.py` | budget and loss limits from the account value, every trading morning |
 | `trader-broker/day_risk.py` | writes the total-risk figures the buy checks read; the daily loss count is for day trades only: today's realised losses plus risk still open at the stops, for the daily loss limit (`state/day-risk.json`) |
+| `trader-broker/heartbeat.py` | the outside "is this Mac alive?" check: the always-on autopilot pings `HEALTHCHECK_URL` (healthchecks.io) every 5 minutes; when the pings stop, that service tells the owner. Off without the address |
 | `trader-broker/netwait.py` | no internet: check every 2 min for up to 30, then a BACK ONLINE message saying what was missed |
 | `trader-broker/go_live.py` | the user's own switch to live (checklist in `GO_LIVE.md`). **Claude never runs it** |
 | `trader-kronos/` | Kronos-small forecasts, **shadow only** (news runs may use it, `kronos_minutes`); own Python 3.11 venv; `.venv/`, `vendor/`, `models/` are git-ignored |
@@ -276,6 +277,29 @@ The guard's protections:
   is the older trader-news tool. A fake Claude answer in a test must carry a search record
   (`test_news_ideas.searched`).
 
+## Market holidays and 1:00 p.m. early closes (from 21 Nov 2026)
+
+- **Full NYSE holidays** (the list in `trader-alerts/alerts.py`, e.g. 26 Nov, 25 Dec 2026, 1 Jan 2027): the
+  guard stops at once ("US market holiday"), with no read, no stop check, no approved sale and no end-of-day
+  sale; the autopilot's day is "closed" (no buys, no report); the briefing and news runs skip the day, as before.
+- **Early closes** (`NYSE_EARLY_CLOSE`, 27 Nov and 24 Dec 2026): `t212.market_close(d)` gives 13:00 and
+  `t212.eod_time(at, d)` moves the end-of-day sale to `EARLY_EOD_BEFORE` (10) minutes before it, 12:50. The
+  guard stops at the close (13:00, not 16:00); the autopilot's evening report (12:55), its "sold at the close"
+  timing (`at_close`) and the close time in messages (`close_uk`) follow the same time.
+- **Tests:** `tests/test_market_days.py`.
+
+## The outside heartbeat (from 21 Nov 2026): `trader-broker/heartbeat.py`
+
+- **Why:** Telegram cannot say the Mac is down, because the Mac sends it. The owner's free healthchecks.io
+  check expects a ping every 5 minutes and messages the owner when they stop (Mac off, asleep, no internet,
+  or the autopilot stuck or not starting).
+- **How:** `export HEALTHCHECK_URL=https://hc-ping.com/...` in `~/.zshrc`. `run-autopilot.sh` hands it to the
+  autopilot as `AUTOPILOT_HEARTBEAT_URL` and unsets the original, so a terminal or a test run never pings;
+  `Pilot.listen` calls `Pilot.beat` (at most every 5 minutes). No address: nothing happens.
+- The address is private: never printed or logged. A failed ping is logged once until one gets through, and
+  never stops anything. By hand: `python3 trader-broker/heartbeat.py ping`.
+- **Tests:** `tests/test_heartbeat.py`.
+
 ## The S&P 500 in reports (from 16 Nov 2026)
 
 - Shown for information only, never a pass or fail test. The Friday report's ON TRACK now means a
@@ -422,6 +446,8 @@ per-trade cap and the Time Machine confidence bands are **dormant: day trading**
   With stops about 1% away the cap binds on most trades: about GBP 15 at the stop, not GBP 49.
 - **`max_open_positions`** 4: held positions plus buys waiting to fill. A signal over it is still
   built and logged (`skipped: 4 positions open...`), so it gets its virtual result.
+- **No day-trade reservations while day trading is off** (21 Nov 2026): the briefing passes no candidates to
+  `make_plan` unless `t212.intraday_on`, so only drift's slots are reserved.
 - **Reservations:** the 07:30 briefing writes `trader/state/allocation.json`: up to `max_reservations`
   (2) blocks of one max-per-trade, for listed stocks that reported earnings after the last close or
   report before the open (ranked by `adv_usd`). Never more than `100 - free_pool_pct` (50%) of the
@@ -477,7 +503,8 @@ per-trade cap and the Time Machine confidence bands are **dormant: day trading**
 The guard (`t212-guard`) also sells, from 09:35 New York, any holding whose sale the owner approved on the phone.
 
 - **Keys:** the scripts read only the `export T212_API_KEY/T212_API_SECRET/T212_ENV/TELEGRAM_BOT_TOKEN`
-  lines from `~/.zshrc`, and use `/usr/bin/python3`.
+  lines from `~/.zshrc` (`run-autopilot.sh` also `HEALTHCHECK_URL`), and use `/usr/bin/python3`. `~/.zshrc` is
+  mode 600 (owner only) since 21 Nov 2026.
 - **The python.org 3.11** at `/usr/local/bin/python3` lacks certificates: HTTPS fails from it. Use
   `/usr/bin/python3` for live calls.
 - **Rate limits:** `t212.Client` keeps `trader/state/t212-ratelimit.json` (when each endpoint was last called,

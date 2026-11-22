@@ -327,13 +327,28 @@ class Briefing(TempDir):
                 "2026-11-04": [{"symbol": "CHTR", "when": "after the close"}]}
         briefing.all_earnings = lambda d: rows.get(d.isoformat(), [])
         briefing.t212.with_universe = lambda cfg, sd: dict(cfg, allowed_tickers=["BBY", "CHTR"])
-        line = briefing.allocation_line(GBP, self.dir, datetime.date(2026, 11, 5), datetime.date(2026, 11, 4), set())
+        on = dict(GBP, autopilot={"intraday_enabled": True})        # day-trade reservations need day trading on
+        line = briefing.allocation_line(on, self.dir, datetime.date(2026, 11, 5), datetime.date(2026, 11, 4), set())
         self.assertIn("Reserved: £1,086 CHTR (earnings after yesterday's close, 09:45 to 11:15 NY), "
                       "£1,086 BBY (earnings before the open, 09:45 to 11:15 NY)", line)
         self.assertIn("Free pool: £2,270. Max 4 positions", line)
         self.assertEqual(len(allocation.load_plan(self.dir, "2026-11-05")["reservations"]), 2)
         self.assertIsNone(briefing.allocation_line(dict(GBP, paper=False), self.dir, datetime.date(2026, 11, 5),
                                                    datetime.date(2026, 11, 4), set()))
+
+    def test_no_day_trade_reservations_while_day_trading_is_off(self):
+        import datetime
+        rows = {"2026-11-05": [{"symbol": "BBY", "when": "before the open"}],
+                "2026-11-04": [{"symbol": "CHTR", "when": "after the close"}]}
+        briefing.all_earnings = lambda d: rows.get(d.isoformat(), [])
+        briefing.t212.with_universe = lambda cfg, sd: dict(cfg, allowed_tickers=["BBY", "CHTR"])
+        for cfg in (GBP, dict(GBP, autopilot={"intraday_enabled": False})):     # missing key = off
+            shutil.rmtree(os.path.join(self.dir, "state"), ignore_errors=True)
+            line = briefing.allocation_line(cfg, self.dir, datetime.date(2026, 11, 5), datetime.date(2026, 11, 4),
+                                            set())
+            self.assertIn("Reserved: none", line)
+            self.assertNotIn("CHTR", line)
+            self.assertEqual(allocation.load_plan(self.dir, "2026-11-05")["reservations"], [])
 
 
 if __name__ == "__main__":

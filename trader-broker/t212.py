@@ -2223,6 +2223,25 @@ def eod_settings(cfg):
 
 
 APPROVED_SELL_AT = (9, 35)     # New York: a sale you approved on your phone is made from this time on
+EARLY_EOD_BEFORE = 10          # minutes before a 1:00 p.m. early close that the end-of-day sale is made
+
+
+def market_close(d):
+    """The New York close on date d as (h, m): 16:00, 13:00 on an early close (the NYSE list in
+    trader-alerts/alerts.py), or None when the market is shut all day (weekend or holiday)."""
+    s = alerts_module().session(d)
+    return (s[1].hour, s[1].minute) if s else None
+
+
+def eod_time(at, d):
+    """When the end-of-day sale runs on date d: `at` (h, m), but no later than EARLY_EOD_BEFORE minutes
+    before the close (12:50 on a 1:00 p.m. early close). None when the market is shut that day."""
+    close = market_close(d)
+    if close is None:
+        return None
+    latest = close[0] * 60 + close[1] - EARLY_EOD_BEFORE
+    mins = min(at[0] * 60 + at[1], latest)
+    return (mins // 60, mins % 60)
 
 
 def eod_close(client, state_dir, approved_only=False):
@@ -2577,10 +2596,16 @@ def cmd_guard(client, args):
         if now_et.weekday() >= 5:
             _say("%s  weekend in New York: the guard has nothing to watch" % now_et.strftime("%a %H:%M"))
             return None
+        close = market_close(now_et.date())
+        if close is None:                       # a full NYSE holiday: no orders, no sales, nothing to watch
+            _say("%s  US market holiday (%s): the guard has nothing to watch"
+                 % (now_et.strftime("%a %H:%M"), alerts_module().trading_day(now_et.date())[1]))
+            return None
         open_et = now_et.replace(hour=GUARD_OPEN[0], minute=GUARD_OPEN[1], second=0)
-        end_et = now_et.replace(hour=uh, minute=um, second=0)
+        end_et = min(now_et.replace(hour=uh, minute=um, second=0),
+                     now_et.replace(hour=close[0], minute=close[1], second=0))   # 13:00 on an early close
         if now_et >= end_et:
-            _say("%s  past %s New York: the guard stops (%d pass%s)" % (now_et.strftime("%H:%M"), args.until,
+            _say("%s  past %s New York: the guard stops (%d pass%s)" % (now_et.strftime("%H:%M"), end_et.strftime("%H:%M"),
                                                                         passes, "" if passes == 1 else "es"))
             return None
         if now_et < open_et:
@@ -2594,7 +2619,8 @@ def cmd_guard(client, args):
         except T212Error as e:
             guard_alarm(client, "the guard has STOPPED: %s" % e)
             raise
-        eod_at = now_et.replace(hour=eod["at"][0], minute=eod["at"][1], second=0) if eod else None
+        e_hm = eod_time(eod["at"], now_et.date()) if eod else None      # 12:50 on an early close
+        eod_at = now_et.replace(hour=e_hm[0], minute=e_hm[1], second=0) if e_hm else None
         if eod_at is not None and client.env == "demo" and now_et >= eod_at and not eod_done_today(args.state_dir):
             try:
                 run_eod(client, args.state_dir)

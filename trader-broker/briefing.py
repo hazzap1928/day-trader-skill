@@ -478,9 +478,11 @@ def allocation_line(cfg, state_dir, session, prev, held, drift_rows=None):
                      for x in uni.get("tickers") or [] if isinstance(x, dict)}
             today_rows, prev_rows = all_earnings(session), all_earnings(prev)
             cands = allocation.catalysts(today_rows, prev_rows, allowed, ranks, held)
+            if not t212.intraday_on(cfg):
+                cands = []          # day trading off: no cash is set aside for a day trade (drift's slots still are)
             dres, dused = drift_first(cfg, state_dir, session, held, drift_rows)
             plan = allocation.save_plan(state_dir, allocation.make_plan(cfg, day, cands, drift=dres, drift_used_gbp=dused))
-            if today_rows is None or prev_rows is None:
+            if t212.intraday_on(cfg) and (today_rows is None or prev_rows is None):
                 return allocation.plan_text(plan) + " (earnings calendar: no data, so no reservations from it)"
         return allocation.plan_text(plan)
     except (allocation.AllocationError, t212.T212Error) as e:

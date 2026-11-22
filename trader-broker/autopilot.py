@@ -89,6 +89,7 @@ M = phone_mod.messages()          # every word sent to the phone (trader-broker/
 net = t212.net_module()
 evidence = _load("trader-broker", "evidence")
 allocation = _load("trader-broker", "allocation")
+heartbeat = _load("trader-broker", "heartbeat")
 KRONOS_BUDGET = 9 * 60          # seconds of Kronos shadow verdicts a cycle at most (it never blocks a trade)
 KRONOS_NEEDS = 300              # one verdict takes about this long on this Mac: none starts with less time left
 tk = t212.ticket_module()
@@ -305,6 +306,7 @@ class Pilot(object):
         self.cfg = self.read_cfg()
         self.s = settings(self.cfg)
         self.state = self._load_state()
+        self.hb = heartbeat.Heartbeat(None)     # main() gives serve the outside check's address (HEALTHCHECK_URL)
         M.use(self.sd)
 
     # ------------------------------------------------------------ files
@@ -888,7 +890,9 @@ class Pilot(object):
             return None
         if not e:
             return None
-        ny = _ny().replace(hour=e["at"][0], minute=e["at"][1], second=0, microsecond=0)
+        ny = _ny()
+        h, m = t212.eod_time(e["at"], ny.date()) or e["at"]          # earlier on a 1:00 p.m. early close
+        ny = ny.replace(hour=h, minute=m, second=0, microsecond=0)
         utc = tk.eastern_to_utc(ny.replace(tzinfo=None))
         return M.uk_clock(datetime.datetime.fromtimestamp(utc.replace(tzinfo=datetime.timezone.utc).timestamp()))
 
@@ -952,8 +956,20 @@ class Pilot(object):
         except phone_mod.PhoneError as e:
             self.say("could not update the phone message: %s" % e)
 
+    def beat(self):
+        """The heartbeat to the outside check (trader-broker/heartbeat.py), at most every 5 minutes. A failed
+        ping is logged once until one gets through again. The address is never logged. Never raises."""
+        was = self.hb.fails
+        res = self.hb.beat()
+        if res == "sent" and self.hb.last == self.hb.tried and (was or not getattr(self, "_hb_said", False)):
+            self.say("heartbeat: the outside check heard from this Mac%s" % (" again" if was else ""))
+            self._hb_said = True
+        elif res == "failed" and self.hb.fails == 1:
+            self.say("heartbeat: the ping to the outside check failed; trying again every 5 minutes")
+
     def listen(self, wait):
         """Wait up to `wait` seconds for taps and commands from your phone, and act on them."""
+        self.beat()
         try:
             ups = self.phone.updates(wait=wait)
         except phone_mod.PhoneError as e:
@@ -1181,7 +1197,7 @@ class Pilot(object):
         if not e:
             return False
         ny = _ny()
-        return (ny.hour, ny.minute) >= tuple(e["at"])
+        return (ny.hour, ny.minute) >= tuple(t212.eod_time(e["at"], ny.date()) or e["at"])
 
     def sale_message(self, t212_ticker, qty, px):
         """One message per sale during the day, with the result from Trading 212's own fills. None for the
@@ -1845,6 +1861,7 @@ class Pilot(object):
         first = ny.replace(hour=b_h, minute=b_m, second=0)
         last = min(ny.replace(hour=a_h, minute=a_m, second=0), close_at)
         e_h, e_m = _hm((self.cfg.get("eod_close") or {}).get("at"), EOD_DEFAULT)
+        e_h, e_m = t212.eod_time((e_h, e_m), ny.date()) or (e_h, e_m)     # 12:50 on a 1:00 p.m. early close
         summary_at = min(ny.replace(hour=e_h, minute=e_m, second=0), close_at) + datetime.timedelta(minutes=REPORT_AFTER)
         if ny >= summary_at:
             if not self.state.get("summary_sent"):
@@ -1955,6 +1972,7 @@ def main(argv=None, environ=None):
             raise PilotError("not starting:\n  - " + "\n  - ".join(problems))
         pilot = Pilot(client, phone, a.state_dir)
         if a.cmd == "serve":
+            pilot.hb = heartbeat.Heartbeat(heartbeat.url_from(environ, heartbeat.SERVE_ENV))
             pilot.serve()
             return 0
         if a.cmd == "open-check":

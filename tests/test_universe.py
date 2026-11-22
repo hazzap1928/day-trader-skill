@@ -6,6 +6,7 @@ import datetime
 import io
 import json
 import os
+import time
 import shutil
 import tempfile
 import unittest
@@ -236,7 +237,11 @@ class Reader(TmpDir):
         self.assertEqual(out["allowed_tickers"], ["AAPL", "TSLA"])
 
     def test_t212_place_risk_and_scanner_all_see_it_and_blocked_still_wins(self):
-        self.built()
+        # trader-risk and the scanner load their own copy of universe.py, on the real clock: build the list
+        # at the real time, so the test does not go stale once NOW is over 14 days in the past
+        real = time.time()
+        uv._now = lambda: real
+        self.built(now=real)
         cfg = dict(CFG, blocked_tickers=["META"])
         self.write("config.json", cfg)
         self.assertEqual(t212.allowed_tickers(t212.with_universe(cfg, self.dir)), {"AAPL", "BRK.B", "MSFT"})
