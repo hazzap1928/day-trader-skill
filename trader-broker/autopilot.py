@@ -1460,6 +1460,7 @@ class Pilot(object):
     def daily_review(self, res):
         """The daily review of what is held (trader-broker/review.py), after the closing report and the match.
         REPORT ONLY: it says what it would sell or ask about. Never stops the day."""
+        review = None
         try:
             nw = self.news()
             rv = mod("trader-broker", "review")
@@ -1469,13 +1470,24 @@ class Pilot(object):
             hw = mod("trader-broker", "hold_watch").run(self.sd, cfg, "review", say=self.say)
             # each holding's next results date, flagged when it falls before the sell date (report only; off unless on)
             ew = mod("trader-broker", "earnings_watch").run(self.sd, cfg, _ny().date(), say=self.say)
-            rv.run(self.sd, cfg, res, _ny().date(), bars_fn=nw.drift.daily_bars, say=self.say,
-                   push=lambda text: phone_mod.push(self.sd, text, phone=self.phone),
-                   asks=nw.load_asks(self.sd)["asks"], verdicts=nw.todays_verdicts(self.sd, _ny().date()),
-                   watch=hw["by_page"], earnings=ew["by_page"])
+            review = rv.run(self.sd, cfg, res, _ny().date(), bars_fn=nw.drift.daily_bars, say=self.say,
+                            push=lambda text: phone_mod.push(self.sd, text, phone=self.phone),
+                            asks=nw.load_asks(self.sd)["asks"], verdicts=nw.todays_verdicts(self.sd, _ny().date()),
+                            watch=hw["by_page"], earnings=ew["by_page"])
             self.fill_checks(nw)
         except Exception as e:
             self.say("daily review: could not be done (%s)" % t212.scrub(e, self.client._secrets))
+        self.board(review)
+
+    def board(self, review=None):
+        """The evening strategy board (trader-broker/board.py): an HTML page, one card per strategy, sent to the
+        phone as a file after the review. REPORT ONLY. A failure sends one short message; never stops the day."""
+        try:
+            mod("trader-broker", "board").run(self.sd, self.drift_cfg(), _ny().date(), phone=self.phone,
+                                              say=self.say, review=review,
+                                              push=lambda text: phone_mod.push(self.sd, text, phone=self.phone))
+        except Exception as e:
+            self.say("board: could not be done (%s)" % t212.scrub(e, self.client._secrets))
 
     def fill_checks(self, nw):
         """Each evening, REPORT ONLY: every drift and news fill against the price expected and the real market in the

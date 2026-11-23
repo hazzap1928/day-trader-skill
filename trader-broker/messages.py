@@ -1454,3 +1454,14 @@ def news_sold(page):
         "Bought %s, sold %s" % (esc(short_day(page.get("buy_date") or "?")), esc(short_day(res.get("date") or "?"))),
         "Result: %s" % (b(signed_gbp(p)) if p is not None else "not known yet"),
         "Bought because: %s" % esc(page.get("reason") or "?")]))
+
+
+# ---------------------------------------------------------------- the evening strategy board (board.py)
+
+def board_caption():
+    return "\U0001f4cb Today's strategy board: tap to open"
+
+
+def board_failed():
+    return join(["\u26a0\ufe0f I couldn't make today's strategy board. The daily review above is unaffected, "
+                 "and nothing was bought or sold because of it.", FOOTER])

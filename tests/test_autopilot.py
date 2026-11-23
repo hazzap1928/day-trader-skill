@@ -44,6 +44,11 @@ class FakePhone(object):
         self.sent.append((text, buttons))
         return self.next_id
 
+    def send_document(self, path, caption=""):
+        self.docs = getattr(self, "docs", [])
+        self.docs.append((path, caption))
+        return 1
+
     def edit(self, mid, text):
         self.edits.append((mid, text))
 

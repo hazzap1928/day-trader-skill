@@ -5,7 +5,8 @@
 ## What this is now (17 Nov 2026)
 
 A **news-feed and post-earnings-drift agent** that runs a Trading 212 **demo** account unattended from
-this Mac (Intel i7, 16 GB, macOS 13, UK time). It buys each share for a written reason, holds it until a
+this Mac: the always-on Mac mini at home (Apple M6, 24 GB, Apple Silicon; it replaced the old 2017 Intel
+MacBook in Nov 2026; UK time). It buys each share for a written reason, holds it until a
 rule says sell, and reports how it did. Education and tooling, not financial advice.
 Branch `t212-adapter`. Run the tests with `cd tests && python3 -m unittest discover -s .`. Every test is
 offline (fakes for Trading 212, Yahoo, Nasdaq, Telegram, launchd). Keep them passing.
@@ -52,6 +53,7 @@ strategy or a feed, add it to "The parts" and give it its own section. Known loo
 | `trader-broker/holdings_t212.py` | Trading 212's side of the record: the account as a plain "view", and the daily match. **Read-only, report only** |
 | `trader-broker/news_ideas.py` | the **"news" strategy**: ideas from two scheduled `claude -p` runs a day, checked by the pack's rules, plus a verdict on every holding and the day's hot topics. Buys only with `news.buy_enabled` (ON since 17 Nov, see "News ideas") |
 | `trader-broker/review.py` | the **daily review** of what is held, after the close. **Report only**: it says what it would sell or ask about (see "The daily review") |
+| `trader-broker/board.py` | the **evening strategy board**: one HTML page, a card per strategy, sent to the phone as a file after the review. **Report only** (see "The evening strategy board") |
 | `trader-broker/evidence.py` | **(mostly dormant: day trading)** evidence mode (forward test): signal log, virtual results, slippage, Friday report |
 | `trader-broker/briefing.py`, `report.py` | 07:30 morning briefing; closing report from Trading 212's own fills |
 | `trader-broker/allocation.py` | demo cash allocation (drift reserves its slots first; the intraday reservations are dormant): per-trade cap, morning reservations, free pool, max open positions |
@@ -278,6 +280,33 @@ holdings record (`holdings.py`), never Trading 212 (except `hold_slippage.py`, w
 - **Files:** `trader/state/reviews/DATE.json`. **By hand:** `python3 trader-broker/review.py` (prints, sends nothing).
 - **Tests:** `tests/test_review.py`.
 
+## The evening strategy board (from 22 Nov 2026): `trader-broker/board.py`, REPORT ONLY
+
+- **What:** one self-contained HTML page (inline CSS, no scripts, no outside links; light and dark mode on an
+  iPhone), one card per strategy: drift ("Earnings trades") and news ("News ideas"); day trading is one
+  "switched off" line while `autopilot.intraday_enabled` is false (a card of its own when it is on).
+  - top: the date, account value (the review's), change today (`account-days.json`), cash and the cash kept
+    aside (the review's `cash` limit, `cash_buffer_pct`), and the S&P 500's move today
+  - each card: **today** in UK time (news runs, drift's earnings check, buys with the page's reason, names not
+    bought grouped by reason, sales with the reason and the result in pounds, the close: what is held), or
+    "Nothing happened today"; **holding now** (company, days held, sell date, gain after fees from the review,
+    the page's reason); **progress so far** (completed trades since the first buy, made / lost money, total
+    after fees, and the same money in the S&P 500 over the same days where recorded: drift's `trades.jsonl`;
+    news trades have no S&P figure recorded, and the board says so)
+  - green and red only on pound results. Company names and money from `messages.py`.
+- **Data:** only what the agent already saved: `holdings.json`, `fills.json` (fill times), `news/runs.jsonl`,
+  `ideas.jsonl`, `buys.jsonl`, `drift/buys.jsonl`, `trades.jsonl`, `shortlist.json`, `reviews/DATE.json`,
+  `account-days.json`, and `market-day.json` (the closing report's S&P 500 move, saved by `report.send` since
+  22 Nov when `report.market_line` is on). No broker call and no web call (a test reads the source).
+- **When:** `Pilot.board`, at the end of `Pilot.daily_review` (after the review message and the fill checks),
+  every US trading day. Saved to `trader/state/boards/DATE.html`; sent with `phone.Phone.send_document`
+  (Telegram sendDocument, a multipart upload, standard library, the token scrubbed from errors) with the
+  caption `messages.board_caption()`. A failure to build or send: one short message (`messages.board_failed`);
+  it never stops the evening run, and the review has already gone. No switch: always on.
+- **By hand:** `python3 trader-broker/board.py [DATE]` writes the file and prints its path, sending nothing;
+  `--send` also sends it to the phone.
+- **Tests:** `tests/test_board.py`.
+
 ## News ideas (from 16 Nov 2026; buying ON since 17 Nov): `trader-broker/news_ideas.py`
 
 - **Switch:** `"news": {"buy_enabled": false}` is the code's default; the owner's config has it `true` since
@@ -416,7 +445,7 @@ holdings record (`holdings.py`), never Trading 212 (except `hold_slippage.py`, w
 - **When:** the autopilot starts `shadow.py run` after the daily review, as a separate program, not waited for
   (log `trader/logs/shadow.log`). Only when `run-autopilot.sh` sets `AUTOPILOT_SHADOW=1`, so a shell or a test
   starts nothing. It changes no order, stop, sell date or status, and blocks nothing (a test reads the source).
-- **Timing on the 2017 MacBook (22 Nov):** model load 27 s cold (about 4 s warm), then about 14 s a share
+- **Timing on the old 2017 MacBook (22 Nov; the Mac mini should be faster, not yet re-measured):** model load 27 s cold (about 4 s warm), then about 14 s a share
   (5 paths x 20 days). A run of 5 holdings: about 1.5 minutes, once a day after the close, in its own program.
   The 06:00 news run: about 45 s an idea (the model is loaded per idea), inside `kronos_minutes` (10).
   (The dormant day-trade verdict took about 5 minutes each.)
@@ -676,8 +705,8 @@ per-trade cap and the Time Machine confidence bands are **dormant: day trading**
 
 | Job | When | What |
 |---|---|---|
-| `caffeinate` | always (KeepAlive) | `caffeinate -s`: no sleep on mains power (a closed lid still sleeps the laptop) |
-| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, starts a news run the Mac slept through, sends MARKET OPEN, (no ORB scan while `intraday_enabled` is false; otherwise every 15 min 09:45 to 15:30 New York), runs the drift buys at 09:33 (only with `drift.buy_enabled`), the news buys at 09:35 (only with `news.buy_enabled`), the holdings match before the open message and after the closing report (and every 10 min while buys are paused), sends "sell it?" requests at any hour, the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results, sends DRIFT SELL messages and the daily review) and the evidence report on Fridays |
+| `caffeinate` | always (KeepAlive) | `caffeinate -s`: no sleep on mains power (the Mac mini has no lid or battery) |
+| `autopilot` | always (RunAtLoad + KeepAlive) | `run-autopilot.sh` runs `autopilot.py serve`: answers /status /pause /resume at any hour, delivers the outbox, catches up a missed briefing, rebuilds the universe each Sunday 18:00 UK (or next chance outside market hours), sets the budget before the open, starts a news run the Mac slept through, sends MARKET OPEN, (no ORB scan while `intraday_enabled` is false; otherwise every 15 min 09:45 to 15:30 New York), runs the drift buys at 09:33 (only with `drift.buy_enabled`), the news buys at 09:35 (only with `news.buy_enabled`), the holdings match before the open message and after the closing report (and every 10 min while buys are paused), sends "sell it?" requests at any hour, the drift shadow scan at 15:35, sends the closing report about 15:55 (then fills in drift results, sends DRIFT SELL messages, the daily review and the strategy board) and the evidence report on Fridays |
 | `t212-guard` | weekdays 13:00 UK | `run-guard.sh`: `t212.py budget --apply`, then `guard --watch` from the 09:30 open to 16:00 New York |
 | `briefing` | weekdays 07:30 UK | `run-briefing.sh`: the briefing; skips US holidays; retries its send for 30 min |
 | `news` | weekdays 06:00 UK | `run-news.sh run --kind main`: the main Claude review, the checks, the log; its ideas go into the 07:30 briefing (log: `trader/logs/news.log`). Never an order |

@@ -512,6 +512,12 @@ def send(client, state_dir, phone=None, environ=None):
     path = save(r, state_dir)
     cfg = t212._read_json(os.path.join(state_dir, "config.json"), {}) or {}
     market = market_move(r["day"]) if (cfg.get("report") or {}).get("market_line") else None
+    if market is not None:
+        try:                                  # kept for the evening strategy board (board.py): no second fetch
+            t212._write_json(os.path.join(state_dir, "state", "market-day.json"),
+                             {"day": r["day"].isoformat(), "spy_pct": round(market, 3)})
+        except Exception:
+            pass
     text = phone_text(r, path, state_dir, market)
     ok = phone_mod.push(state_dir, text, environ=environ, phone=phone)
     return ok, path, text

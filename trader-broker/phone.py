@@ -31,6 +31,7 @@ API = "https://api.telegram.org/bot%s/%s"
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 TIMEOUT = 40
 MAX_TEXT = 3900               # Telegram's limit is 4096 characters a message
+MAX_DOC = 10 * 1024 * 1024    # a board is a few kilobytes; Telegram bots may send up to 50 MB
 _MSG = []
 
 
@@ -143,9 +144,11 @@ class Phone(object):
         _write(self.path, self.state)
 
     def call(self, method, http_timeout=TIMEOUT, **params):
-        data = json.dumps(params).encode("utf-8")
+        return self._post(method, json.dumps(params).encode("utf-8"), "application/json", http_timeout)
+
+    def _post(self, method, data, content_type, http_timeout=TIMEOUT):
         req = urllib.request.Request(API % (self._token, method), data=data, method="POST",
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": content_type})
         try:
             resp = _open(req, http_timeout)
             try:
@@ -191,6 +194,30 @@ class Phone(object):
             if buttons and i == len(pieces) - 1:
                 params["reply_markup"] = {"inline_keyboard": [[{"text": l, "callback_data": d} for l, d in buttons]]}
             res = self._html("sendMessage", piece, **params)
+        return (res or {}).get("message_id")
+
+    def send_document(self, path, caption=""):
+        """A file (the evening strategy board) to your chat: Telegram sendDocument, a multipart upload built with
+        the standard library. The token never appears in an error (as in call). Returns the message id."""
+        if not self.paired:
+            raise PhoneError("no phone paired yet: run python3 trader-broker/phone.py setup")
+        try:
+            with open(path, "rb") as fh:
+                blob = fh.read()
+        except OSError as e:
+            raise PhoneError("could not read %s: %s" % (os.path.basename(path), e))
+        if len(blob) > MAX_DOC:
+            raise PhoneError("%s is too big to send (%d bytes)" % (os.path.basename(path), len(blob)))
+        boundary = "----board%s" % os.urandom(12).hex()
+        name = os.path.basename(path).replace('"', "")
+        body = []
+        for k, v in (("chat_id", str(self.state["chat_id"])), ("caption", str(caption)[:1000])):
+            body.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, k, v)).encode("utf-8"))
+        body.append(('--%s\r\nContent-Disposition: form-data; name="document"; filename="%s"\r\n'
+                     'Content-Type: text/html; charset=utf-8\r\n\r\n' % (boundary, name)).encode("utf-8"))
+        body.append(blob)
+        body.append(("\r\n--%s--\r\n" % boundary).encode("utf-8"))
+        res = self._post("sendDocument", b"".join(body), "multipart/form-data; boundary=%s" % boundary, TIMEOUT)
         return (res or {}).get("message_id")
 
     def edit(self, message_id, text):
